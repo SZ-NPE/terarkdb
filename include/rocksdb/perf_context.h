@@ -28,6 +28,21 @@ class DBOperationTypeGuard {
   ~DBOperationTypeGuard();
 };
 
+enum BGOperationType : unsigned char {
+  kOpTypeGetKey = 0,
+  kOpTypeGCRead = 1,
+  kOpTypeNotdefined = 2
+};
+
+class BGOperationTypeGuard {
+ public:
+  BGOperationTypeGuard() = delete;
+  explicit BGOperationTypeGuard(const BGOperationType& _bg_operation_type);
+  ~BGOperationTypeGuard();
+  static void SetOperationType(const BGOperationType& _bg_operation_type);
+  static void ResetOperationType();
+};
+
 // A thread local context for gathering performance counter efficiently
 // and transparently.
 // Use SetPerfLevel(PerfLevel::kEnableTime) to enable time stats.
@@ -226,5 +241,9 @@ PerfContext* get_perf_context();
 DBOperationType get_db_operation_type();
 
 bool is_foreground_operation();
+
+BGOperationType get_bg_operation_type();
+
+bool is_getkey_operation();
 
 }  // namespace TERARKDB_NAMESPACE
