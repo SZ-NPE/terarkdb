@@ -1459,6 +1459,7 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
                      ValueType* type, SequenceNumber* seq, LazyBuffer* value,
                      const FileMetaData& blob) {
   RecordTick(db_statistics_, GC_GET_KEYS);
+  StopWatch sw(env_, db_statistics_, GC_GET_KEY_TIME);
   bool value_found;
   GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
                          cfd_->ioptions()->info_log, db_statistics_,
@@ -1475,11 +1476,22 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
   while (f != nullptr) {
     *status = table_cache_->Get(
         options, *f->file_metadata, storage_info_.dependence_map(), ikey,
-        &get_context, mutable_cf_options_.prefix_extractor.get(), nullptr, true,
+        &get_context, mutable_cf_options_.prefix_extractor.get(), nullptr, false,
         fp.GetCurrentLevel(), &blob);
+
+    
     if (!status->ok()) {
       return;
     }
+
+    // //*************************************************************
+    // if (get_context.State() != GetContext::kNotFound &&
+    //     get_context.State() != GetContext::kMerge &&
+    //     db_statistics_ != nullptr) {
+    //   get_context.ReportCounters();
+    // }
+    // //*************************************************************
+
     switch (get_context.State()) {
       case GetContext::kNotFound:
         break;
@@ -1498,6 +1510,13 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
     }
     f = fp.GetNextFile();
   }
+  
+  // //**********************************************************
+  // if (db_statistics_ != nullptr) {
+  //   get_context.ReportCounters();
+  // }
+  // //**********************************************************
+
   *status = Status::NotFound();
 }
 

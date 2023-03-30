@@ -29,6 +29,7 @@ struct GetContextStats {
   uint64_t num_cache_bytes_read = 0;
   uint64_t num_cache_miss = 0;
   uint64_t num_cache_add = 0;
+  uint64_t num_cache_read = 0;
   uint64_t num_cache_bytes_write = 0;
   uint64_t num_cache_index_add = 0;
   uint64_t num_cache_index_bytes_insert = 0;

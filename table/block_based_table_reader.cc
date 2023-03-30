@@ -147,6 +147,7 @@ Cache::Handle* GetEntryFromCache(Cache* block_cache, const Slice& key,
                                  uint64_t* block_cache_hit_stats,
                                  Statistics* statistics,
                                  GetContext* get_context) {
+  RecordTick(statistics, BLOCK_CACHE_READ);
   auto cache_handle = block_cache->Lookup(key, statistics);
   if (cache_handle != nullptr) {
     PERF_COUNTER_ADD(block_cache_hit_count, 1);
