@@ -1459,6 +1459,7 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
                      ValueType* type, SequenceNumber* seq, LazyBuffer* value,
                      const FileMetaData& blob) {
   RecordTick(db_statistics_, GC_GET_KEYS);
+  StopWatch sw(env_, db_statistics_, GC_GET_KEY_TIME);
   BGOperationTypeGuard::SetOperationType(kOpTypeGetKey);
   bool value_found;
   GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
