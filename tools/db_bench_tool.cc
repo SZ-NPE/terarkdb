@@ -83,6 +83,11 @@
 #include <io.h>  // open/close
 #endif
 
+// #define SZ_DBG
+#ifdef SZ_DBG
+int64_t total_value_size = 0;
+#endif
+
 using GFLAGS_NAMESPACE::ParseCommandLineFlags;
 using GFLAGS_NAMESPACE::RegisterFlagValidator;
 using GFLAGS_NAMESPACE::SetUsageMessage;
@@ -2831,6 +2836,9 @@ class Benchmark {
         method = &Benchmark::TimeSeries;
       } else if (name == "stats") {
         PrintStats("rocksdb.stats");
+        if (FLAGS_statistics) {
+          fprintf(stdout, "STATISTICS in stats:\n%s\n", dbstats->ToString().c_str());
+        }
       } else if (name == "resetstats") {
         ResetStats();
       } else if (name == "verify") {
@@ -2941,9 +2949,12 @@ class Benchmark {
     }
 #endif  // ROCKSDB_LITE
 
-    if (FLAGS_statistics) {
-      fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
-    }
+    // if (FLAGS_statistics) {
+    //   #ifdef SZ_DBG
+    //   fprintf(stdout, "Total value size : %ld MB)\n", total_value_size / 1024 / 1024);
+    //   #endif
+    //   fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
+    // }
     if (FLAGS_simcache_size >= 0) {
       fprintf(stdout, "SIMULATOR CACHE STATISTICS:\n%s\n",
               static_cast_with_check<SimCache, Cache>(cache_.get())
@@ -3933,15 +3944,23 @@ class Benchmark {
   }
 
   int32_t GetValueSizeWithRatio(Random64* rand, int32_t fixed_value_size, int32_t kv_sep_size, double small_kv_ratio) {
+    int32_t vsize = 0;
     if (small_kv_ratio <= 0 || kv_sep_size == 0) {
-      return fixed_value_size;
+      vsize = fixed_value_size;
     }
     double rand_value = rand->Uniform(100);
     if (rand_value < small_kv_ratio * 100) {
-      return rand->Uniform(kv_sep_size) + 1;
+      vsize = rand->Uniform(kv_sep_size) + 1;
     } else {
-      return fixed_value_size;
+      vsize = fixed_value_size;
     }
+
+    #ifdef SZ_DBG
+      total_value_size += vsize;
+      total_value_size += FLAGS_key_size;
+    #endif
+
+    return vsize;
   }
 
   void DoWrite(ThreadState* thread, WriteMode write_mode) {
