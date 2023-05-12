@@ -40,7 +40,7 @@ option(WITH_GFLAGS "build with GFlags" ON)
 include(CMakeDependentOption)
 # Tests are excluded from Release builds
 CMAKE_DEPENDENT_OPTION(WITH_TESTS "build with tests" ON "CMAKE_BUILD_TYPE STREQUAL Debug" OFF)
-option(WITH_TOOLS "build with tools" OFF)
+option(WITH_TOOLS "build with tools" ON)
 option(WITH_TERARK_ZIP "build with TerarkZipTable support" ON)
 option(WITH_ZENFS "build with experimental zenfs" OFF)
 option(WITH_DIAGNOSE_CACHE "build with diagnosable cache support" OFF)
@@ -652,6 +652,12 @@ set(SOURCES
         monitoring/thread_status_updater.cc
         monitoring/thread_status_util.cc
         monitoring/thread_status_util_debug.cc
+        ycsbcore/acknowledged_counter_generator.cc                   
+        ycsbcore/basic_db.cc                                         
+        ycsbcore/core_workload.cc                                    
+        ycsbcore/db_factory.cc                                       
+        ycsbcore/measurements.cc                                     
+        ycsbcore/ycsbc.cc  
         options/cf_options.cc
         options/db_options.cc
         options/options.cc
