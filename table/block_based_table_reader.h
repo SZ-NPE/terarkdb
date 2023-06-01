@@ -35,6 +35,7 @@
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
+#include "util/static_index_map.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -251,6 +252,38 @@ class BlockBasedTable : public TableReader {
  private:
   friend class MockedBlockBasedTable;
   static std::atomic<uint64_t> next_cache_key_id_;
+
+  class LazyBufferStateImpl : public LazyBufferState {
+   public:
+    void destroy(LazyBuffer* /*buffer*/) const override {}
+
+    Status pin_buffer(LazyBuffer* buffer) const override {
+      if (buffer->size() <= sizeof(LazyBufferContext)) {
+        buffer->reset(buffer->slice(), true, buffer->file_number());
+        return Status::OK();
+      }
+      auto context = get_context(buffer);
+      DataBlockIter* iter = reinterpret_cast<DataBlockIter*>(context->data[0]);
+      terarkdb_assert(iter != nullptr);
+      Cleanable release_cached_entry = iter->RefCache();
+      if (release_cached_entry.Empty()) {
+        return Status::NotSupported();
+      }
+      buffer->reset(buffer->slice(), std::move(release_cached_entry),
+                    buffer->file_number());
+      return Status::OK();
+    }
+
+    Status fetch_buffer(LazyBuffer* /*buffer*/) const override {
+      return Status::OK();
+    }
+  };
+
+  Status GetKeyFromMap(const ReadOptions& read_options, const Slice& key,
+                       GetContext* get_context,
+                       const SliceTransform* prefix_extractor,
+                       CachableEntry<FilterBlockReader>& filter_entry,
+                       bool no_io);
 
   // If block cache enabled (compressed or uncompressed), looks for the block
   // identified by handle in (1) uncompressed cache, (2) compressed cache, and
@@ -498,6 +531,9 @@ struct BlockBasedTable::Rep {
   // is easier because the Slice member depends on the continued existence of
   // another member ("allocation").
   std::unique_ptr<const BlockContents> compression_dict_block;
+  // Index key map is in memory, used for garbage collection getkey
+  std::unique_ptr<StaticMapIndex> index_key_map;
+
   BlockBasedTableOptions::IndexType index_type;
   bool hash_index_allow_collision;
   bool whole_key_filtering;

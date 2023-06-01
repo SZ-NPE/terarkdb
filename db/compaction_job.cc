@@ -2040,6 +2040,10 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
 void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact != nullptr);
+  StopWatch sw(env_, stats_, GC_ALL_TIME);
+  uint64_t gc_begin_reads = IOSTATS(bytes_read);
+  uint64_t gc_begin_writes = IOSTATS(bytes_written);
+
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
 
   std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
@@ -2148,8 +2152,15 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       ValueType type = kTypeDeletion;
       SequenceNumber seq = kMaxSequenceNumber;
       LazyBuffer value;
-      input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
-                            &seq, &value, *blob_meta);
+      {
+        StopWatch sw1(env_, stats_, GC_GET_KEY_TIME);
+        uint64_t get_begin_reads = IOSTATS(bytes_read);
+        input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s,
+                              &type, &seq, &value, *blob_meta);
+        uint64_t get_end_reads = IOSTATS(bytes_read);
+        RecordTick(stats_, GC_GETKEY_READ_BYTES,
+                   get_end_reads - get_begin_reads);
+      }
       if (s.IsNotFound()) {
         ++counter.get_not_found;
         break;
@@ -2178,9 +2189,12 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       }
       curr_file_number = value.file_number();
 
-      assert(sub_compact->blob_builder != nullptr);
-      assert(sub_compact->current_blob_output() != nullptr);
-      status = sub_compact->blob_builder->Add(curr_key, value);
+      {
+        StopWatch sw2(env_, stats_, GC_WRITE_TIME);
+        assert(sub_compact->blob_builder != nullptr);
+        assert(sub_compact->current_blob_output() != nullptr);
+        status = sub_compact->blob_builder->Add(curr_key, value);
+      }
       if (!status.ok()) {
         break;
       }
@@ -2201,8 +2215,19 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     last_key.assign(curr_key.data(), curr_key.size());
     last_file_number = curr_file_number;
 
-    input->Next();
+    {
+      StopWatch sw3(env_, stats_, GC_READ_TIME);
+      input->Next();
+    }
   }
+
+  uint64_t gc_end_reads = IOSTATS(bytes_read);
+  uint64_t gc_end_writes = IOSTATS(bytes_written);
+  RecordTick(stats_, GC_READ_BYTES, gc_end_reads - gc_begin_reads);
+  RecordTick(stats_, GC_WRITE_BYTES, gc_end_writes - gc_begin_writes);
+
+  IOSTATS_RESET(bytes_read);
+  IOSTATS_RESET(bytes_written);
 
   if (status.ok() &&
       (shutting_down_->load(std::memory_order_relaxed) || cfd->IsDropped())) {

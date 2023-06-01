@@ -54,7 +54,8 @@ class GetContext {
              const Slice& user_key, LazyBuffer* value, bool* value_found,
              MergeContext* merge_context, const SeparateHelper* separate_helper,
              SequenceNumber* max_covering_tombstone_seq, Env* env,
-             SequenceNumber* seq = nullptr, ReadCallback* callback = nullptr);
+             SequenceNumber* seq = nullptr, ReadCallback* callback = nullptr,
+             bool is_getkey_operation = false);
 
   void MarkKeyMayExist();
 
@@ -83,7 +84,7 @@ class GetContext {
 
   bool sample() const { return sample_; }
   bool is_index() const { return is_index_; }
-
+  bool is_getkey() const { return is_getkey_; }
   bool is_finished() const { return is_finished_; }
 
   void SetMinSequenceAndType(uint64_t min_seq_type) {
@@ -125,6 +126,7 @@ class GetContext {
   bool sample_;
   bool is_index_;
   bool is_finished_;
+  bool is_getkey_;
 };
 
 }  // namespace TERARKDB_NAMESPACE

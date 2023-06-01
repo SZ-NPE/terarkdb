@@ -241,6 +241,7 @@ extern const std::string kPropertiesBlock = "rocksdb.properties";
 extern const std::string kPropertiesBlockOldName = "rocksdb.stats";
 extern const std::string kCompressionDictBlock = "rocksdb.compression_dict";
 extern const std::string kRangeDelBlock = "rocksdb.range_del";
+extern const std::string kIndexKeyBlock = "rocksdb.index_key";
 
 // Seek to the properties block.
 // Return true if it successfully seeks to the properties block.
@@ -265,6 +266,12 @@ Status SeekToRangeDelBlock(InternalIteratorBase<Slice>* meta_iter,
                            bool* is_found,
                            BlockHandle* block_handle = nullptr) {
   return SeekToMetaBlock(meta_iter, kRangeDelBlock, is_found, block_handle);
+}
+
+Status SeekToIndexKeyBlock(InternalIteratorBase<Slice>* meta_iter,
+                           bool* is_found,
+                           BlockHandle* block_handle = nullptr) {
+  return SeekToMetaBlock(meta_iter, kIndexKeyBlock, is_found, block_handle);
 }
 
 }  // namespace TERARKDB_NAMESPACE

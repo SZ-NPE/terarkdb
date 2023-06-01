@@ -111,6 +111,7 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WritePropertiesBlock(MetaIndexBuilder* meta_index_builder);
   void WriteCompressionDictBlock(MetaIndexBuilder* meta_index_builder);
   void WriteRangeDelBlock(MetaIndexBuilder* meta_index_builder);
+  void WriteIndexKeyBlock(MetaIndexBuilder* meta_index_builder);
 
   struct Rep;
   class BlockBasedTablePropertiesCollectorFactory;

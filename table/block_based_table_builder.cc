@@ -252,6 +252,7 @@ struct BlockBasedTableBuilder::Rep {
   size_t alignment;
   BlockBuilder data_block;
   BlockBuilder range_del_block;
+  BlockBuilder index_key_block;
 
   InternalKeySliceTransform internal_prefix_transform;
   std::unique_ptr<IndexBuilder> index_builder;
@@ -301,6 +302,7 @@ struct BlockBasedTableBuilder::Rep {
                        : table_options.data_block_index_type,
                    table_options.data_block_hash_table_util_ratio),
         range_del_block(1 /* block_restart_interval */),
+        index_key_block(table_options.block_restart_interval),
         internal_prefix_transform(builder_opt.moptions.prefix_extractor.get()),
         compression_dict(builder_opt.compression_dict),
         compression_ctx(builder_opt.compression_type,
@@ -404,6 +406,12 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
     return Status::Corruption("BlockBasedTableBuilder::Add: overlapping key");
   }
 
+  ValueType value_type = ExtractValueType(key);
+  bool is_separated = false;
+  if (value_type == kTypeValueIndex || value_type == kTypeMergeIndex) {
+    is_separated = true;
+  }
+
   auto should_flush = r->flush_block_policy->Update(key, value);
   if (should_flush) {
     assert(!r->data_block.empty());
@@ -429,10 +437,12 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
 
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
+  if (is_separated) {
+    r->index_key_block.Add(key, value);
+  }
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
-  ValueType value_type = ExtractValueType(key);
   if (value_type == kTypeDeletion || value_type == kTypeSingleDeletion) {
     r->props.num_deletions++;
   } else if (value_type == kTypeMerge) {
@@ -874,6 +884,16 @@ void BlockBasedTableBuilder::WriteRangeDelBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteIndexKeyBlock(
+    MetaIndexBuilder* meta_index_builder) {
+  if (ok() && !rep_->index_key_block.empty()) {
+    BlockHandle index_key_block_handle;
+    WriteRawBlock(rep_->index_key_block.Finish(), kNoCompression,
+                  &index_key_block_handle);
+    meta_index_builder->Add(kIndexKeyBlock, index_key_block_handle);
+  }
+}
+
 Status BlockBasedTableBuilder::Finish(
     const TablePropertyCache* prop,
     const std::vector<SequenceNumber>* snapshots,
@@ -911,6 +931,7 @@ Status BlockBasedTableBuilder::Finish(
   //    3. [meta block: compression dictionary]
   //    4. [meta block: range deletion tombstone]
   //    5. [meta block: properties]
+  //    7. [meta block: index key]
   //    6. [metaindex block]
   BlockHandle metaindex_block_handle, index_block_handle;
   MetaIndexBuilder meta_index_builder;
@@ -918,6 +939,7 @@ Status BlockBasedTableBuilder::Finish(
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
+  WriteIndexKeyBlock(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);
   if (ok()) {
     // flush the meta index block

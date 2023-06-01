@@ -1463,7 +1463,7 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
   GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
                          cfd_->ioptions()->info_log, db_statistics_,
                          GetContext::kNotFound, user_key, value, &value_found,
-                         nullptr, nullptr, nullptr, env_, seq);
+                         nullptr, nullptr, nullptr, env_, seq, nullptr, true);
   ReadOptions options;
 
   FilePicker fp(
