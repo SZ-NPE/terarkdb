@@ -282,7 +282,7 @@ class BlockBasedTable : public TableReader {
   Status GetKeyFromMap(const ReadOptions& read_options, const Slice& key,
                        GetContext* get_context,
                        const SliceTransform* prefix_extractor,
-                       CachableEntry<FilterBlockReader>& filter_entry,
+                       CachableEntry<FilterBlockReader>* filter_entry,
                        bool no_io);
 
   // If block cache enabled (compressed or uncompressed), looks for the block

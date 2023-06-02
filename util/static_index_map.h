@@ -19,23 +19,25 @@ class StaticMapIndex {
 
   ~StaticMapIndex();
 
-  char* GetKeyOffset(uint32_t id) const;
+  char* GetKeyOffset(uint64_t id) const;
 
-  uint32_t GetKeyLen(uint32_t id) const;
+  uint64_t GetKeyLen(uint64_t id) const;
 
-  char* GetValueOffset(uint32_t id) const;
+  char* GetValueOffset(uint64_t id) const;
 
-  uint32_t GetValueLen(uint32_t id) const;
+  uint64_t GetValueLen(uint64_t id) const;
 
-  Slice GetKey(uint32_t id) const;
+  Slice GetKey(uint64_t id) const;
 
-  Slice GetValue(uint32_t id) const;
+  Slice GetValue(uint64_t id) const;
 
-  uint32_t Size();
+  uint64_t Size();
 
-  uint32_t GetIndex(const Slice& key);
+  uint64_t GetIndex(const Slice& key);
 
   bool FindKey(const Slice& key);
+
+  bool empty() const { return key_nums_ == 0; }
 
   bool DecodeFrom(Slice& map_input);
 
@@ -43,15 +45,17 @@ class StaticMapIndex {
 
   Status BuildStaticMapIndex(std::unique_ptr<InternalIteratorBase<Slice>> iter);
 
+  static std::atomic<uint64_t> index_key_map_size;
+
  private:
   const InternalKeyComparator* c_;
   char* key_buff_;
   char* value_buff_;
-  uint32_t* key_offset_;
-  uint32_t* value_offset_;
-  uint32_t key_nums_;
-  uint32_t key_len_;
-  uint32_t value_len_;
+  uint64_t* key_offset_;
+  uint64_t* value_offset_;
+  uint64_t key_nums_;
+  uint64_t key_len_;
+  uint64_t value_len_;
 };
 
 }  // namespace TERARKDB_NAMESPACE

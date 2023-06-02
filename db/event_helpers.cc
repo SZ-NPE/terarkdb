@@ -101,7 +101,8 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
                             table_properties.num_entries)
               << "num_data_blocks" << table_properties.num_data_blocks
               << "num_entries" << table_properties.num_entries
-              << "filter_policy_name" << table_properties.filter_policy_name;
+              << "filter_policy_name" << table_properties.filter_policy_name
+              << "use_index_key_block" << table_properties.use_index_key_block;
       if (!table_properties.dependence.empty()) {
         jwriter << "dependence";
         auto& dependence = table_properties.dependence;

@@ -92,6 +92,8 @@ std::string TablePropertiesBase::ToString(const std::string& prop_delim,
            "index block size (user-key? %d, delta-value? %d)",
            static_cast<int>(index_key_is_user_key),
            static_cast<int>(index_value_is_delta_encoded));
+  AppendProperty(result, "use index key block", use_index_key_block, prop_delim,
+                 kv_delim);
   AppendProperty(result, index_block_size_str, index_size, prop_delim,
                  kv_delim);
   if (index_partitions != 0) {
@@ -220,6 +222,8 @@ const std::string TablePropertiesNames::kCompression = "rocksdb.compression";
 const std::string TablePropertiesNames::kCreationTime = "rocksdb.creation.time";
 const std::string TablePropertiesNames::kOldestKeyTime =
     "rocksdb.oldest.key.time";
+const std::string TablePropertiesNames::kUseIndexKeyBlock =
+    "rocksdb.use.index.key.block";
 const std::string TablePropertiesNames::kSnapshots =
     "rocksdb.property.snapshots";
 const std::string TablePropertiesNames::kPurpose = "rocksdb.sst.purpose";

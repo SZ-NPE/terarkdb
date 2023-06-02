@@ -437,7 +437,7 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
 
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
-  if (is_separated) {
+  if (is_separated && r->table_options.use_index_key_block) {
     r->index_key_block.Add(key, value);
   }
   r->props.num_entries++;
@@ -886,7 +886,8 @@ void BlockBasedTableBuilder::WriteRangeDelBlock(
 
 void BlockBasedTableBuilder::WriteIndexKeyBlock(
     MetaIndexBuilder* meta_index_builder) {
-  if (ok() && !rep_->index_key_block.empty()) {
+  if (ok() && rep_->table_options.use_index_key_block &&
+      !rep_->index_key_block.empty()) {
     BlockHandle index_key_block_handle;
     WriteRawBlock(rep_->index_key_block.Finish(), kNoCompression,
                   &index_key_block_handle);

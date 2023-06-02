@@ -62,6 +62,7 @@ struct TablePropertiesNames {
   static const std::string kCompression;
   static const std::string kCreationTime;
   static const std::string kOldestKeyTime;
+  static const std::string kUseIndexKeyBlock;
   static const std::string kSnapshots;
   static const std::string kPurpose;
   static const std::string kReadAmp;
@@ -202,6 +203,10 @@ struct TablePropertiesBase {
   uint64_t creation_time = 0;
   // Timestamp of the earliest key. 0 means unknown.
   uint64_t oldest_key_time = 0;
+
+  // 0 is the default the version not support the validity check accelerate
+  // 1 is the version that support validity check accelerate
+  uint64_t use_index_key_block = 0;
 
   // Name of the column family with which this SST file is associated.
   // If column family is unknown, `column_family_name` will be an empty string.

@@ -2437,10 +2437,10 @@ bool BlockBasedTable::FullFilterKeyMayMatch(
 Status BlockBasedTable::GetKeyFromMap(
     const ReadOptions& read_options, const Slice& key, GetContext* get_context,
     const SliceTransform* prefix_extractor,
-    CachableEntry<FilterBlockReader>& filter_entry, bool no_io) {
+    CachableEntry<FilterBlockReader>* filter_entry, bool no_io) {
   Status s;
   bool matched = false;  // if such user key matched a key in SST
-  FilterBlockReader* filter = filter_entry.value;
+  FilterBlockReader* filter = filter_entry->value;
   // First check the full filter
   // If full filter not useful, Then go into each block
   if (!FullFilterKeyMayMatch(read_options, filter, key, no_io,
@@ -2450,13 +2450,13 @@ Status BlockBasedTable::GetKeyFromMap(
   } else {
     static LazyBufferStateImpl static_state;
 
-    if (rep_->index_key_map->FindKey(key)) {
+    if (!rep_->index_key_map->empty() && rep_->index_key_map->FindKey(key)) {
+      uint64_t index = rep_->index_key_map->GetIndex(key);
       ParsedInternalKey parsed_key;
       if (!ParseInternalKey(key, &parsed_key)) {
         s = Status::Corruption(Slice());
       }
 
-      uint32_t index = rep_->index_key_map->GetIndex(key);
       get_context->SaveValue(
           parsed_key,
           LazyBuffer(&static_state, {}, rep_->index_key_map->GetValue(index),
@@ -2475,7 +2475,7 @@ Status BlockBasedTable::GetKeyFromMap(
   // don't call, in this case we have a local copy in rep_->filter_entry,
   // it's pinned to the cache and will be released in the destructor
   if (!rep_->filter_entry.IsSet()) {
-    filter_entry.Release(rep_->table_options.block_cache.get());
+    filter_entry->Release(rep_->table_options.block_cache.get());
   }
   return s;
 }
@@ -2494,11 +2494,12 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
                   read_options.read_tier == kBlockCacheTier, get_context);
   }
 
-  // If the operation is getkey in garbage collection
-  // Then get key from index_key_map
-  if (get_context->is_getkey()) {
+  // When use_index_key_block == true and the operation is getkey in
+  // garbage collection, get key from index_key_map
+  if (rep_->table_properties_base.use_index_key_block == true &&
+      rep_->table_options.use_index_key_block && get_context->is_getkey()) {
     s = GetKeyFromMap(read_options, key, get_context, prefix_extractor,
-                      filter_entry, no_io);
+                      &filter_entry, no_io);
     return s;
   }
 

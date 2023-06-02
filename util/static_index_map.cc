@@ -9,12 +9,17 @@
 
 namespace TERARKDB_NAMESPACE {
 
+std::atomic<uint64_t> StaticMapIndex::index_key_map_size(0);
+
 StaticMapIndex::StaticMapIndex(const InternalKeyComparator *c)
     : c_(c),
       key_buff_(nullptr),
       value_buff_(nullptr),
       key_offset_(nullptr),
-      value_offset_(nullptr) {}
+      value_offset_(nullptr),
+      key_nums_(0),
+      key_len_(0),
+      value_len_(0) {}
 
 StaticMapIndex::~StaticMapIndex() {
   if (key_buff_ != nullptr) {
@@ -22,100 +27,73 @@ StaticMapIndex::~StaticMapIndex() {
     delete[] value_buff_;
     delete[] key_offset_;
     delete[] value_offset_;
+    index_key_map_size.fetch_sub(Size(), std::memory_order_seq_cst);
+    key_nums_ = 0;
+    key_len_ = 0;
+    value_len_ = 0;
   }
 }
 
-char *StaticMapIndex::GetKeyOffset(uint32_t id) const {
+char *StaticMapIndex::GetKeyOffset(uint64_t id) const {
   assert(id < key_nums_);
   return key_buff_ + key_offset_[id];
 }
 
-uint32_t StaticMapIndex::GetKeyLen(uint32_t id) const {
+uint32_t StaticMapIndex::GetKeyLen(uint64_t id) const {
   assert(id < key_nums_);
   return key_offset_[id + 1] - key_offset_[id];
 }
 
-char *StaticMapIndex::GetValueOffset(uint32_t id) const {
+char *StaticMapIndex::GetValueOffset(uint64_t id) const {
   assert(id < key_nums_);
   return value_buff_ + value_offset_[id];
 }
 
-uint32_t StaticMapIndex::GetValueLen(uint32_t id) const {
+uint32_t StaticMapIndex::GetValueLen(uint64_t id) const {
   assert(id < key_nums_);
   return value_offset_[id + 1] - value_offset_[id];
 }
 
-Slice StaticMapIndex::GetKey(uint32_t id) const {
+Slice StaticMapIndex::GetKey(uint64_t id) const {
   assert(key_buff_ != nullptr);
   return Slice(GetKeyOffset(id), GetKeyLen(id));
 }
 
-Slice StaticMapIndex::GetValue(uint32_t id) const {
+Slice StaticMapIndex::GetValue(uint64_t id) const {
   assert(value_buff_ != nullptr);
   return Slice(GetValueOffset(id), GetValueLen(id));
 }
 
-uint32_t StaticMapIndex::Size() {
+uint64_t StaticMapIndex::Size() {
   return key_len_ + value_len_ + key_nums_ * 16 + 16;
 }
 
-uint32_t StaticMapIndex::GetIndex(const Slice &key) {
-  uint32_t l = 0;
-  uint32_t r = key_nums_ - 1;
+uint64_t StaticMapIndex::GetIndex(const Slice &key) {
+  uint64_t l = 0;
+  uint64_t r = key_nums_ - 1;
   while (l < r) {
-    uint32_t mid = (l + r) >> 1;
-    if (c_->Compare(key, GetKey(mid)) == 0) {
-      l = mid;
+    uint64_t mid = l + ((r - l) >> 1);
+    if (r == -1) {
       break;
-    } else if (c_->Compare(key, GetKey(mid)) < 0) {
+    }
+    Slice curr_key = GetKey(mid);
+    if (c_->Compare(key, curr_key) == 0) {
+      return mid;
+    } else if (c_->Compare(key, curr_key) < 0) {
       r = mid - 1;
     } else {
       l = mid + 1;
     }
   }
-  return l;
+  return -1;
 }
 
 bool StaticMapIndex::FindKey(const Slice &key) {
-  uint32_t index = GetIndex(key);
-  if (c_->Compare(key, GetKey(index)) == 0) {
-    return true;
+  uint64_t index = GetIndex(key);
+  if (index >= key_nums_ || c_->Compare(key, GetKey(index)) != 0) {
+    return false;
   } else {
-    return false;
-  }
-}
-
-bool StaticMapIndex::DecodeFrom(Slice &map_input) {
-  Slice smallest_key;
-  uint64_t link_count;
-  std::vector<int> dependence;
-  uint64_t flags;
-  if (!GetVarint64(&map_input, &flags) ||
-      !GetVarint64(&map_input, &link_count) ||
-      !GetLengthPrefixedSlice(&map_input, &smallest_key)) {
-    std::cout << "parse error" << std::endl;
-    return false;
-  }
-  uint64_t file_number;
-  for (uint64_t i = 0; i < link_count; ++i) {
-    if (!GetVarint64(&map_input, &file_number)) {
-      std::cout << "parse error" << std::endl;
-    }
-    dependence.push_back(file_number);
-  }
-  InternalKey ikey;
-  ikey.DecodeFrom(smallest_key);
-  std::cout << "link_count:" << link_count
-            << " smallest_key:" << ikey.DebugString() << std::endl;
-}
-
-void StaticMapIndex::DebugString() {
-  InternalKey ikey;
-  for (uint32_t i = 0; i < key_nums_; i++) {
-    ikey.DecodeFrom(GetKey(i));
-    std::cout << ikey.DebugString() << std::endl;
-    Slice v = GetValue(i);
-    DecodeFrom(v);
+    return true;
   }
 }
 
@@ -125,15 +103,15 @@ Status StaticMapIndex::BuildStaticMapIndex(
   if (!status.ok()) {
     return status;
   }
-  uint32_t key_nums = 0;
+  uint64_t key_nums = 0;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     key_nums++;
   }
-  uint32_t key_lens = 0;
-  uint32_t value_lens = 0;
-  uint32_t *key_offset = new uint32_t[key_nums + 1];
-  uint32_t *value_offset = new uint32_t[key_nums + 1];
-  uint32_t i = 0;
+  uint64_t key_lens = 0;
+  uint64_t value_lens = 0;
+  uint64_t *key_offset = new uint64_t[key_nums + 1];
+  uint64_t *value_offset = new uint64_t[key_nums + 1];
+  uint64_t i = 0;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     key_offset[i] = key_lens;
     value_offset[i] = value_lens;
@@ -143,8 +121,8 @@ Status StaticMapIndex::BuildStaticMapIndex(
   }
   key_offset[key_nums] = key_lens;
   value_offset[key_nums] = value_lens;
-  char *key_buffer = (char *)malloc(key_lens);
-  char *value_buffer = (char *)malloc(value_lens);
+  char *key_buffer = new char[key_lens];
+  char *value_buffer = new char[value_lens];
   i = 0;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     Slice curr_key = iter->key();
@@ -173,6 +151,7 @@ Status StaticMapIndex::BuildStaticMapIndex(
   key_nums_ = key_nums;
   key_len_ = key_lens;
   value_len_ = value_lens;
+  index_key_map_size.fetch_add(Size(), std::memory_order_seq_cst);
   return status;
 }
 
