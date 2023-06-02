@@ -2122,7 +2122,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
           Status::Corruption("ProcessGarbageCollection invalid InternalKey");
       break;
     }
-    uint64_t blob_file_number = input->value().file_number();
+    uint64_t blob_file_number = input->file_number();
     FileMetaData* blob_meta;
     auto find_cache = std::find_if(
         blob_meta_cache.begin(), blob_meta_cache.end(),
@@ -2182,6 +2182,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         status = Status::Corruption("Separate value dependence missing");
         break;
       }
+      // When key-value is valid, fetch value actively
+      input->fetch_value();
       value = input->value();
       if (find->second->fd.GetNumber() != value.file_number()) {
         ++counter.file_number_mismatch;
@@ -3000,8 +3002,8 @@ Status CompactionJob::OpenCompactionOutputFile(
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(),
       sub_compact->compaction->output_level(), c->compaction_load(),
-      &sub_compact->compression_dict, skip_filters, output_file_creation_time,
-      0 /* oldest_key_time */,
+      &sub_compact->compression_dict, skip_filters, 0 /* meta_type */,
+      output_file_creation_time, 0 /* oldest_key_time */,
       sub_compact->compaction->compaction_type() == kMapCompaction
           ? kMapSst
           : kEssenceSst));
@@ -3089,7 +3091,7 @@ Status CompactionJob::OpenCompactionOutputBlob(
       cfd->GetName(), sub_compact->blob_outfile.get(),
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(), -1 /* level */,
-      c->compaction_load(), nullptr, true /* skip_filters */,
+      c->compaction_load(), nullptr, true /* skip_filters */, 1 /* meta_type */,
       output_file_creation_time, 0 /* oldest_key_time */, kEssenceSst));
   LogFlush(db_options_.info_log);
   return s;

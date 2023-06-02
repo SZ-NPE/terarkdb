@@ -819,7 +819,7 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
         immutable_cf_options, mutable_cf_options, *icmp,
         &int_tbl_prop_collector_factories.data, context.compression,
         context.compression_opts, nullptr /* compression_dict */,
-        context.skip_filters, context.cf_name, -1 /* level */,
+        context.skip_filters, context.meta_type, context.cf_name, -1 /* level */,
         0 /* compaction_load */);
     table_builder_options.smallest_user_key = context.smallest_user_key;
     table_builder_options.largest_user_key = context.largest_user_key;

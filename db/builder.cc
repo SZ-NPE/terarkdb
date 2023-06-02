@@ -30,6 +30,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/terark_namespace.h"
+#include "table/block_based_table_builder.h"
 #include "table/format.h"
 #include "table/internal_iterator.h"
 #include "util/c_style_callback.h"
@@ -51,7 +52,7 @@ TableBuilder* NewTableBuilder(
     WritableFileWriter* file, const CompressionType compression_type,
     const CompressionOptions& compression_opts, int level,
     double compaction_load, const std::string* compression_dict,
-    bool skip_filters, uint64_t creation_time, uint64_t oldest_key_time,
+    bool skip_filters, uint64_t meta_type, uint64_t creation_time, uint64_t oldest_key_time,
     SstPurpose sst_purpose) {
   assert((column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
@@ -59,7 +60,7 @@ TableBuilder* NewTableBuilder(
   return ioptions.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, internal_comparator,
                           int_tbl_prop_collector_factories, compression_type,
-                          compression_opts, compression_dict, skip_filters,
+                          compression_opts, compression_dict, skip_filters, meta_type,
                           column_family_name, level, compaction_load,
                           creation_time, oldest_key_time, sst_purpose),
       column_family_id, file);
@@ -147,7 +148,7 @@ Status BuildTable(
           int_tbl_prop_collector_factories, column_family_id,
           column_family_name, file_writer.get(), compression, compression_opts,
           level, compaction_load, nullptr /* compression_dict */,
-          false /* skip_filters */, creation_time, oldest_key_time);
+          false /* skip_filters */, 0 /* meta_type */, creation_time, oldest_key_time);
     }
 
     MergeHelper merge(env, internal_comparator.user_comparator(),
@@ -283,7 +284,7 @@ Status BuildTable(
             int_tbl_prop_collector_factories_for_blob, column_family_id,
             column_family_name, separate_helper.file_writer.get(), compression,
             compression_opts, -1 /* level */, 0 /* compaction_load */, nullptr,
-            true));
+            true, 1));
         blob_builder = separate_helper.builder.get();
       }
       if (status.ok()) {

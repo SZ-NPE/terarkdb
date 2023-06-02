@@ -261,6 +261,10 @@ DEFINE_bool(use_index_key_block, true,
             "Used to choose whether the validity check acceleration function "
             "is turned on");
 
+DEFINE_bool(blob_single_key_block, true,
+            "Used to choose whether the gc read acceleration function is"
+            "turned on");
+
 DEFINE_int32(seek_nexts, 0,
              "How many times to call Next() after Seek() in "
              "fillseekseq, seekrandom, seekrandomwhilewriting and "
@@ -3462,6 +3466,7 @@ class Benchmark {
           FLAGS_enable_index_compression;
       block_based_options.block_align = FLAGS_block_align;
       block_based_options.use_index_key_block = FLAGS_use_index_key_block;
+      block_based_options.blob_single_key_block = FLAGS_blob_single_key_block;
       if (FLAGS_use_data_block_hash_index) {
         block_based_options.data_block_index_type =
             TERARKDB_NAMESPACE::BlockBasedTableOptions::kDataBlockBinaryAndHash;

@@ -279,6 +279,8 @@ struct BlockBasedTableBuilder::Rep {
   const std::string& column_family_name;
   uint64_t creation_time = 0;
   uint64_t oldest_key_time = 0;
+  int level = 0;
+  MetaType meta_type = MetaType::KEYSST;
 
   std::vector<std::unique_ptr<IntTblPropCollector>> table_properties_collectors;
 
@@ -316,7 +318,9 @@ struct BlockBasedTableBuilder::Rep {
         column_family_id(_column_family_id),
         column_family_name(builder_opt.column_family_name),
         creation_time(builder_opt.creation_time),
-        oldest_key_time(builder_opt.oldest_key_time) {
+        oldest_key_time(builder_opt.oldest_key_time),
+        level(builder_opt.level),
+        meta_type(MetaType(builder_opt.meta_type)) {
     if (table_options.index_type ==
         BlockBasedTableOptions::kTwoLevelIndexSearch) {
       p_index_builder_ = PartitionedIndexBuilder::CreateIndexBuilder(
@@ -327,7 +331,7 @@ struct BlockBasedTableBuilder::Rep {
       index_builder.reset(IndexBuilder::CreateIndexBuilder(
           table_options.index_type, &internal_comparator,
           &this->internal_prefix_transform, use_delta_encoding_for_index_values,
-          table_options));
+          table_options, meta_type));
     }
     if (builder_opt.skip_filters) {
       filter_builder = nullptr;
@@ -392,6 +396,9 @@ BlockBasedTableBuilder::~BlockBasedTableBuilder() {
 
 Status BlockBasedTableBuilder::Add(const Slice& key,
                                    const LazyBuffer& lazy_value) {
+  if (rep_->meta_type == MetaType::BLOB) {
+    return AddFullRecord(key, lazy_value);
+  }
   Rep* r = rep_;
   assert(!r->closed);
   assert(ok());
@@ -440,6 +447,65 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
   if (is_separated && r->table_options.use_index_key_block) {
     r->index_key_block.Add(key, value);
   }
+  r->props.num_entries++;
+  r->props.raw_key_size += key.size();
+  r->props.raw_value_size += value.size();
+  if (value_type == kTypeDeletion || value_type == kTypeSingleDeletion) {
+    r->props.num_deletions++;
+  } else if (value_type == kTypeMerge) {
+    r->props.num_merge_operands++;
+  }
+
+  r->index_builder->OnKeyAdded(key);
+  NotifyCollectTableCollectorsOnAdd(key, value, r->offset,
+                                    r->table_properties_collectors,
+                                    r->ioptions.info_log);
+  return r->status;
+}  // namespace TERARKDB_NAMESPACE
+
+Status BlockBasedTableBuilder::AddFullRecord(const Slice& key,
+                                             const LazyBuffer& lazy_value) {
+  Rep* r = rep_;
+  assert(!r->closed);
+  assert(ok());
+  auto s = lazy_value.fetch();
+  if (!s.ok()) {
+    return s;
+  }
+
+  if (r->props.num_entries > 0 &&
+      r->internal_comparator.Compare(key, Slice(r->last_key)) <= 0) {
+    assert(r->internal_comparator.Compare(key, Slice(r->last_key)) >
+                    0);
+    return Status::Corruption("BlockBasedTableBuilder::Add: overlapping key");
+  }
+
+  uint32_t value_size = 0;
+  uint64_t value_meta_size = 0;
+  LazyBuffer actual_lazy_value;
+  ValueType value_type = ExtractValueType(key);
+  bool is_separated = false;
+  if (value_type == kTypeValueIndex || value_type == kTypeMergeIndex) {
+    is_separated = true;
+  }
+
+  const Slice& value = actual_lazy_value.slice();
+  if (!r->data_block.empty()) {
+    assert(!r->data_block.empty());
+    Flush();
+    if (ok()) {
+      r->index_builder->AddIndexEntry(&r->last_key, nullptr, r->pending_handle);
+    }
+  }
+
+  // Note: PartitionedFilterBlockBuilder requires key being added to filter
+  // builder after being added to index builder.
+  if (r->filter_builder != nullptr) {
+    r->filter_builder->Add(ExtractUserKey(key));
+  }
+
+  r->last_key.assign(key.data(), key.size());
+  r->data_block.Add(key, value);
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
@@ -641,7 +707,8 @@ void BlockBasedTableBuilder::WriteRawBlock(const Slice& block_contents,
     }
     if (r->status.ok()) {
       r->offset += block_contents.size() + kBlockTrailerSize;
-      if (r->table_options.block_align && is_data_block) {
+      if (r->table_options.block_align && is_data_block &&
+          r->meta_type != MetaType::BLOB) {
         size_t pad_bytes =
             (r->alignment - ((block_contents.size() + kBlockTrailerSize) &
                              (r->alignment - 1))) &
@@ -842,6 +909,18 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
         rep_->use_delta_encoding_for_index_values;
     rep_->props.creation_time = rep_->creation_time;
     rep_->props.oldest_key_time = rep_->oldest_key_time;
+    if (rep_->table_options.use_index_key_block) {
+      assert(rep_->props.use_index_key_block == false);
+      rep_->props.use_index_key_block = true;
+    }
+    if (rep_->table_options.blob_single_key_block &&
+        rep_->meta_type == MetaType::BLOB &&
+        rep_->table_options.index_type ==
+            BlockBasedTableOptions::kBinarySearch) {
+      assert(rep_->props.index_key_is_user_key == false);
+      rep_->props.blob_single_key_block = true;
+    }
+    rep_->props.meta_type = rep_->meta_type;
 
     // Add basic properties
     property_block_builder.AddTableProperty(rep_->props);

@@ -191,6 +191,9 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"use_index_key_block",
          {offsetof(struct BlockBasedTableOptions, use_index_key_block),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"blob_single_key_block",
+         {offsetof(struct BlockBasedTableOptions, blob_single_key_block),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}}};
 #endif  // !ROCKSDB_LITE
 }  // namespace TERARKDB_NAMESPACE

@@ -2209,6 +2209,13 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekForPrev(
 
 template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToFirst() {
+  if (gc_accelerate_) {
+    is_out_of_bound_ = false;
+    SavePrevIndexValue();
+    index_iter_->SeekToFirst();
+    assert(index_iter_->Valid());
+    return;
+  }
   is_out_of_bound_ = false;
   SavePrevIndexValue();
   index_iter_->SeekToFirst();
@@ -2237,6 +2244,18 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToLast() {
 
 template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::Next() {
+  if (gc_accelerate_) {
+    assert(index_iter_->Valid());
+    index_iter_->Next();
+#ifndef NDEBUG
+    if (index_iter_->Valid()) {
+      fetch_value();
+      assert(index_iter_->key().ToString() ==
+                      block_iter_.key().ToString());
+    }
+#endif  // !NDEBUG
+    return;
+  }
   assert(block_iter_points_to_real_block_);
   block_iter_.Next();
   FindKeyForward();
@@ -2365,6 +2384,10 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyBackward() {
 InternalIterator* BlockBasedTable::NewIterator(
     const ReadOptions& read_options, const SliceTransform* prefix_extractor,
     Arena* arena, bool skip_filters, bool for_compaction) {
+  bool gc_read_optimization =
+      rep_->table_properties_base.meta_type == MetaType::BLOB &&
+      rep_->table_properties_base.blob_single_key_block == true &&
+      rep_->table_options.blob_single_key_block;
   bool need_upper_bound_check =
       PrefixExtractorChanged(&rep_->table_properties_base, prefix_extractor);
   const bool kIsNotIndex = false;
@@ -2378,7 +2401,7 @@ InternalIterator* BlockBasedTable::NewIterator(
         !skip_filters && !read_options.total_order_seek &&
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
-        true /*key_includes_seq*/, for_compaction);
+        true /*key_includes_seq*/, for_compaction, gc_read_optimization);
   } else {
     auto* mem = arena->AllocateAligned(
         sizeof(BlockBasedTableIterator<DataBlockIter, LazyBuffer>));
@@ -2388,7 +2411,7 @@ InternalIterator* BlockBasedTable::NewIterator(
         !skip_filters && !read_options.total_order_seek &&
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
-        true /*key_includes_seq*/, for_compaction);
+        true /*key_includes_seq*/, for_compaction, gc_read_optimization);
   }
 }
 

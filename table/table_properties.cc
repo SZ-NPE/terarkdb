@@ -224,6 +224,9 @@ const std::string TablePropertiesNames::kOldestKeyTime =
     "rocksdb.oldest.key.time";
 const std::string TablePropertiesNames::kUseIndexKeyBlock =
     "rocksdb.use.index.key.block";
+const std::string TablePropertiesNames::kSSTMetaType = "rocksdb.sst.meta.type";
+const std::string TablePropertiesNames::kBlobSingleKeyBlock =
+    "rocksdb.blob.single.key.block";
 const std::string TablePropertiesNames::kSnapshots =
     "rocksdb.property.snapshots";
 const std::string TablePropertiesNames::kPurpose = "rocksdb.sst.purpose";
