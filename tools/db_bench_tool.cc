@@ -265,6 +265,13 @@ DEFINE_bool(blob_single_key_block, true,
             "Used to choose whether the gc read acceleration function is"
             "turned on");
 
+DEFINE_bool(hotness_aware, true,
+            "Used to choose whether the hotness awareness fubction is"
+            "turned on");
+
+DEFINE_int64(drop_key_cache_size, 8 << 20,  // 8MB
+             "Number of bytes to use as a cache of drop keys");
+
 DEFINE_int32(seek_nexts, 0,
              "How many times to call Next() after Seek() in "
              "fillseekseq, seekrandom, seekrandomwhilewriting and "
@@ -2066,6 +2073,7 @@ class Duration {
 class Benchmark {
  private:
   std::shared_ptr<Cache> cache_;
+  std::shared_ptr<Cache> drop_key_cache_;
   std::shared_ptr<Cache> compressed_cache_;
   std::shared_ptr<const FilterPolicy> filter_policy_;
   const SliceTransform* prefix_extractor_;
@@ -2401,6 +2409,7 @@ class Benchmark {
  public:
   Benchmark()
       : cache_(NewCache(FLAGS_cache_size)),
+        drop_key_cache_(NewCache(FLAGS_drop_key_cache_size)),
         compressed_cache_(NewCache(FLAGS_compressed_cache_size)),
         filter_policy_(FLAGS_bloom_bits >= 0
                            ? NewBloomFilterPolicy(FLAGS_bloom_bits,
@@ -3640,6 +3649,9 @@ class Benchmark {
     if (FLAGS_thread_status_per_interval > 0) {
       options.enable_thread_tracking = true;
     }
+    // Set hotness aware options
+    options.drop_key_cache = drop_key_cache_;
+    options.hotness_aware = FLAGS_hotness_aware;
 
 #ifndef ROCKSDB_LITE
     if (FLAGS_readonly && FLAGS_transaction_db) {

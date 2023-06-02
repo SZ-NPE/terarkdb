@@ -732,6 +732,7 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
       input.get(), &separate_helper, end, ucmp, &merge, context.last_sequence,
       &context.existing_snapshots, context.earliest_write_conflict_snapshot,
       nullptr, env, false, false, &range_del_agg,
+      immutable_cf_options.drop_key_cache, immutable_cf_options.hotness_aware,
       std::unique_ptr<CompactionIterator::CompactionProxy>(
           new RemoteCompactionProxy(&context)),
       context.blob_config, compaction_filter, nullptr,
@@ -803,7 +804,8 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
         second_pass_iter_storage.input.get(), &separate_helper, end, ucmp,
         merge_ptr, context.last_sequence, &context.existing_snapshots,
         context.earliest_write_conflict_snapshot, nullptr, env, false, false,
-        range_del_agg_ptr, std::move(compaction), context.blob_config,
+        range_del_agg_ptr, immutable_cf_options.drop_key_cache,
+        immutable_cf_options.hotness_aware, std::move(compaction), context.blob_config,
         second_pass_iter_storage.compaction_filter, nullptr,
         context.preserve_deletes_seqnum);
   };

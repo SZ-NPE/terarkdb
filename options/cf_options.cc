@@ -37,6 +37,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
           cf_options.value_meta_extractor_factory.get()),
       ttl_extractor_factory(cf_options.ttl_extractor_factory.get()),
       compaction_filter(cf_options.compaction_filter),
+      drop_key_cache(cf_options.drop_key_cache),
+      hotness_aware(cf_options.hotness_aware),
       compaction_filter_factory(cf_options.compaction_filter_factory.get()),
       compaction_dispatcher(cf_options.compaction_dispatcher.get()),
       min_write_buffer_number_to_merge(

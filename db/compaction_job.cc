@@ -1687,6 +1687,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       versions_->LastSequence(), &existing_snapshots_,
       earliest_write_conflict_snapshot_, snapshot_checker_, env_,
       ShouldReportDetailedTime(env_, stats_), false, &range_del_agg,
+      cfd->ioptions()->drop_key_cache, cfd->ioptions()->hotness_aware,
       sub_compact->compaction, mutable_cf_options->get_blob_config(),
       compaction_filter, shutting_down_, preserve_deletes_seqnum_,
       &rebuild_blobs_info.blobs));
@@ -1741,6 +1742,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         cfd->user_comparator(), merge_ptr, versions_->LastSequence(),
         &existing_snapshots_, earliest_write_conflict_snapshot_,
         snapshot_checker_, env_, false, false, range_del_agg_ptr,
+        cfd->ioptions()->drop_key_cache, cfd->ioptions()->hotness_aware,
         sub_compact->compaction, mutable_cf_options->get_blob_config(),
         second_pass_iter_storage.compaction_filter, shutting_down_,
         preserve_deletes_seqnum_, &rebuild_blobs_info.blobs);
