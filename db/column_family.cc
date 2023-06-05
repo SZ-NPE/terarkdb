@@ -331,9 +331,9 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   if (result.blob_large_key_ratio < 0) {
     result.blob_large_key_ratio = 0;
   }
-  if (result.blob_gc_ratio > 0.5) {
-    result.blob_gc_ratio = 0.5;
-  }
+  // if (result.blob_gc_ratio > 0.5) {
+  //   result.blob_gc_ratio = 0.5;
+  // }
   if (result.blob_gc_ratio < 0) {
     result.blob_gc_ratio = 0;
   }
