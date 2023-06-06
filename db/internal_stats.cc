@@ -1336,13 +1336,18 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
   gc_micros = comp_blob_stat_.micros;
 
   minor_compact_bytes_write += minor_compact_bytes_rebuild_write + minor_compact_bytes_lsm_write;
-  major_compact_bytes_read = compact_bytes_read - minor_compact_bytes_read;
-  major_compact_bytes_write = compact_bytes_write - minor_compact_bytes_write;
+  major_compact_bytes_read =
+      compact_bytes_read - minor_compact_bytes_read - gc_bytes_read;
+  major_compact_bytes_write =
+      compact_bytes_write - minor_compact_bytes_write - gc_bytes_write;
   major_compact_bytes_rebuild_write =
       compact_bytes_rebuild_write - minor_compact_bytes_rebuild_write;
   major_compact_bytes_lsm_write =
       compact_bytes_lsm_write - minor_compact_bytes_lsm_write;
-  major_compact_micros = compact_micros - minor_compact_micros;
+  major_compact_micros = compact_micros - minor_compact_micros - gc_micros;
+
+  assert(major_compact_bytes_write ==
+         major_compact_bytes_rebuild_write + major_compact_bytes_lsm_write);
 
   snprintf(buf, sizeof(buf),
            "Cumulative compaction: %.2f GB write, %.2f MB/s write, "
@@ -1354,7 +1359,7 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
 
   snprintf(buf, sizeof(buf),
            "Cumulative compaction: %.2f GB (write-lsm), %.2f GB "
-           "(write-rebuild), %.2f GB (write-gc)",
+           "(write-rebuild), %.2f GB (write-gc)\n",
            compact_bytes_lsm_write / kGB, compact_bytes_rebuild_write / kGB,
            comp_blob_stat_.bytes_blob_written / kGB);
   value->append(buf);
