@@ -1365,28 +1365,36 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
   value->append(buf);
 
   snprintf(buf, sizeof(buf),
-           "Cumulative minor compaction: %.2f GB %.2f MB/s, "
+           "Cumulative minor compaction: "
+           "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
            "%.2f GB %.2f MB/s minor_compact_bytes_written, "
            "%.2f GB %.2f MB/s minor_compact_bytes_blob_written\n"
-           "Cumulative major compaction: %.2f GB %.2f MB/s, "
-           "%.2f GB %.2f MB/s comp_bytes_written, "
-           "%.2f GB %.2f MB/s comp_bytes_blob_written\n"
-           "Cumulative gc: %.2f GB %.2f MB/s, "
+           "Cumulative major compaction: "
+           "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
+           "%.2f GB %.2f MB/s major_compact_bytes_written, "
+           "%.2f GB %.2f MB/s major_compact_bytes_blob_written\n"
+           "Cumulative gc: "
+           "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
            "%.2f GB %.2f MB/s gc_bytes_written, "
            "%.2f GB %.2f MB/s gc_bytes_blob_written\n",
            minor_compact_bytes_write / kGB,
            minor_compact_bytes_write / kMB / seconds_up,
+           minor_compact_bytes_read / kGB,
+           minor_compact_bytes_read / kMB / seconds_up,
            minor_compact_bytes_lsm_write / kGB,
            minor_compact_bytes_lsm_write / kMB / seconds_up,
            minor_compact_bytes_rebuild_write / kGB,
            minor_compact_bytes_rebuild_write / kMB / seconds_up,
            major_compact_bytes_write / kGB,
            major_compact_bytes_write / kMB / seconds_up,
+           major_compact_bytes_read / kGB,
+           major_compact_bytes_read / kMB / seconds_up,
            major_compact_bytes_lsm_write / kGB,
            major_compact_bytes_lsm_write / kMB / seconds_up,
            major_compact_bytes_rebuild_write / kGB,
            major_compact_bytes_rebuild_write / kMB / seconds_up,
            gc_bytes_write / kGB, gc_bytes_write / kMB / seconds_up,
+           gc_bytes_read / kGB, gc_bytes_read / kMB / seconds_up,
            comp_blob_stat_.bytes_written / kGB,
            comp_blob_stat_.bytes_written / kMB / seconds_up,
            comp_blob_stat_.bytes_blob_written / kGB,
