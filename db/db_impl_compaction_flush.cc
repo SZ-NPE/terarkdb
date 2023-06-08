@@ -2056,6 +2056,9 @@ void DBImpl::SchedulePendingPurge(const std::string& fname,
 void DBImpl::BGWorkFlush(void* db) {
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::HIGH);
   TEST_SYNC_POINT("DBImpl::BGWorkFlush");
+  // Set the thread name to aid debugging
+  std::string thread_name = "Tag:Flush";
+  pthread_setname_np(pthread_self(), thread_name.c_str());
   reinterpret_cast<DBImpl*>(db)->BackgroundCallFlush();
   TEST_SYNC_POINT("DBImpl::BGWorkFlush:done");
 }
@@ -2065,6 +2068,9 @@ void DBImpl::BGWorkCompaction(void* arg) {
   delete reinterpret_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
   TEST_SYNC_POINT("DBImpl::BGWorkCompaction");
+  // Set the thread name to aid debugging
+  std::string thread_name = "Tag:Compaction";
+  pthread_setname_np(pthread_self(), thread_name.c_str());
   auto prepicked_compaction =
       static_cast<PrepickedCompaction*>(ca.prepicked_compaction);
   reinterpret_cast<DBImpl*>(ca.db)->BackgroundCallCompaction(
@@ -2077,6 +2083,9 @@ void DBImpl::BGWorkGarbageCollection(void* arg) {
   delete reinterpret_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
   TEST_SYNC_POINT("DBImpl::BGWorkGarbageCollection");
+  // Set the thread name to aid debugging
+  std::string thread_name = "Tag:GC";
+  pthread_setname_np(pthread_self(), thread_name.c_str());
   reinterpret_cast<DBImpl*>(ca.db)->BackgroundCallGarbageCollection();
 }
 
@@ -2088,6 +2097,9 @@ void DBImpl::BGWorkBottomCompaction(void* arg) {
   auto* prepicked_compaction = ca.prepicked_compaction;
   assert(prepicked_compaction && prepicked_compaction->compaction &&
          !prepicked_compaction->manual_compaction_state);
+  // Set the thread name to aid debugging
+  std::string thread_name = "Tag:Bottom";
+  pthread_setname_np(pthread_self(), thread_name.c_str());
   ca.db->BackgroundCallCompaction(prepicked_compaction, Env::Priority::BOTTOM);
   delete prepicked_compaction;
 }
