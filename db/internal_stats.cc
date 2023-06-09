@@ -1325,14 +1325,14 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
       minor_compact_micros += comp_stats_[level].micros;
     }
   }
-  compact_bytes_read += comp_blob_stat_.bytes_read_non_output_levels +
+  compact_bytes_read += comp_blob_stat_.bytes_read_output_level +
                         comp_blob_stat_.bytes_read_non_output_levels;
   compact_bytes_write += comp_blob_stat_.bytes_written +
                          comp_blob_stat_.bytes_blob_written +
                          compact_bytes_rebuild_write + compact_bytes_lsm_write;
   compact_micros += comp_blob_stat_.micros;
 
-  gc_bytes_read = comp_blob_stat_.bytes_read_non_output_levels +
+  gc_bytes_read = comp_blob_stat_.bytes_read_output_level +
                   comp_blob_stat_.bytes_read_non_output_levels;
   gc_bytes_write =
       comp_blob_stat_.bytes_written + comp_blob_stat_.bytes_blob_written;
