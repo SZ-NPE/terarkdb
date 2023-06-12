@@ -269,6 +269,8 @@ class VersionStorageInfo {
 
   double total_garbage_ratio() const { return total_garbage_ratio_; }
 
+  uint64_t total_blob_file_size() const { return blob_file_size_; }
+
   bool blob_marked_for_compaction() const {
     return blob_marked_for_compaction_;
   }

@@ -660,6 +660,21 @@ struct AdvancedColumnFamilyOptions {
   // Create ColumnFamilyOptions from Options
   explicit AdvancedColumnFamilyOptions(const Options& options);
 
+  // ---------------- GC STALL OPTIONS  ----------------
+  // Maximum gc_ratio of blob files.  We stop writes at this point.
+  //
+  // Default: 1.0
+  //
+  // Dynamically changeable through SetOptions() API
+  double garbage_ratio_stop_writes_trigger = 1.0;
+
+  // All writes are stopped if blob file size exceed this threshold.
+  //
+  // Default: 0
+  //
+  // Dynamically changeable through SetOptions() API
+  uint64_t blob_file_bytes_limit = 0;
+
   // ---------------- OPTIONS NOT SUPPORTED ANYMORE ----------------
 
   // NOT SUPPORTED ANYMORE

@@ -228,6 +228,10 @@ void MutableCFOptions::Dump(Logger* log) const {
                  max_bytes_for_level_base);
   ROCKS_LOG_INFO(log, "           max_bytes_for_level_multiplier: %f",
                  max_bytes_for_level_multiplier);
+  ROCKS_LOG_INFO(log, "           garbage_ratio_stop_writes_trigger: %f",
+                 garbage_ratio_stop_writes_trigger);
+  ROCKS_LOG_INFO(log, "           blob_file_bytes_limit: %" PRIu64,
+                 blob_file_bytes_limit);
   ROCKS_LOG_INFO(log, "                             ttl_gc_ratio: %f",
                  ttl_gc_ratio);
   ROCKS_LOG_INFO(log, "                         ttl_max_scan_gap: %zd",
@@ -315,6 +319,8 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       max_bytes_for_level_multiplier_additional(
           options.max_bytes_for_level_multiplier_additional),
       compaction_options_universal(options.compaction_options_universal),
+      garbage_ratio_stop_writes_trigger(options.garbage_ratio_stop_writes_trigger),
+      blob_file_bytes_limit(options.blob_file_bytes_limit),
       max_sequential_skip_in_iterations(
           options.max_sequential_skip_in_iterations),
       paranoid_file_checks(options.paranoid_file_checks),

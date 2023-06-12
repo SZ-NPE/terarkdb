@@ -108,6 +108,8 @@ class InternalStats {
     INGESTED_NUM_KEYS_TOTAL,
     READ_AMP_LIMIT_SLOWDOWNS,
     READ_AMP_LIMIT_STOPS,
+    GARBAGE_RATIO_LIMIT_STOPS,
+    BLOB_FILE_BYTES_LIMIT_STOPS,
     INTERNAL_CF_STATS_ENUM_MAX,
   };
 
@@ -501,7 +503,7 @@ class InternalStats {
       gc_bytes_rebuild_write = 0;
       gc_bytes_lsm_write = 0;
       gc_micros = 0;
-      
+
       seconds_up = 0;
       ingest_bytes_addfile = 0;
       ingest_files_addfile = 0;

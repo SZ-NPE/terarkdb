@@ -1723,6 +1723,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
               vstorage->l0_delay_trigger_count() + 1,
               int(vstorage->read_amplification()) + 1,
               vstorage->estimated_compaction_needed_bytes(),
+              vstorage->total_blob_file_size(), vstorage->total_garbage_ratio(),
               cfd->ioptions()->num_levels, mutable_cf_options)
               .first;
     } while (write_stall_condition != WriteStallCondition::kNormal);
