@@ -712,7 +712,12 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
   } else if (total_garbage_ratio >=
              mutable_cf_options.garbage_ratio_stop_writes_trigger) {
     return {WriteStallCondition::kStopped, WriteStallCause::kGarbageRatioLimit};
-  } else if (total_blob_file_size >= mutable_cf_options.blob_file_bytes_limit) {
+  // } else if (total_garbage_ratio >=
+  //            mutable_cf_options.blob_gc_ratio && 
+  //            mutable_cf_options.blob_file_bytes_limit > 0 && 
+  //            total_blob_file_size >= mutable_cf_options.blob_file_bytes_limit) {
+  } else if (mutable_cf_options.blob_file_bytes_limit > 0 && 
+             total_blob_file_size >= mutable_cf_options.blob_file_bytes_limit) {
     return {WriteStallCondition::kStopped, WriteStallCause::kBlobFileBytes};
   } else if (mutable_cf_options.max_write_buffer_number > 3 &&
              num_unflushed_memtables >=
@@ -813,9 +818,10 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
                                   1);
       ROCKS_LOG_WARN(
           ioptions_.info_log,
-          "[%s] Stopping writes because of total blob file bytes %" PRIu64
+          "[%s] Stopping writes because of total blob file bytes %" PRIu64 
+          "and total garbage ratio %f"
           "(waiting for garbage collection)",
-          name_.c_str(), vstorage->total_blob_file_size());
+          name_.c_str(), vstorage->total_blob_file_size(), vstorage->total_garbage_ratio());
     } else if (write_stall_condition == WriteStallCondition::kDelayed &&
                write_stall_cause == WriteStallCause::kMemtableLimit) {
       write_controller_token_ =
