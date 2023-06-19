@@ -2040,6 +2040,10 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
 void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact != nullptr);
+  //*********
+  StopWatch sw(env_, stats_, GC_ALL_TIME);
+  //*********
+
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
 
   std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
@@ -2178,9 +2182,12 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       }
       curr_file_number = value.file_number();
 
-      assert(sub_compact->blob_builder != nullptr);
-      assert(sub_compact->current_blob_output() != nullptr);
-      status = sub_compact->blob_builder->Add(curr_key, value);
+      {
+        StopWatch sw2(env_, stats_, GC_WRITE_TIME);
+        assert(sub_compact->blob_builder != nullptr);
+        assert(sub_compact->current_blob_output() != nullptr);
+        status = sub_compact->blob_builder->Add(curr_key, value);
+      }
       if (!status.ok()) {
         break;
       }
@@ -2198,10 +2205,13 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       std::lock_guard<std::mutex> lock(conflict_map_mutex);
       conflict_map.emplace(pinned_key, valid_file_number);
     }
-    last_key.assign(curr_key.data(), curr_key.size());
-    last_file_number = curr_file_number;
+    {
+      StopWatch sw1(env_, stats_, GC_READ_TIME);
+      last_key.assign(curr_key.data(), curr_key.size());
+      last_file_number = curr_file_number;
 
-    input->Next();
+      input->Next();
+    }
   }
 
   if (status.ok() &&

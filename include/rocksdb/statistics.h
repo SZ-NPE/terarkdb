@@ -37,6 +37,7 @@ enum Tickers : uint32_t {
   BLOCK_CACHE_HIT,
   // # of blocks added to block cache.
   BLOCK_CACHE_ADD,
+  BLOCK_CACHE_READ,
   // # of failures when adding blocks to block cache.
   BLOCK_CACHE_ADD_FAILURES,
   // # of times cache miss when accessing index block from block cache.
@@ -282,6 +283,14 @@ enum Histograms : uint32_t {
   DB_WRITE,
   COMPACTION_TIME,
   SUBCOMPACTION_SETUP_TIME,
+
+  //*********************
+  GC_GET_KEY_TIME,
+  GC_READ_TIME,
+  GC_WRITE_TIME,
+  GC_ALL_TIME,
+  //*********************
+
   TABLE_SYNC_MICROS,
   COMPACTION_OUTFILE_SYNC_MICROS,
   WAL_FILE_SYNC_MICROS,
