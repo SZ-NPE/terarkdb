@@ -1004,6 +1004,15 @@ bool ColumnFamilyData::NeedsCompaction() const {
 
 bool ColumnFamilyData::NeedsGarbageCollection() const {
   auto vstorage = current_->storage_info();
+  double dynamic_blob_gc_ratio = mutable_cf_options_.blob_gc_ratio;
+  if (mutable_cf_options_.blob_file_bytes_limit > 0 && 
+        vstorage->total_blob_file_size() >= mutable_cf_options_.blob_file_bytes_limit) {
+    dynamic_blob_gc_ratio = 1e-15;
+    ROCKS_LOG_INFO(
+            ioptions_.info_log,
+            "[GC Stall] set dynamic blob gc ratio in NeedsGarbageCollection %f and current total_garbage_ratio is %f",
+            dynamic_blob_gc_ratio, vstorage->total_garbage_ratio());
+  }
   return !vstorage->IsPickGarbageCollectionFail() &&
          (vstorage->blob_marked_for_compaction() ||
           vstorage->total_garbage_ratio() >= mutable_cf_options_.blob_gc_ratio);
@@ -1029,6 +1038,15 @@ Compaction* ColumnFamilyData::PickGarbageCollection(
     const MutableCFOptions& mutable_options, LogBuffer* log_buffer) {
   StopWatch sw(ioptions_.env, ioptions_.statistics,
                PICK_GARBAGE_COLLECTION_TIME);
+  double dynamic_blob_gc_ratio = mutable_options.blob_gc_ratio;
+  if (mutable_options.blob_file_bytes_limit > 0 && 
+        current_->storage_info()->total_blob_file_size() >= mutable_options.blob_file_bytes_limit) {
+    dynamic_blob_gc_ratio = 1e-15;
+    ROCKS_LOG_INFO(
+            ioptions_.info_log,
+            "[GC Stall] set dynamic blob gc ratio %f when pick",
+            dynamic_blob_gc_ratio);
+  }
   auto* result = compaction_picker_->PickGarbageCollection(
       GetName(), mutable_options, current_->storage_info(), log_buffer);
   if (result != nullptr) {
