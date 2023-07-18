@@ -2040,6 +2040,9 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
 void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact != nullptr);
+
+  RecordTick(stats_, GC_INPUT_BYTES, sub_compact->compaction->CalculateTotalInputSize());
+
   //*********
   StopWatch sw(env_, stats_, GC_ALL_TIME);
   //*********

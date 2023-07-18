@@ -1015,7 +1015,7 @@ bool ColumnFamilyData::NeedsGarbageCollection() const {
   }
   return !vstorage->IsPickGarbageCollectionFail() &&
          (vstorage->blob_marked_for_compaction() ||
-          vstorage->total_garbage_ratio() >= mutable_cf_options_.blob_gc_ratio);
+          vstorage->total_garbage_ratio() >= dynamic_blob_gc_ratio);
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -1048,7 +1048,7 @@ Compaction* ColumnFamilyData::PickGarbageCollection(
             dynamic_blob_gc_ratio);
   }
   auto* result = compaction_picker_->PickGarbageCollection(
-      GetName(), mutable_options, current_->storage_info(), log_buffer);
+      GetName(), mutable_options, dynamic_blob_gc_ratio, current_->storage_info(), log_buffer);
   if (result != nullptr) {
     result->SetInputVersion(current_);
     result->set_compaction_load(0);
