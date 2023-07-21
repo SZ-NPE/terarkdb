@@ -630,9 +630,13 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
 
   virtual Status Read(uint64_t offset, size_t n, Slice* result,
                       char* scratch) const override {
-    if (n + alignment_ >= readahead_size_) {
-      return file_->Read(offset, n, result, scratch);
-    }
+    #ifdef DISABLE_READAHEAD
+        return file_->Read(offset, n, result, scratch);
+    #else
+      if (n + alignment_ >= readahead_size_) {
+        return file_->Read(offset, n, result, scratch);
+      }
+    #endif
 
     std::unique_lock<std::mutex> lk(lock_);
 
