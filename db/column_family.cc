@@ -38,6 +38,11 @@
 #include "util/compression.h"
 #include "util/sst_file_manager_impl.h"
 
+
+#ifdef DISABLE_READAHEAD
+#include <iostream>
+#endif   
+
 namespace TERARKDB_NAMESPACE {
 
 ColumnFamilyHandleImpl::ColumnFamilyHandleImpl(
@@ -177,6 +182,9 @@ Status CheckCFPathsSupported(const DBOptions& db_options,
 
 ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
                                     const ColumnFamilyOptions& src) {
+  #ifdef DISABLE_READAHEAD
+    std::cout << "define DISABLE_READAHEAD" << std::endl;
+  #endif   
   ColumnFamilyOptions result = src;
   size_t clamp_max = std::conditional<
       sizeof(size_t) == 4, std::integral_constant<size_t, 0xffffffff>,
