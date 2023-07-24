@@ -48,6 +48,10 @@
 #define F_SET_RW_HINT (F_LINUX_SPECIFIC_BASE + 12)
 #endif
 
+#ifndef NDEBUG
+#include <iostream>
+#endif
+
 namespace TERARKDB_NAMESPACE {
 
 // A wrapper for fadvise, if the platform doesn't support fadvise,
@@ -375,7 +379,12 @@ static Status PosixFsRead(uint64_t offset, size_t n, Slice* result,
 
 Status PosixRandomAccessFile::Read(uint64_t offset, size_t n, Slice* result,
                                    char* scratch) const {
+
+      #ifndef NDEBUG
+        std::cout << "read io size (KB)" << n / 1024 << std::endl;
+      #endif
 #if !defined(NDEBUG)
+
   if (use_direct_io_) {
     assert(IsSectorAligned(offset, GetRequiredBufferAlignment()));
     assert(IsSectorAligned(n, GetRequiredBufferAlignment()));
