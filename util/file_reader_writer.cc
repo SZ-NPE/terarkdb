@@ -24,6 +24,8 @@
 
 #undef min
 
+extern thread_local int gc_read_ahead_size;
+
 namespace TERARKDB_NAMESPACE {
 
 #ifndef NDEBUG
@@ -630,10 +632,18 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
 
   virtual Status Read(uint64_t offset, size_t n, Slice* result,
                       char* scratch) const override {
+
+    size_t actual_readahead_size = readahead_size_;
+    #ifdef GC_READAHEAD
+    if (gc_read_ahead_size != -1) {
+      actual_readahead_size = gc_read_ahead_size;
+    }
+    #endif GC_READAHEAD                    
+
     #ifdef DISABLE_READAHEAD
         return file_->Read(offset, n, result, scratch);
     #else
-      if (n + alignment_ >= readahead_size_) {
+      if (n + alignment_ >= actual_readahead_size) {
         return file_->Read(offset, n, result, scratch);
       }
     #endif
@@ -648,7 +658,7 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
     if (TryReadFromCache(offset, n, &cached_len, scratch) &&
         (cached_len == n ||
          // End of file
-         buffer_.CurrentSize() < readahead_size_)) {
+         buffer_.CurrentSize() < actual_readahead_size)) {
       *result = Slice(scratch, cached_len);
       return Status::OK();
     }
@@ -658,7 +668,7 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
     size_t chunk_offset = TruncateToPageBoundary(alignment_, advanced_offset);
     Slice readahead_result;
 
-    Status s = ReadIntoBuffer(chunk_offset, readahead_size_);
+    Status s = ReadIntoBuffer(chunk_offset, actual_readahead_size);
     if (s.ok()) {
       // In the case of cache miss, i.e. when cached_len equals 0, an offset can
       // exceed the file end position, so the following check is required

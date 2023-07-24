@@ -84,6 +84,8 @@
 #include "util/sync_point.h"
 #include "utilities/util/valvec.hpp"
 
+thread_local int gc_read_ahead_size = -1;
+
 namespace TERARKDB_NAMESPACE {
 
 const char* GetCompactionReasonString(CompactionReason compaction_reason) {
@@ -2040,7 +2042,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
 void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact != nullptr);
-
+  gc_read_ahead_size = 0 * 1024;
   RecordTick(stats_, GC_INPUT_BYTES, sub_compact->compaction->CalculateTotalInputSize());
 
   //*********
@@ -2299,6 +2301,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
 
   input.reset();
   sub_compact->status = status;
+
+  gc_read_ahead_size = -1;
 }
 
 void CompactionJob::RecordDroppedKeys(
