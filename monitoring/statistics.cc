@@ -146,7 +146,14 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_READ_BYTES, "lavakv.gc.read.bytes"},
     {GC_WRITE_BYTES, "lavakv.gc.write.bytes"},
     {GC_GETKEY_READ_BYTES, "lavakv.gc.getkey.read.bytes"},
-
+    {BLOCK_CACHE_HIT_FG, "rocksdb.block.cache.hit.fg"},
+    {BLOCK_CACHE_MISS_FG, "rocksdb.block.cache.miss.fg"},
+    {BLOCK_CACHE_HIT_BG, "rocksdb.block.cache.hit.bg"},
+    {BLOCK_CACHE_MISS_BG, "rocksdb.block.cache.miss.bg"},
+    {BLOCK_CACHE_HIT_GET_KEYS, "rocksdb.block.cache.hit.get.keys"},
+    {BLOCK_CACHE_MISS_GET_KEYS, "rocksdb.block.cache.miss.get.keys"},
+    {BLOCK_CACHE_HIT_GC_READ, "rocksdb.block.cache.hit.gc.read"},
+    {BLOCK_CACHE_MISS_GC_READ, "rocksdb.block.cache.miss.gc.read"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
@@ -164,6 +171,10 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
     {COMPACTION_OUTFILE_SYNC_MICROS, "rocksdb.compaction.outfile.sync.micros"},
     {WAL_FILE_SYNC_MICROS, "rocksdb.wal.file.sync.micros"},
     {MANIFEST_FILE_SYNC_MICROS, "rocksdb.manifest.file.sync.micros"},
+    {GC_GET_KEY_TIME, "lavakv.garbage.collection.get.key.micros"},
+    {GC_READ_TIME, "lavakv.garbage.collection.read.micros"},
+    {GC_WRITE_TIME, "lavakv.garbage.collection.write.micros"},
+    {GC_ALL_TIME, "lavakv.garbage.collection.all.micros"},
     {TABLE_OPEN_IO_MICROS, "rocksdb.table.open.io.micros"},
     {DB_MULTIGET, "rocksdb.db.multiget.micros"},
     {READ_BLOCK_COMPACTION_MICROS, "rocksdb.read.block.compaction.micros"},

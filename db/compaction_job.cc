@@ -2191,7 +2191,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         break;
       }
       curr_file_number = value.file_number();
-
+      
       {
         StopWatch sw2(env_, stats_, GC_WRITE_TIME);
         assert(sub_compact->blob_builder != nullptr);

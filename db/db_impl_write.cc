@@ -134,6 +134,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   }
 
   StopWatch write_sw(env_, immutable_db_options_.statistics.get(), DB_WRITE);
+  DBOperationTypeGuard op_guard(kOpTypeFG);
 
   write_thread_.JoinBatchGroup(&w);
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {

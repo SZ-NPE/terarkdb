@@ -166,6 +166,16 @@ Cache::Handle* GetEntryFromCache(Cache* block_cache, const Slice& key,
       RecordTick(statistics, BLOCK_CACHE_BYTES_READ,
                  block_cache->GetUsage(cache_handle));
       RecordTick(statistics, block_cache_hit_ticker);
+      if (is_foreground_operation()) {
+        RecordTick(statistics, BLOCK_CACHE_HIT_FG);
+      } else {
+        RecordTick(statistics, BLOCK_CACHE_HIT_BG);
+        if (is_getkey_operation()) {
+          RecordTick(statistics, BLOCK_CACHE_HIT_GET_KEYS);
+        } else {
+          RecordTick(statistics, BLOCK_CACHE_HIT_GC_READ);
+        }
+      }
     }
   } else {
     if (get_context != nullptr) {
@@ -176,6 +186,16 @@ Cache::Handle* GetEntryFromCache(Cache* block_cache, const Slice& key,
     } else {
       RecordTick(statistics, BLOCK_CACHE_MISS);
       RecordTick(statistics, block_cache_miss_ticker);
+      if (is_foreground_operation()) {
+        RecordTick(statistics, BLOCK_CACHE_MISS_FG);
+      } else {
+        RecordTick(statistics, BLOCK_CACHE_MISS_BG);
+        if (is_getkey_operation()) {
+          RecordTick(statistics, BLOCK_CACHE_MISS_GET_KEYS);
+        } else {
+          RecordTick(statistics, BLOCK_CACHE_MISS_GC_READ);
+        }
+      }
     }
   }
 
