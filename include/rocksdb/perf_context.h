@@ -17,8 +17,12 @@ namespace TERARKDB_NAMESPACE {
 
 enum DBOperationType : unsigned char {
   kOpTypeBG = 0,
-  kOpTypeFG = 1,
-  kOpTypeUndefined = 2,
+  kOpTypeGC = 1,
+  kOpTypeFlush = 2,
+  kOpTypeCompaction = 3,
+  kOpTypeFG = 4,
+  kOpTypeUndefined = 5,
+
 };
 
 class DBOperationTypeGuard {
@@ -241,6 +245,9 @@ PerfContext* get_perf_context();
 DBOperationType get_db_operation_type();
 
 bool is_foreground_operation();
+bool is_flush_operation();
+bool is_compaction_operation();
+bool is_garbage_collenction_operation();
 
 BGOperationType get_bg_operation_type();
 

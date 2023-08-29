@@ -15,6 +15,7 @@
 
 #include "db/version_set.h"
 #include "rocksdb/terark_namespace.h"
+#include "util/static_index_map.h"
 
 namespace TERARKDB_NAMESPACE {
 

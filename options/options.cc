@@ -143,6 +143,9 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
       ttl_extractor_factory ? ttl_extractor_factory->Name() : "None");
   ROCKS_LOG_HEADER(log, "       Options.compaction_filter: %s",
                    compaction_filter ? compaction_filter->Name() : "None");
+  ROCKS_LOG_HEADER(log, "          Options.drop_key_cache: %s",
+                   drop_key_cache ? drop_key_cache->Name() : "None");
+  ROCKS_LOG_HEADER(log, "           Options.hotness_aware: %d", hotness_aware);
   ROCKS_LOG_HEADER(
       log, "       Options.compaction_filter_factory: %s",
       compaction_filter_factory ? compaction_filter_factory->Name() : "None");

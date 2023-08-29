@@ -1253,6 +1253,9 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
 
   double seconds_up = (env_->NowMicros() - started_at_ + 1) / kMicrosInSec;
   double interval_seconds_up = seconds_up - cf_stats_snapshot_.seconds_up;
+  snprintf(buf, sizeof(buf), "Static index map(GB): %.3f\n",
+           static_cast<double>(StaticMapIndex::index_key_map_size / kGB));
+  value->append(buf);
   snprintf(buf, sizeof(buf), "Uptime(secs): %.1f total, %.1f interval\n",
            seconds_up, interval_seconds_up);
   value->append(buf);

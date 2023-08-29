@@ -21,6 +21,7 @@
 #include "util/string_util.h"
 #include "util/sync_point.h"
 #include "utilities/util/factory.h"
+#include "rocksdb/perf_context.h"
 
 #undef min
 
@@ -106,6 +107,7 @@ Status RandomAccessFileReader::Read(uint64_t offset, size_t n, Slice* result,
                                     char* scratch) const {
   Status s;
   uint64_t elapsed = 0;
+  uint64_t begin = IOSTATS(bytes_read);
   {
     StopWatch sw(env_, stats_, hist_type_,
                  (stats_ != nullptr) ? &elapsed : nullptr, true /*overwrite*/,
@@ -212,7 +214,22 @@ Status RandomAccessFileReader::Read(uint64_t offset, size_t n, Slice* result,
       }
       *result = Slice(res_scratch, s.ok() ? pos : 0);
     }
-    IOSTATS_ADD_IF_POSITIVE(bytes_read, result->size());
+    // IOSTATS_ADD_IF_POSITIVE(bytes_read, result->size());
+
+    uint64_t end = IOSTATS(bytes_read);
+    uint64_t diff = end - begin;
+    if (diff > 0) {
+      RecordTick(stats_, RANDOM_IO_READ_BYTES, diff);
+      if (is_flush_operation()) {
+          RecordTick(stats_, FLUSH_IO_READ_BYTES, diff);
+      } else if (is_compaction_operation()) {
+          RecordTick(stats_, COMPACTION_IO_READ_BYTES, diff);
+      } else if (is_foreground_operation()) {
+          RecordTick(stats_, FG_IO_READ_BYTES, diff);
+      } else if (is_garbage_collenction_operation()) {
+          RecordTick(stats_, GC_IO_READ_BYTES, diff);
+      }
+    }
   }
   if (stats_ != nullptr && file_read_hist_ != nullptr) {
     file_read_hist_->Add(elapsed);
@@ -225,7 +242,6 @@ Status WritableFileWriter::Append(const Slice& data) {
   size_t left = data.size();
   Status s;
   pending_sync_ = true;
-
   TEST_KILL_RANDOM("WritableFileWriter::Append:0",
                    rocksdb_kill_odds * REDUCE_ODDS2);
 
@@ -283,7 +299,6 @@ Status WritableFileWriter::Append(const Slice& data) {
     assert(buf_.CurrentSize() == 0);
     s = WriteBuffered(src, left, true);
   }
-
   TEST_KILL_RANDOM("WritableFileWriter::Append:1", rocksdb_kill_odds);
   if (s.ok()) {
     filesize_ += data.size();
@@ -590,6 +605,17 @@ Status WritableFileWriter::WriteDirect() {
     }
 
     IOSTATS_ADD(bytes_written, size);
+    RecordTick(stats_, IO_WRITE_BYTES, size);
+    if (is_flush_operation()) {
+      RecordTick(stats_, FLUSH_IO_WRITE_BYTES, size);
+    } else if (is_compaction_operation()) {
+      RecordTick(stats_, COMPACTION_IO_WRITE_BYTES, size);
+    } else if (is_foreground_operation()) {
+      RecordTick(stats_, FG_IO_WRITE_BYTES, size);
+    } else if (is_garbage_collenction_operation()) {
+      RecordTick(stats_, GC_IO_WRITE_BYTES, size);
+    }
+
     left -= size;
     src += size;
     write_offset += size;
@@ -638,7 +664,7 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
     if (gc_read_ahead_size != -1) {
       actual_readahead_size = gc_read_ahead_size;
     }
-    #endif GC_READAHEAD                    
+    #endif                    
 
     #ifdef DISABLE_READAHEAD
         return file_->Read(offset, n, result, scratch);

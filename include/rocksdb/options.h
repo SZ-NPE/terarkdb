@@ -178,6 +178,15 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Default: nullptr
   const CompactionFilter* compaction_filter = nullptr;
 
+  // [HUST] Hotness awareness
+  // drop keys cache
+  // Default: nullptr
+  std::shared_ptr<Cache> drop_key_cache = nullptr;
+
+  // Control whether the hotness awareness function is turned on
+  // Default: false
+  bool hotness_aware = false;
+
   // This is a factory that provides compaction filter objects which allow
   // an application to modify/delete a key-value during background compaction.
   //

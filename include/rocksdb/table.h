@@ -259,6 +259,17 @@ struct BlockBasedTableOptions {
 
   // Align data blocks on lesser of page size and block size
   bool block_align = false;
+
+  // [HUST: Validity check accelerate]
+  // Use index key block to store repetitive index key during kv seperation
+  // use_index_key_block is immutable, if use_index_key_block is false, the
+  // engine option [validity_check_accelerate] must be false as well
+  bool use_index_key_block = false;
+
+  // [HUST: Read accelerate]
+  // Keep one key-value one block in blob file
+  // Store full index in index block
+  bool blob_single_key_block = false;
 };
 
 // Table Properties that are specific to block-based table properties.

@@ -336,6 +336,11 @@ static Status PosixFsRead(uint64_t offset, size_t n, Slice* result,
                           char* scratch, int fd_, const std::string& filename_,
                           bool use_aio_reads_, bool use_direct_io_,
                           size_t filealign) {
+  #ifndef NDEBUG
+    std::cout << "[tid:" << std::this_thread::get_id() << "][fd:" << fd_ << "] read io size " << n << std::endl;
+  #endif
+  // IOSTATS_ADD_IF_POSITIVE(bytes_read, n);
+
   Status s;
   ssize_t r = -1;
   size_t left = n;
@@ -351,6 +356,13 @@ static Status PosixFsRead(uint64_t offset, size_t n, Slice* result,
 #endif
     } else {
       r = pread(fd_, ptr, left, static_cast<off_t>(offset));
+      IOSTATS_ADD_IF_POSITIVE(bytes_read, r);
+#ifndef NDEBUG
+  if (r != left) {
+    std::cout << "[tid:" << std::this_thread::get_id() << "][fd:" << fd_ << "] pread io size " << left << std::endl;
+  }
+#endif
+
     }
     if (r <= 0) {
       if (r == -1 && errno == EINTR) {

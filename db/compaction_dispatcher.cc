@@ -566,7 +566,8 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
         return s;
       }
       std::unique_ptr<RandomAccessFileReader> file_reader(
-          new RandomAccessFileReader(std::move(file), file_name, env));
+          new RandomAccessFileReader(std::move(file), file_name, env,
+                                     immutable_cf_options.statistics));
       std::unique_ptr<TableReader> reader;
       TableReaderOptions table_reader_options(
           immutable_cf_options, mutable_cf_options.prefix_extractor.get(),
@@ -732,6 +733,7 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
       input.get(), &separate_helper, end, ucmp, &merge, context.last_sequence,
       &context.existing_snapshots, context.earliest_write_conflict_snapshot,
       nullptr, env, false, false, &range_del_agg,
+      immutable_cf_options.drop_key_cache, immutable_cf_options.hotness_aware,
       std::unique_ptr<CompactionIterator::CompactionProxy>(
           new RemoteCompactionProxy(&context)),
       context.blob_config, compaction_filter, nullptr,
@@ -803,7 +805,8 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
         second_pass_iter_storage.input.get(), &separate_helper, end, ucmp,
         merge_ptr, context.last_sequence, &context.existing_snapshots,
         context.earliest_write_conflict_snapshot, nullptr, env, false, false,
-        range_del_agg_ptr, std::move(compaction), context.blob_config,
+        range_del_agg_ptr, immutable_cf_options.drop_key_cache,
+        immutable_cf_options.hotness_aware, std::move(compaction), context.blob_config,
         second_pass_iter_storage.compaction_filter, nullptr,
         context.preserve_deletes_seqnum);
   };
@@ -819,7 +822,7 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
         immutable_cf_options, mutable_cf_options, *icmp,
         &int_tbl_prop_collector_factories.data, context.compression,
         context.compression_opts, nullptr /* compression_dict */,
-        context.skip_filters, context.cf_name, -1 /* level */,
+        context.skip_filters, context.meta_type, context.cf_name, -1 /* level */,
         0 /* compaction_load */);
     table_builder_options.smallest_user_key = context.smallest_user_key;
     table_builder_options.largest_user_key = context.largest_user_key;

@@ -267,9 +267,22 @@ DEFINE_int32(duration, 0,
 
 DEFINE_int32(value_size, 100, "Size of each value");
 
-DEFINE_int32(kv_sep_size, 512, "Size of the key-value separator");
-
 DEFINE_double(small_kv_ratio, 0.0, "Ratio of small key-value pairs");
+
+DEFINE_bool(use_index_key_block, true,
+            "Used to choose whether the validity check acceleration function "
+            "is turned on");
+
+DEFINE_bool(blob_single_key_block, true,
+            "Used to choose whether the gc read acceleration function is"
+            "turned on");
+
+DEFINE_bool(hotness_aware, true,
+            "Used to choose whether the hotness awareness fubction is"
+            "turned on");
+
+DEFINE_int64(drop_key_cache_size, 8 << 20,  // 8MB
+             "Number of bytes to use as a cache of drop keys");
 
 DEFINE_int32(seek_nexts, 0,
              "How many times to call Next() after Seek() in "
@@ -2081,6 +2094,7 @@ class Duration {
 class Benchmark {
  private:
   std::shared_ptr<Cache> cache_;
+  std::shared_ptr<Cache> drop_key_cache_;
   std::shared_ptr<Cache> compressed_cache_;
   std::shared_ptr<const FilterPolicy> filter_policy_;
   const SliceTransform* prefix_extractor_;
@@ -2093,6 +2107,8 @@ class Benchmark {
   double small_kv_ratio_;
   int key_size_;
   int prefix_size_;
+  int kv_sep_size_;
+  double small_kv_ratio_;
   int64_t keys_per_prefix_;
   int64_t entries_per_batch_;
   int64_t writes_before_delete_range_;
@@ -2419,6 +2435,7 @@ class Benchmark {
  public:
   Benchmark()
       : cache_(NewCache(FLAGS_cache_size)),
+        drop_key_cache_(NewCache(FLAGS_drop_key_cache_size)),
         compressed_cache_(NewCache(FLAGS_compressed_cache_size)),
         filter_policy_(FLAGS_bloom_bits >= 0
                            ? NewBloomFilterPolicy(FLAGS_bloom_bits,
@@ -2432,6 +2449,8 @@ class Benchmark {
         kv_sep_size_(FLAGS_kv_sep_size),
         key_size_(FLAGS_key_size),
         prefix_size_(FLAGS_prefix_size),
+        small_kv_ratio_(FLAGS_small_kv_ratio),
+        kv_sep_size_(FLAGS_blob_size),
         keys_per_prefix_(FLAGS_keys_per_prefix),
         entries_per_batch_(1),
         reads_(FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads),
@@ -2630,6 +2649,8 @@ class Benchmark {
       small_kv_ratio_ = FLAGS_small_kv_ratio;
       kv_sep_size_ = FLAGS_kv_sep_size;
       key_size_ = FLAGS_key_size;
+      small_kv_ratio_ = FLAGS_small_kv_ratio;
+      kv_sep_size_ = FLAGS_blob_size;
       entries_per_batch_ = FLAGS_batch_size;
       writes_before_delete_range_ = FLAGS_writes_before_delete_range;
       writes_per_range_tombstone_ = FLAGS_writes_per_range_tombstone;
@@ -3504,6 +3525,8 @@ class Benchmark {
       block_based_options.enable_index_compression =
           FLAGS_enable_index_compression;
       block_based_options.block_align = FLAGS_block_align;
+      block_based_options.use_index_key_block = FLAGS_use_index_key_block;
+      block_based_options.blob_single_key_block = FLAGS_blob_single_key_block;
       if (FLAGS_use_data_block_hash_index) {
         block_based_options.data_block_index_type =
             TERARKDB_NAMESPACE::BlockBasedTableOptions::kDataBlockBinaryAndHash;
@@ -3677,6 +3700,9 @@ class Benchmark {
     if (FLAGS_thread_status_per_interval > 0) {
       options.enable_thread_tracking = true;
     }
+    // Set hotness aware options
+    options.drop_key_cache = drop_key_cache_;
+    options.hotness_aware = FLAGS_hotness_aware;
 
 #ifndef ROCKSDB_LITE
     if (FLAGS_readonly && FLAGS_transaction_db) {
@@ -4582,24 +4608,17 @@ class Benchmark {
     return FLAGS_sine_a * sin((FLAGS_sine_b * x) + FLAGS_sine_c) + FLAGS_sine_d;
   }
 
-  int32_t GetValueSizeWithRatio(Random64* rand, int32_t fixed_value_size, int32_t kv_sep_size, double small_kv_ratio) {
-    int32_t vsize = 0;
+  int32_t GetValueSizeWithRatio(Random64* rand, int32_t fixed_value_size,
+                                int32_t kv_sep_size, double small_kv_ratio) {
     if (small_kv_ratio <= 0 || kv_sep_size == 0) {
-      vsize = fixed_value_size;
+      return fixed_value_size;
     }
     double rand_value = rand->Uniform(100);
     if (rand_value < small_kv_ratio * 100) {
-      vsize = rand->Uniform(kv_sep_size) + 1;
+      return rand->Uniform(kv_sep_size) + 1;
     } else {
-      vsize = fixed_value_size;
+      return fixed_value_size;
     }
-
-    #ifdef SZ_DBG
-      total_value_size += vsize;
-      total_value_size += FLAGS_key_size;
-    #endif
-
-    return vsize;
   }
 
   void DoWrite(ThreadState* thread, WriteMode write_mode) {
@@ -4680,7 +4699,8 @@ class Benchmark {
         thread->stats.ResetLastOpTime();
       }
 
-      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
+      int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
       for (int64_t j = 0; j < entries_per_batch_; j++) {
         int64_t rand_num = key_gens[id]->Next();
         if (write_mode == MULTI_UNIQUE_RANDOM)
@@ -4688,15 +4708,15 @@ class Benchmark {
         else
           GenerateKeyFromInt(rand_num, FLAGS_num, &key, -1);
         if (FLAGS_num_column_families <= 1) {
-          batch.Put(key, gen.Generate(vlength));
+          batch.Put(key, gen.Generate(vLength));
         } else {
           // We use same rand_num as seed for key and column family so that we
           // can deterministically find the cfh corresponding to a particular
           // key while reading the key.
           batch.Put(db_with_cfh->GetCfh(rand_num), key,
-                    gen.Generate(vlength));
+                    gen.Generate(vLength));
         }
-        bytes += vlength + key_size_;
+        bytes += vLength + key_size_;
         ++num_written;
         if (writes_per_range_tombstone_ > 0 &&
             num_written > writes_before_delete_range_ &&
@@ -5532,20 +5552,21 @@ class Benchmark {
         }
       }
 
-      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
+      int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
       GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key, -1);
       Status s;
       if (write_merge == kWrite) {
-        s = db->Put(write_options_, key, gen.Generate(vlength));
+        s = db->Put(write_options_, key, gen.Generate(vLength));
       } else {
-        s = db->Merge(write_options_, key, gen.Generate(vlength));
+        s = db->Merge(write_options_, key, gen.Generate(vLength));
       }
       written++;
       if (!s.ok()) {
         fprintf(stderr, "put or merge error: %s\n", s.ToString().c_str());
         exit(1);
       }
-      bytes += key.size() + vlength;
+      bytes += key.size() + vLength;
       thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
 
       if (FLAGS_benchmark_write_rate_limit > 0) {
@@ -5723,7 +5744,9 @@ class Benchmark {
 
         // then do all the corresponding number of puts
         // for all the gets we have done earlier
-        Status s = PutMany(db, write_options_, key, gen.Generate(vlength));
+        int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                                kv_sep_size_, small_kv_ratio_);
+        Status s = PutMany(db, write_options_, key, gen.Generate(vLength));
         if (!s.ok()) {
           fprintf(stderr, "putmany error: %s\n", s.ToString().c_str());
           exit(1);
@@ -5791,8 +5814,9 @@ class Benchmark {
       } else if (put_weight > 0) {
         // then do all the corresponding number of puts
         // for all the gets we have done earlier
-        int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
-        Status s = db->Put(write_options_, key, gen.Generate(vlength));
+        int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                                kv_sep_size_, small_kv_ratio_);
+        Status s = db->Put(write_options_, key, gen.Generate(vLength));
         if (!s.ok()) {
           fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           exit(1);
@@ -5844,12 +5868,14 @@ class Benchmark {
       }
       int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
 
-      Status s = db->Put(write_options_, key, gen.Generate(vlength));
+      int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
+      Status s = db->Put(write_options_, key, gen.Generate(vLength));
       if (!s.ok()) {
         fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         exit(1);
       }
-      bytes += key.size() + vlength;
+      bytes += key.size() + vLength;
       thread->stats.FinishedOps(nullptr, db, 1, kUpdate);
     }
     char msg[100];
@@ -5889,7 +5915,9 @@ class Benchmark {
       }
       int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
 
-      Slice value = gen.Generate(vlength);
+      int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
+      Slice value = gen.Generate(vLength);
       std::string new_value;
 
       if (status.ok()) {
@@ -5946,7 +5974,9 @@ class Benchmark {
       int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
 
       // Update the value (by appending data)
-      Slice operand = gen.Generate(vlength);
+      int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
+      Slice operand = gen.Generate(vLength);
       if (value.size() > 0) {
         // Use a delimiter to match the semantics for StringAppendOperator
         value.append(1, ',');
@@ -5987,29 +6017,30 @@ class Benchmark {
     Slice key = AllocateKey(&key_guard);
     // The number of iterations is the larger of read_ or write_
     Duration duration(FLAGS_duration, readwrites_);
-
-    int32_t vlength;
+    int32_t vLength;
     while (!duration.Done(1)) {
       DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
       int64_t key_rand = thread->rand.Next() % merge_keys_;
       GenerateKeyFromInt(key_rand, merge_keys_, &key, -1);
-      vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
+
+      vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                      kv_sep_size_, small_kv_ratio_);
       Status s;
       if (FLAGS_num_column_families > 1) {
         s = db_with_cfh->db->Merge(write_options_,
                                    db_with_cfh->GetCfh(key_rand), key,
-                                   gen.Generate(vlength));
+                                   gen.Generate(vLength));
       } else {
         s = db_with_cfh->db->Merge(write_options_,
                                    db_with_cfh->db->DefaultColumnFamily(), key,
-                                   gen.Generate(vlength));
+                                   gen.Generate(vLength));
       }
 
       if (!s.ok()) {
         fprintf(stderr, "merge error: %s\n", s.ToString().c_str());
         exit(1);
       }
-      bytes += key.size() + vlength;
+      bytes += key.size() + vLength;
       thread->stats.FinishedOps(nullptr, db_with_cfh->db, 1, kMerge);
     }
 
@@ -6048,9 +6079,9 @@ class Benchmark {
       bool do_merge = int(thread->rand.Next() % 100) < FLAGS_mergereadpercent;
 
       if (do_merge) {
-        int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
-        
-        Status s = db->Merge(write_options_, key, gen.Generate(vlength));
+        int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                                kv_sep_size_, small_kv_ratio_);
+        Status s = db->Merge(write_options_, key, gen.Generate(vLength));
         if (!s.ok()) {
           fprintf(stderr, "merge error: %s\n", s.ToString().c_str());
           exit(1);
@@ -6233,8 +6264,9 @@ class Benchmark {
     DB* db = SelectDB(thread);
     for (int64_t i = 0; i < FLAGS_numdistinct; i++) {
       GenerateKeyFromInt(i * max_counter, FLAGS_num, &key, -1);
-      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
-      s = db->Put(write_options_, key, gen.Generate(vlength));
+      int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
+      s = db->Put(write_options_, key, gen.Generate(vLength));
       if (!s.ok()) {
         fprintf(stderr, "Operation failed: %s\n", s.ToString().c_str());
         exit(1);
@@ -6401,15 +6433,15 @@ class Benchmark {
       timestamp_emulator_->Inc();
 
       Status s;
-
-      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
-      s = db->Put(write_options_, key, gen.Generate(vlength));
+      int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
+      s = db->Put(write_options_, key, gen.Generate(vLength));
 
       if (!s.ok()) {
         fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         exit(1);
       }
-      bytes = key.size() + vlength;
+      bytes = key.size() + vLength;
       thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
       thread->stats.AddBytes(bytes);
 

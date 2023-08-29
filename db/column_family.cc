@@ -184,7 +184,11 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
                                     const ColumnFamilyOptions& src) {
   #ifdef DISABLE_READAHEAD
     std::cout << "define DISABLE_READAHEAD" << std::endl;
-  #endif   
+  #endif
+  #ifdef GC_READAHEAD
+    std::cout << "define GC_READAHEAD for gc" << std::endl;
+  #endif  
+
   ColumnFamilyOptions result = src;
   size_t clamp_max = std::conditional<
       sizeof(size_t) == 4, std::integral_constant<size_t, 0xffffffff>,
@@ -763,7 +767,7 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
         imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
         int(vstorage->read_amplification()),
         vstorage->estimated_compaction_needed_bytes(),
-        vstorage->total_blob_file_size(), vstorage->total_garbage_ratio(),
+        vstorage->total_db_file_size(), vstorage->total_garbage_ratio(),
         ioptions_.num_levels, mutable_cf_options);
     write_stall_condition = write_stall_condition_and_cause.first;
     auto write_stall_cause = write_stall_condition_and_cause.second;
@@ -826,10 +830,10 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
                                   1);
       ROCKS_LOG_WARN(
           ioptions_.info_log,
-          "[%s] Stopping writes because of total blob file bytes %" PRIu64 
+          "[%s] Stopping writes because of total db file bytes %" PRIu64 
           "and total garbage ratio %f"
           "(waiting for garbage collection)",
-          name_.c_str(), vstorage->total_blob_file_size(), vstorage->total_garbage_ratio());
+          name_.c_str(), vstorage->total_db_file_size(), vstorage->total_garbage_ratio());
     } else if (write_stall_condition == WriteStallCondition::kDelayed &&
                write_stall_cause == WriteStallCause::kMemtableLimit) {
       write_controller_token_ =
@@ -1014,7 +1018,7 @@ bool ColumnFamilyData::NeedsGarbageCollection() const {
   auto vstorage = current_->storage_info();
   double dynamic_blob_gc_ratio = mutable_cf_options_.blob_gc_ratio;
   if (mutable_cf_options_.blob_file_bytes_limit > 0 && 
-        vstorage->total_blob_file_size() >= mutable_cf_options_.blob_file_bytes_limit) {
+        vstorage->total_db_file_size() >= mutable_cf_options_.blob_file_bytes_limit) {
     dynamic_blob_gc_ratio = 1e-15;
     ROCKS_LOG_INFO(
             ioptions_.info_log,
@@ -1048,7 +1052,7 @@ Compaction* ColumnFamilyData::PickGarbageCollection(
                PICK_GARBAGE_COLLECTION_TIME);
   double dynamic_blob_gc_ratio = mutable_options.blob_gc_ratio;
   if (mutable_options.blob_file_bytes_limit > 0 && 
-        current_->storage_info()->total_blob_file_size() >= mutable_options.blob_file_bytes_limit) {
+        current_->storage_info()->total_db_file_size() >= mutable_options.blob_file_bytes_limit) {
     dynamic_blob_gc_ratio = 1e-15;
     ROCKS_LOG_INFO(
             ioptions_.info_log,

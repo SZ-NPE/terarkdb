@@ -731,6 +731,7 @@ set(SOURCES
         util/rate_limiter.cc
         util/slice.cc
         util/sst_file_manager_impl.cc
+        util/static_index_map.cc
         util/status.cc
         util/string_util.cc
         util/sync_point.cc

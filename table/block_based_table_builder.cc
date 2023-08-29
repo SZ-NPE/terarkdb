@@ -252,6 +252,7 @@ struct BlockBasedTableBuilder::Rep {
   size_t alignment;
   BlockBuilder data_block;
   BlockBuilder range_del_block;
+  BlockBuilder index_key_block;
 
   InternalKeySliceTransform internal_prefix_transform;
   std::unique_ptr<IndexBuilder> index_builder;
@@ -278,6 +279,8 @@ struct BlockBasedTableBuilder::Rep {
   const std::string& column_family_name;
   uint64_t creation_time = 0;
   uint64_t oldest_key_time = 0;
+  int level = 0;
+  MetaType meta_type = MetaType::KEYSST;
 
   std::vector<std::unique_ptr<IntTblPropCollector>> table_properties_collectors;
 
@@ -301,6 +304,7 @@ struct BlockBasedTableBuilder::Rep {
                        : table_options.data_block_index_type,
                    table_options.data_block_hash_table_util_ratio),
         range_del_block(1 /* block_restart_interval */),
+        index_key_block(table_options.block_restart_interval),
         internal_prefix_transform(builder_opt.moptions.prefix_extractor.get()),
         compression_dict(builder_opt.compression_dict),
         compression_ctx(builder_opt.compression_type,
@@ -314,7 +318,9 @@ struct BlockBasedTableBuilder::Rep {
         column_family_id(_column_family_id),
         column_family_name(builder_opt.column_family_name),
         creation_time(builder_opt.creation_time),
-        oldest_key_time(builder_opt.oldest_key_time) {
+        oldest_key_time(builder_opt.oldest_key_time),
+        level(builder_opt.level),
+        meta_type(MetaType(builder_opt.meta_type)) {
     if (table_options.index_type ==
         BlockBasedTableOptions::kTwoLevelIndexSearch) {
       p_index_builder_ = PartitionedIndexBuilder::CreateIndexBuilder(
@@ -325,7 +331,7 @@ struct BlockBasedTableBuilder::Rep {
       index_builder.reset(IndexBuilder::CreateIndexBuilder(
           table_options.index_type, &internal_comparator,
           &this->internal_prefix_transform, use_delta_encoding_for_index_values,
-          table_options));
+          table_options, meta_type));
     }
     if (builder_opt.skip_filters) {
       filter_builder = nullptr;
@@ -390,6 +396,9 @@ BlockBasedTableBuilder::~BlockBasedTableBuilder() {
 
 Status BlockBasedTableBuilder::Add(const Slice& key,
                                    const LazyBuffer& lazy_value) {
+  if (rep_->meta_type == MetaType::BLOB) {
+    return AddFullRecord(key, lazy_value);
+  }
   Rep* r = rep_;
   assert(!r->closed);
   assert(ok());
@@ -402,6 +411,12 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
       r->internal_comparator.Compare(key, Slice(r->last_key)) <= 0) {
     assert(r->internal_comparator.Compare(key, Slice(r->last_key)) > 0);
     return Status::Corruption("BlockBasedTableBuilder::Add: overlapping key");
+  }
+
+  ValueType value_type = ExtractValueType(key);
+  bool is_separated = false;
+  if (value_type == kTypeValueIndex || value_type == kTypeMergeIndex) {
+    is_separated = true;
   }
 
   auto should_flush = r->flush_block_policy->Update(key, value);
@@ -429,10 +444,71 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
 
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
+  if (is_separated && r->table_options.use_index_key_block) {
+    r->index_key_block.Add(key, value);
+  }
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
+  if (value_type == kTypeDeletion || value_type == kTypeSingleDeletion) {
+    r->props.num_deletions++;
+  } else if (value_type == kTypeMerge) {
+    r->props.num_merge_operands++;
+  }
+
+  r->index_builder->OnKeyAdded(key);
+  NotifyCollectTableCollectorsOnAdd(key, value, r->offset,
+                                    r->table_properties_collectors,
+                                    r->ioptions.info_log);
+  return r->status;
+}  // namespace TERARKDB_NAMESPACE
+
+Status BlockBasedTableBuilder::AddFullRecord(const Slice& key,
+                                             const LazyBuffer& lazy_value) {
+  Rep* r = rep_;
+  assert(!r->closed);
+  assert(ok());
+  auto s = lazy_value.fetch();
+  if (!s.ok()) {
+    return s;
+  }
+
+  if (r->props.num_entries > 0 &&
+      r->internal_comparator.Compare(key, Slice(r->last_key)) <= 0) {
+    assert(r->internal_comparator.Compare(key, Slice(r->last_key)) >
+                    0);
+    return Status::Corruption("BlockBasedTableBuilder::Add: overlapping key");
+  }
+
+  uint32_t value_size = 0;
+  uint64_t value_meta_size = 0;
+  LazyBuffer actual_lazy_value;
   ValueType value_type = ExtractValueType(key);
+  bool is_separated = false;
+  if (value_type == kTypeValueIndex || value_type == kTypeMergeIndex) {
+    is_separated = true;
+  }
+
+  const Slice& value = actual_lazy_value.slice();
+  if (!r->data_block.empty()) {
+    assert(!r->data_block.empty());
+    Flush();
+    if (ok()) {
+      r->index_builder->AddIndexEntry(&r->last_key, nullptr, r->pending_handle);
+    }
+  }
+
+  // Note: PartitionedFilterBlockBuilder requires key being added to filter
+  // builder after being added to index builder.
+  if (r->filter_builder != nullptr) {
+    r->filter_builder->Add(ExtractUserKey(key));
+  }
+
+  r->last_key.assign(key.data(), key.size());
+  r->data_block.Add(key, value);
+  r->props.num_entries++;
+  r->props.raw_key_size += key.size();
+  r->props.raw_value_size += value.size();
   if (value_type == kTypeDeletion || value_type == kTypeSingleDeletion) {
     r->props.num_deletions++;
   } else if (value_type == kTypeMerge) {
@@ -631,7 +707,8 @@ void BlockBasedTableBuilder::WriteRawBlock(const Slice& block_contents,
     }
     if (r->status.ok()) {
       r->offset += block_contents.size() + kBlockTrailerSize;
-      if (r->table_options.block_align && is_data_block) {
+      if (r->table_options.block_align && is_data_block &&
+          r->meta_type != MetaType::BLOB) {
         size_t pad_bytes =
             (r->alignment - ((block_contents.size() + kBlockTrailerSize) &
                              (r->alignment - 1))) &
@@ -832,6 +909,18 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
         rep_->use_delta_encoding_for_index_values;
     rep_->props.creation_time = rep_->creation_time;
     rep_->props.oldest_key_time = rep_->oldest_key_time;
+    if (rep_->table_options.use_index_key_block) {
+      assert(rep_->props.use_index_key_block == false);
+      rep_->props.use_index_key_block = true;
+    }
+    if (rep_->table_options.blob_single_key_block &&
+        rep_->meta_type == MetaType::BLOB &&
+        rep_->table_options.index_type ==
+            BlockBasedTableOptions::kBinarySearch) {
+      assert(rep_->props.index_key_is_user_key == false);
+      rep_->props.blob_single_key_block = true;
+    }
+    rep_->props.meta_type = rep_->meta_type;
 
     // Add basic properties
     property_block_builder.AddTableProperty(rep_->props);
@@ -874,6 +963,17 @@ void BlockBasedTableBuilder::WriteRangeDelBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteIndexKeyBlock(
+    MetaIndexBuilder* meta_index_builder) {
+  if (ok() && rep_->table_options.use_index_key_block &&
+      !rep_->index_key_block.empty()) {
+    BlockHandle index_key_block_handle;
+    WriteRawBlock(rep_->index_key_block.Finish(), kNoCompression,
+                  &index_key_block_handle);
+    meta_index_builder->Add(kIndexKeyBlock, index_key_block_handle);
+  }
+}
+
 Status BlockBasedTableBuilder::Finish(
     const TablePropertyCache* prop,
     const std::vector<SequenceNumber>* snapshots,
@@ -911,6 +1011,7 @@ Status BlockBasedTableBuilder::Finish(
   //    3. [meta block: compression dictionary]
   //    4. [meta block: range deletion tombstone]
   //    5. [meta block: properties]
+  //    7. [meta block: index key]
   //    6. [metaindex block]
   BlockHandle metaindex_block_handle, index_block_handle;
   MetaIndexBuilder meta_index_builder;
@@ -918,6 +1019,7 @@ Status BlockBasedTableBuilder::Finish(
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
+  WriteIndexKeyBlock(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);
   if (ok()) {
     // flush the meta index block

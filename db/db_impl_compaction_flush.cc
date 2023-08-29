@@ -1723,7 +1723,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
               vstorage->l0_delay_trigger_count() + 1,
               int(vstorage->read_amplification()) + 1,
               vstorage->estimated_compaction_needed_bytes(),
-              vstorage->total_blob_file_size(), vstorage->total_garbage_ratio(),
+              vstorage->total_db_file_size(), vstorage->total_garbage_ratio(),
               cfd->ioptions()->num_levels, mutable_cf_options)
               .first;
     } while (write_stall_condition != WriteStallCondition::kNormal);
@@ -2055,6 +2055,7 @@ void DBImpl::SchedulePendingPurge(const std::string& fname,
 }
 
 void DBImpl::BGWorkFlush(void* db) {
+  DBOperationTypeGuard op_guard(kOpTypeFlush);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::HIGH);
   TEST_SYNC_POINT("DBImpl::BGWorkFlush");
   // Set the thread name to aid debugging
@@ -2065,6 +2066,7 @@ void DBImpl::BGWorkFlush(void* db) {
 }
 
 void DBImpl::BGWorkCompaction(void* arg) {
+  DBOperationTypeGuard op_guard(kOpTypeCompaction);
   CompactionArg ca = *(reinterpret_cast<CompactionArg*>(arg));
   delete reinterpret_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
@@ -2080,6 +2082,7 @@ void DBImpl::BGWorkCompaction(void* arg) {
 }
 
 void DBImpl::BGWorkGarbageCollection(void* arg) {
+  DBOperationTypeGuard op_guard(kOpTypeGC);
   CompactionArg ca = *(reinterpret_cast<CompactionArg*>(arg));
   delete reinterpret_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
@@ -2091,6 +2094,7 @@ void DBImpl::BGWorkGarbageCollection(void* arg) {
 }
 
 void DBImpl::BGWorkBottomCompaction(void* arg) {
+  DBOperationTypeGuard op_guard(kOpTypeCompaction);
   CompactionArg ca = *(static_cast<CompactionArg*>(arg));
   delete static_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::BOTTOM);

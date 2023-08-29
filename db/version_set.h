@@ -271,6 +271,8 @@ class VersionStorageInfo {
 
   uint64_t total_blob_file_size() const { return blob_file_size_; }
 
+  uint64_t total_db_file_size() const { return blob_file_size_ + lsm_file_size_; }
+
   bool blob_marked_for_compaction() const {
     return blob_marked_for_compaction_;
   }

@@ -1034,6 +1034,39 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     }
   }
 
+  // Read the index key meta block
+  bool found_index_key_block;
+  BlockHandle index_key_handle;
+  s = SeekToIndexKeyBlock(meta_iter.get(), &found_index_key_block,
+                          &index_key_handle);
+  if (!s.ok()) {
+    ROCKS_LOG_WARN(rep->ioptions.info_log,
+                   "Error when seeking to index key block from file: %s",
+                   s.ToString().c_str());
+  } else if (found_index_key_block && !index_key_handle.IsNull()) {
+    ReadOptions read_options;
+    std::unique_ptr<InternalIteratorBase<Slice>> iter(
+        NewDataBlockIterator<DataBlockIter>(rep, read_options,
+                                            index_key_handle));
+    assert(iter != nullptr);
+    s = iter->status();
+    if (!s.ok()) {
+      ROCKS_LOG_WARN(
+          rep->ioptions.info_log,
+          "Encountered error while reading data from index key block %s",
+          s.ToString().c_str());
+    } else {
+      rep->index_key_map =
+          std::make_unique<StaticMapIndex>(&rep->ioptions.internal_comparator);
+      s = rep->index_key_map->BuildStaticMapIndex(std::move(iter));
+      if (!s.ok()) {
+        ROCKS_LOG_WARN(rep->ioptions.info_log,
+                       "Encountered error while building index key map %s",
+                       s.ToString().c_str());
+      }
+    }
+  }
+
   bool need_upper_bound_check =
       PrefixExtractorChanged(rep->table_properties.get(), prefix_extractor);
 
@@ -2197,6 +2230,13 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekForPrev(
 
 template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToFirst() {
+  if (gc_accelerate_) {
+    is_out_of_bound_ = false;
+    SavePrevIndexValue();
+    index_iter_->SeekToFirst();
+    assert(index_iter_->Valid());
+    return;
+  }
   is_out_of_bound_ = false;
   SavePrevIndexValue();
   index_iter_->SeekToFirst();
@@ -2225,6 +2265,18 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToLast() {
 
 template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::Next() {
+  if (gc_accelerate_) {
+    assert(index_iter_->Valid());
+    index_iter_->Next();
+// #ifndef NDEBUG
+//     if (index_iter_->Valid()) {
+//       fetch_value();
+//       assert(index_iter_->key().ToString() ==
+//                       block_iter_.key().ToString());
+//     }
+// #endif  // !NDEBUG
+    return;
+  }
   assert(block_iter_points_to_real_block_);
   block_iter_.Next();
   FindKeyForward();
@@ -2353,6 +2405,10 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyBackward() {
 InternalIterator* BlockBasedTable::NewIterator(
     const ReadOptions& read_options, const SliceTransform* prefix_extractor,
     Arena* arena, bool skip_filters, bool for_compaction) {
+  bool gc_read_optimization =
+      rep_->table_properties_base.meta_type == MetaType::BLOB &&
+      rep_->table_properties_base.blob_single_key_block == true &&
+      rep_->table_options.blob_single_key_block;
   bool need_upper_bound_check =
       PrefixExtractorChanged(&rep_->table_properties_base, prefix_extractor);
   const bool kIsNotIndex = false;
@@ -2366,7 +2422,7 @@ InternalIterator* BlockBasedTable::NewIterator(
         !skip_filters && !read_options.total_order_seek &&
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
-        true /*key_includes_seq*/, true, for_compaction);
+        true /*key_includes_seq*/, for_compaction, gc_read_optimization);
   } else {
     auto* mem = arena->AllocateAligned(
         sizeof(BlockBasedTableIterator<DataBlockIter, LazyBuffer>));
@@ -2376,7 +2432,7 @@ InternalIterator* BlockBasedTable::NewIterator(
         !skip_filters && !read_options.total_order_seek &&
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
-        true /*key_includes_seq*/, true, for_compaction);
+        true /*key_includes_seq*/, for_compaction, gc_read_optimization);
   }
 }
 
@@ -2422,6 +2478,52 @@ bool BlockBasedTable::FullFilterKeyMayMatch(
   return may_match;
 }
 
+Status BlockBasedTable::GetKeyFromMap(
+    const ReadOptions& read_options, const Slice& key, GetContext* get_context,
+    const SliceTransform* prefix_extractor,
+    CachableEntry<FilterBlockReader>* filter_entry, bool no_io) {
+  Status s;
+  bool matched = false;  // if such user key matched a key in SST
+  FilterBlockReader* filter = filter_entry->value;
+  // First check the full filter
+  // If full filter not useful, Then go into each block
+  if (!FullFilterKeyMayMatch(read_options, filter, key, no_io,
+                             prefix_extractor)) {
+    RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_USEFUL);
+    PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_useful, 1, rep_->level);
+  } else {
+    static LazyBufferStateImpl static_state;
+
+    if (!rep_->index_key_map->empty() && rep_->index_key_map->FindKey(key)) {
+      uint64_t index = rep_->index_key_map->GetIndex(key);
+      ParsedInternalKey parsed_key;
+      if (!ParseInternalKey(key, &parsed_key)) {
+        s = Status::Corruption(Slice());
+      }
+
+      get_context->SaveValue(
+          parsed_key,
+          LazyBuffer(&static_state, {}, rep_->index_key_map->GetValue(index),
+                     rep_->file_number),
+          &matched);
+    }
+
+    if (matched && filter != nullptr && !filter->IsBlockBased()) {
+      RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_FULL_TRUE_POSITIVE);
+      PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_full_true_positive, 1,
+                                rep_->level);
+    }
+  }
+
+  // if rep_->filter_entry is not set, we should call Release(); otherwise
+  // don't call, in this case we have a local copy in rep_->filter_entry,
+  // it's pinned to the cache and will be released in the destructor
+  if (!rep_->filter_entry.IsSet()) {
+    filter_entry->Release(rep_->table_options.block_cache.get());
+  }
+  return s;
+}
+
 Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
                             GetContext* get_context,
                             const SliceTransform* prefix_extractor,
@@ -2435,6 +2537,16 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
         GetFilter(prefix_extractor, /*prefetch_buffer*/ nullptr,
                   read_options.read_tier == kBlockCacheTier, get_context);
   }
+
+  // When use_index_key_block == true and the operation is getkey in
+  // garbage collection, get key from index_key_map
+  if (rep_->table_properties_base.use_index_key_block == true &&
+      rep_->table_options.use_index_key_block && get_context->is_getkey()) {
+    s = GetKeyFromMap(read_options, key, get_context, prefix_extractor,
+                      &filter_entry, no_io);
+    return s;
+  }
+
   FilterBlockReader* filter = filter_entry.value;
 
   // First check the full filter

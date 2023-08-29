@@ -84,7 +84,9 @@
 #include "util/sync_point.h"
 #include "utilities/util/valvec.hpp"
 
+#ifdef GC_READAHEAD
 thread_local int gc_read_ahead_size = -1;
+#endif
 
 namespace TERARKDB_NAMESPACE {
 
@@ -1169,7 +1171,7 @@ Status CompactionJob::Run() {
           }
           std::unique_ptr<TERARKDB_NAMESPACE::RandomAccessFileReader>
               file_reader(new TERARKDB_NAMESPACE::RandomAccessFileReader(
-                  std::move(file), fname, env_));
+                  std::move(file), fname, env_, stats_));
           std::unique_ptr<TERARKDB_NAMESPACE::TableReader> reader;
           TableReaderOptions table_reader_options(
               *c->immutable_cf_options(),
@@ -1689,6 +1691,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       versions_->LastSequence(), &existing_snapshots_,
       earliest_write_conflict_snapshot_, snapshot_checker_, env_,
       ShouldReportDetailedTime(env_, stats_), false, &range_del_agg,
+      cfd->ioptions()->drop_key_cache, cfd->ioptions()->hotness_aware,
       sub_compact->compaction, mutable_cf_options->get_blob_config(),
       compaction_filter, shutting_down_, preserve_deletes_seqnum_,
       &rebuild_blobs_info.blobs));
@@ -1743,6 +1746,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         cfd->user_comparator(), merge_ptr, versions_->LastSequence(),
         &existing_snapshots_, earliest_write_conflict_snapshot_,
         snapshot_checker_, env_, false, false, range_del_agg_ptr,
+        cfd->ioptions()->drop_key_cache, cfd->ioptions()->hotness_aware,
         sub_compact->compaction, mutable_cf_options->get_blob_config(),
         second_pass_iter_storage.compaction_filter, shutting_down_,
         preserve_deletes_seqnum_, &rebuild_blobs_info.blobs);
@@ -2042,11 +2046,25 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
 void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact != nullptr);
+  #ifdef GC_READAHEAD
   gc_read_ahead_size = 0 * 1024;
-  RecordTick(stats_, GC_INPUT_BYTES, sub_compact->compaction->CalculateTotalInputSize());
+  #endif
 
-  //*********
+  RecordTick(stats_, GC_INPUT_BYTES, sub_compact->compaction->CalculateTotalInputSize());
   StopWatch sw(env_, stats_, GC_ALL_TIME);
+  uint64_t total_gc_time = 0;
+  uint64_t getkey_time = 0;
+  uint64_t read_time = 0;
+  uint64_t write_time = 0;
+  // uint64_t total_gc_count = 0;
+  uint64_t getkey_count = 0;
+  uint64_t read_count = 0;
+  uint64_t write_count = 0;
+
+  {
+
+  // StopWatch sw(env_, stats_, GC_ALL_TIME);
+  StopWatch gc_total_sw(env_, nullptr, 0, &total_gc_time, false, false);
   uint64_t gc_begin_reads = IOSTATS(bytes_read);
   uint64_t gc_begin_writes = IOSTATS(bytes_written);
   //*********
@@ -2129,7 +2147,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
           Status::Corruption("ProcessGarbageCollection invalid InternalKey");
       break;
     }
-    uint64_t blob_file_number = input->value().file_number();
+    uint64_t blob_file_number = input->file_number();
     FileMetaData* blob_meta;
     auto find_cache = std::find_if(
         blob_meta_cache.begin(), blob_meta_cache.end(),
@@ -2159,11 +2177,20 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       ValueType type = kTypeDeletion;
       SequenceNumber seq = kMaxSequenceNumber;
       LazyBuffer value;
-      uint64_t get_begin_reads = IOSTATS(bytes_read);
-      input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
-                            &seq, &value, *blob_meta);
-      uint64_t get_end_reads = IOSTATS(bytes_read);
-      RecordTick(stats_, GC_GETKEY_READ_BYTES, get_end_reads - get_begin_reads);
+      {
+        // StopWatch sw1(env_, stats_, GC_GET_KEY_TIME);
+        StopWatch getkey_sw(env_, nullptr, 0, &getkey_time, false, false);
+        getkey_count++;
+        uint64_t get_begin_reads = IOSTATS(bytes_read);
+        #ifndef NDEBUG
+          std::cout << "[tid:" << std::this_thread::get_id() << "] GC check GetKey" << std::endl;
+        #endif
+        input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s,
+                              &type, &seq, &value, *blob_meta);
+        uint64_t get_end_reads = IOSTATS(bytes_read);
+        RecordTick(stats_, GC_GETKEY_READ_BYTES,
+                   get_end_reads - get_begin_reads);
+      }
       if (s.IsNotFound()) {
         ++counter.get_not_found;
         break;
@@ -2175,6 +2202,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         ++counter.get_not_found;
         break;
       }
+      #ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id() << "] GC check valid and prepare fetch value" << std::endl;
+        // TODO:Scavenger check fetch_value
+      #endif
       status = value.fetch();
       if (!status.ok()) {
         break;
@@ -2185,15 +2216,26 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         status = Status::Corruption("Separate value dependence missing");
         break;
       }
+      // When key-value is valid, fetch value actively
+      #ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id() << "] GC check valid and prepare fetch value" << std::endl;
+      #endif
+      input->fetch_value();
       value = input->value();
+      #ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id() << "] GC fetch value size " << value.size() << std::endl;
+      #endif
       if (find->second->fd.GetNumber() != value.file_number()) {
         ++counter.file_number_mismatch;
         break;
       }
       curr_file_number = value.file_number();
-      
+
       {
-        StopWatch sw2(env_, stats_, GC_WRITE_TIME);
+        // StopWatch sw2(env_, stats_, GC_WRITE_TIME);
+        StopWatch write_sw(env_, nullptr, 0, &write_time, false, false);
+        write_count++;
+
         assert(sub_compact->blob_builder != nullptr);
         assert(sub_compact->current_blob_output() != nullptr);
         status = sub_compact->blob_builder->Add(curr_key, value);
@@ -2216,10 +2258,12 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       conflict_map.emplace(pinned_key, valid_file_number);
     }
     {
-      StopWatch sw1(env_, stats_, GC_READ_TIME);
+      // StopWatch sw3(env_, stats_, GC_READ_TIME);
+      StopWatch read_sw(env_, nullptr, 0, &read_time, false, false);
+      read_count++;
+
       last_key.assign(curr_key.data(), curr_key.size());
       last_file_number = curr_file_number;
-
       input->Next();
     }
   }
@@ -2227,6 +2271,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   uint64_t gc_end_writes = IOSTATS(bytes_written);
   RecordTick(stats_, GC_READ_BYTES, gc_end_reads - gc_begin_reads);
   RecordTick(stats_, GC_WRITE_BYTES, gc_end_writes - gc_begin_writes);
+
+  IOSTATS_RESET(bytes_read);
+  IOSTATS_RESET(bytes_written);
 
   if (status.ok() &&
       (shutting_down_->load(std::memory_order_relaxed) || cfd->IsDropped())) {
@@ -2301,8 +2348,24 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
 
   input.reset();
   sub_compact->status = status;
+  }
 
-  gc_read_ahead_size = -1;
+  MeasureTime(stats_, GC_ALL_TIME, total_gc_time);
+  RecordTick(stats_, GC_COUNT, 1);
+
+  MeasureTime(stats_, GC_GET_KEY_TIME, getkey_time);
+  RecordTick(stats_, GC_GETKEY_COUNT, getkey_count);
+  
+  MeasureTime(stats_, GC_READ_TIME, read_time);
+  RecordTick(stats_, GC_READ_COUNT, read_count);
+  
+  MeasureTime(stats_, GC_WRITE_TIME, write_time);
+  RecordTick(stats_, GC_WRITE_COUNT, write_count);
+
+  #ifdef GC_READAHEAD
+    gc_read_ahead_size = -1;
+  #endif
+
 }
 
 void CompactionJob::RecordDroppedKeys(
@@ -3001,8 +3064,8 @@ Status CompactionJob::OpenCompactionOutputFile(
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(),
       sub_compact->compaction->output_level(), c->compaction_load(),
-      &sub_compact->compression_dict, skip_filters, output_file_creation_time,
-      0 /* oldest_key_time */,
+      &sub_compact->compression_dict, skip_filters, 0 /* meta_type */,
+      output_file_creation_time, 0 /* oldest_key_time */,
       sub_compact->compaction->compaction_type() == kMapCompaction
           ? kMapSst
           : kEssenceSst));
@@ -3090,7 +3153,7 @@ Status CompactionJob::OpenCompactionOutputBlob(
       cfd->GetName(), sub_compact->blob_outfile.get(),
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(), -1 /* level */,
-      c->compaction_load(), nullptr, true /* skip_filters */,
+      c->compaction_load(), nullptr, true /* skip_filters */, 1 /* meta_type */,
       output_file_creation_time, 0 /* oldest_key_time */, kEssenceSst));
   LogFlush(db_options_.info_log);
   return s;

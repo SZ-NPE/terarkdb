@@ -794,10 +794,10 @@ Status Version::GetTableProperties(std::shared_ptr<const TableProperties>* tp,
   // pass the magic number check in the footer.
   std::unique_ptr<RandomAccessFileReader> file_reader(
       new RandomAccessFileReader(
-          std::move(file), file_name, nullptr /* env */, nullptr /* stats */,
-          0 /* hist_type */, nullptr /* file_read_hist */,
-          nullptr /* rate_limiter */, false /* for_compaction*/,
-          ioptions->listeners));
+          std::move(file), file_name, env_ /* env */,
+          ioptions->statistics /* stats */, 0 /* hist_type */,
+          nullptr /* file_read_hist */, nullptr /* rate_limiter */,
+          false /* for_compaction*/, ioptions->listeners));
   s = ReadTableProperties(
       file_reader.get(), file_meta->fd.GetFileSize(),
       Footer::kInvalidTableMagicNumber /* table's magic number */, *ioptions,
@@ -1465,7 +1465,7 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
   GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
                          cfd_->ioptions()->info_log, db_statistics_,
                          GetContext::kNotFound, user_key, value, &value_found,
-                         nullptr, nullptr, nullptr, env_, seq);
+                         nullptr, nullptr, nullptr, env_, seq, nullptr, true);
   ReadOptions options;
 
   FilePicker fp(

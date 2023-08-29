@@ -43,6 +43,10 @@ struct ImmutableCFOptions {
 
   const CompactionFilter* compaction_filter;
 
+  std::shared_ptr<Cache> drop_key_cache;
+
+  bool hotness_aware;
+
   CompactionFilterFactory* compaction_filter_factory;
 
   CompactionDispatcher* compaction_dispatcher;

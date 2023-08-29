@@ -210,7 +210,7 @@ Status TableCache::GetTableReaderImpl(
     std::unique_ptr<RandomAccessFileReader> file_reader(
         new RandomAccessFileReader(
             std::move(file), fname, ioptions_.env,
-            record_read_stats ? ioptions_.statistics : nullptr, SST_READ_MICROS,
+            ioptions_.statistics, SST_READ_MICROS,
             file_read_hist, ioptions_.rate_limiter, for_compaction,
             ioptions_.listeners));
     s = ioptions_.table_factory->NewTableReader(
