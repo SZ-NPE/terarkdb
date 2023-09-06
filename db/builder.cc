@@ -282,7 +282,7 @@ Status BuildTable(
         status = finish_output_blob_sst(*blob_builder_info);
         if (is_cold_blob) {
           ROCKS_LOG_INFO(ioptions.info_log,
-                         "finish output clod blob sst: file_number %" PRIu64
+                         "finish output cold blob sst: file_number %" PRIu64
                          " file_size %" PRIu64,
                          blob_builder_info->current_output->fd.GetNumber(),
                          blob_builder_info->current_output->fd.GetFileSize());
@@ -333,9 +333,9 @@ Status BuildTable(
         blob_builder_info->builder.reset(NewTableBuilder(
             ioptions, mutable_cf_options, internal_comparator,
             int_tbl_prop_collector_factories_for_blob, column_family_id,
-            column_family_name, blob_builder_info->file_writer.get(), compression,
-            compression_opts, -1 /* level */, 0 /* compaction_load */, nullptr,
-            true, 1));
+            column_family_name, blob_builder_info->file_writer.get(), 
+            compression, compression_opts, -1 /* level */, 
+            0 /* compaction_load */, nullptr, true, 1));
         blob_builder = blob_builder_info->builder.get();
         if(is_cold_blob){
           RecordTick(ioptions.statistics, COLD_BLOB_FILE_NUM);
@@ -472,7 +472,7 @@ Status BuildTable(
       } else {
         s = finish_output_blob_sst(separate_helper.cold_blob_builder_info);
         ROCKS_LOG_INFO(ioptions.info_log,
-                       "finish output clod blob sst: file_number %" PRIu64
+                       "finish output cold blob sst: file_number %" PRIu64
                        " file_size %" PRIu64,
                        separate_helper.cold_blob_builder_info.current_output
                            ->fd.GetNumber(),

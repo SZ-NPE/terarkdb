@@ -809,6 +809,17 @@ class SeparateHelper {
                  slice.size() - sizeof(uint64_t));
   }
 
+  static uint32_t DecodeValueSize(const Slice& slice) {
+    assert(slice.size() >= sizeof(uint32_t));
+    uint32_t value_size;
+    memcpy(&value_size, slice.data() + slice.size() - sizeof(uint32_t),
+           sizeof(uint32_t));
+    if (!port::kLittleEndian) {
+      value_size = EndianTransform(value_size, sizeof value_size);
+    }
+    return value_size;
+  }
+
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                 uint64_t file_number, const Slice& meta,
                                 bool is_merge, bool is_index,
