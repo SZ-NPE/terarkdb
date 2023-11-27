@@ -146,6 +146,11 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log, "          Options.drop_key_cache: %s",
                    drop_key_cache ? drop_key_cache->Name() : "None");
   ROCKS_LOG_HEADER(log, "           Options.hotness_aware: %d", hotness_aware);
+  ROCKS_LOG_HEADER(log, "           Options.score_modify: %d", score_modify);
+  ROCKS_LOG_HEADER(log, "           Options.score_modify_advanced: %d",
+                   score_modify_advanced);
+  ROCKS_LOG_HEADER(log, "           Options.compensated_size_optimize: %d",
+                   compensated_size_optimize);
   ROCKS_LOG_HEADER(
       log, "       Options.compaction_filter_factory: %s",
       compaction_filter_factory ? compaction_filter_factory->Name() : "None");

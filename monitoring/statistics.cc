@@ -150,6 +150,8 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_READ_COUNT, "lavakv.gc.read.count"},
     {GC_GETKEY_COUNT, "lavakv.gc.getkey.count"},
     {GC_WRITE_COUNT, "lavakv.gc.write.count"},
+    {GC_WRITE_INDEX_KEY_BLOCK_COUNT, "lavakv.gc.index.block.write.count"},
+    {GC_INDEX_KEY_MAP_READ_COUNT, "lavakv.gc.index.map.read.count"},
     {READ_BLOB_VALID, "rocksdb.num.read.blob_valid"},
     {READ_BLOB_INVALID, "rocksdb.num.read.blob_invalid"},
     {GC_INPUT_BYTES, "lavakv.gc.input.bytes"},
@@ -160,6 +162,12 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {BLOCK_CACHE_MISS_FG, "rocksdb.block.cache.miss.fg"},
     {BLOCK_CACHE_HIT_BG, "rocksdb.block.cache.hit.bg"},
     {BLOCK_CACHE_MISS_BG, "rocksdb.block.cache.miss.bg"},
+
+    {INDEX_KEY_MAP_CACHE_ADD, "lavakv.index.key.map.cache.add"},
+    {INDEX_KEY_MAP_CACHE_HIT, "lavakv.index.key.map.cache.hit"},
+    {INDEX_KEY_MAP_CACHE_MISS, "lavakv.index.key.map.cache.miss"},
+    {INDEX_KEY_MAP_MEM_HIT, "lavakv.index.key.map.mem.hit"},
+
     {BLOCK_CACHE_HIT_GET_KEYS, "rocksdb.block.cache.hit.get.keys"},
     {BLOCK_CACHE_MISS_GET_KEYS, "rocksdb.block.cache.miss.get.keys"},
     {BLOCK_CACHE_HIT_GC_READ, "rocksdb.block.cache.hit.gc.read"},

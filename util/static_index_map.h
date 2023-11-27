@@ -11,12 +11,14 @@
 #include "rocksdb/statistics.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/coding.h"
+#include "rocksdb/cleanable.h"
 
 namespace TERARKDB_NAMESPACE {
 
-class StaticMapIndex {
+class StaticMapIndex : public Cleanable {
  public:
-  StaticMapIndex(const InternalKeyComparator* c);
+  StaticMapIndex(const InternalKeyComparator* c, Statistics* s);
+  StaticMapIndex(StaticMapIndex& other);
 
   ~StaticMapIndex();
 
@@ -43,6 +45,10 @@ class StaticMapIndex {
   Status BuildStaticMapIndex(std::unique_ptr<InternalIteratorBase<Slice>> iter);
 
   static std::atomic<uint64_t> index_key_map_size;
+
+  uint64_t GetKeyNums() { return key_nums_; }
+
+  bool CompareKey(const Slice &key, const Slice& queried_key) { return c_->CompareUserKey(key, queried_key) != 0; }
 
  private:
   const InternalKeyComparator* c_;

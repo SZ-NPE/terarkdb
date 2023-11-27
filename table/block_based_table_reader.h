@@ -533,6 +533,7 @@ struct BlockBasedTable::Rep {
   std::unique_ptr<const BlockContents> compression_dict_block;
   // Index key map is in memory, used for garbage collection getkey
   std::unique_ptr<StaticMapIndex> index_key_map;
+  std::unique_ptr<BlockHandle> index_key_handle;
 
   BlockBasedTableOptions::IndexType index_type;
   bool hash_index_allow_collision;

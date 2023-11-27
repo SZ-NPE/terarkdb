@@ -265,6 +265,19 @@ inline int InternalKeyComparator::Compare(const InternalKey& a,
   return Compare(a.Encode(), b.Encode());
 }
 
+inline int InternalKeyComparator::CompareUserKey(const Slice& a,
+                                                 const Slice& b) const {
+
+  int r = 0;
+  if (is_foreground_operation()) {
+    r = user_comparator_->Compare(ExtractUserKey(a), ExtractUserKey(b));
+    PERF_COUNTER_ADD(user_key_comparison_count, 1);
+  } else {
+    return Compare(a, b);
+  }
+  return r;
+}
+
 inline bool ParseInternalKey(const Slice& internal_key,
                              ParsedInternalKey* result) {
   const size_t n = internal_key.size();

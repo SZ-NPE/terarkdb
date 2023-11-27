@@ -452,8 +452,9 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
 
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
-  if (is_separated && r->table_options.use_index_key_block) {
+  if (is_separated && r->table_options.use_index_key_block && r->level != -1) {
     r->index_key_block.Add(key, value);
+    r->props.separated_entry_count += 1;
   }
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
@@ -914,11 +915,17 @@ void BlockBasedTableBuilder::WriteRangeDelBlock(
 
 void BlockBasedTableBuilder::WriteIndexKeyBlock(
     MetaIndexBuilder* meta_index_builder) {
-  if (ok() && rep_->table_options.use_index_key_block &&
-      !rep_->index_key_block.empty()) {
+  bool enable_last_level_replicated = false;
+  Rep* r = rep_;
+  if (ok() && r->table_options.use_index_key_block &&
+      !r->index_key_block.empty() && // 1. 全是小 KV 时不建立 index key map
+      ( (enable_last_level_replicated && r->level == 6) ||
+       (static_cast<double> (r->props.separated_entry_count) /
+        static_cast<double> (r->props.num_entries)) < r->table_options.index_sep_ratio)) { // 【2. index 特别多时也不建立 index key map】
     BlockHandle index_key_block_handle;
-    WriteRawBlock(rep_->index_key_block.Finish(), kNoCompression,
+    WriteRawBlock(r->index_key_block.Finish(), kNoCompression,
                   &index_key_block_handle);
+    RecordTick(r->ioptions.statistics, GC_WRITE_INDEX_KEY_BLOCK_COUNT);
     meta_index_builder->Add(kIndexKeyBlock, index_key_block_handle);
   }
 }

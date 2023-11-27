@@ -6,13 +6,15 @@
 #include "db/dbformat.h"
 #include "rocksdb/slice.h"
 #include "table/table_reader.h"
+#include "rocksdb/perf_context.h"
 
 namespace TERARKDB_NAMESPACE {
 
 std::atomic<uint64_t> StaticMapIndex::index_key_map_size(0);
 
-StaticMapIndex::StaticMapIndex(const InternalKeyComparator *c)
+StaticMapIndex::StaticMapIndex(const InternalKeyComparator *c, Statistics *s)
     : c_(c),
+      stats_(s),
       key_buff_(nullptr),
       value_buff_(nullptr),
       key_offset_(nullptr),
@@ -34,33 +36,51 @@ StaticMapIndex::~StaticMapIndex() {
   }
 }
 
+StaticMapIndex::StaticMapIndex(StaticMapIndex& other) {
+  if (other.key_buff_ != nullptr) {
+    key_buff_ = new char[other.key_len_];
+    value_buff_ = new char[other.value_len_];
+    key_offset_ = new uint64_t[other.key_nums_ + 1];
+    value_offset_ = new uint64_t[other.key_nums_ + 1];
+    memcpy(key_offset_, other.key_offset_, sizeof(uint64_t) * (other.key_nums_ + 1));
+    memcpy(value_offset_, other.value_offset_, sizeof(uint64_t) * (other.key_nums_ + 1));
+    memcpy(key_buff_, other.key_buff_, sizeof(char) * (other.key_len_));
+    memcpy(value_buff_, other.value_buff_, sizeof(char) * (other.value_len_));
+
+    index_key_map_size.store(other.index_key_map_size);
+    key_nums_ = other.key_nums_;
+    key_len_ = other.key_len_;
+    value_len_ = other.value_len_;
+  }
+}
+
 char *StaticMapIndex::GetKeyOffset(uint64_t id) const {
-  assert(id < key_nums_);
+  terarkdb_assert(id < key_nums_);
   return key_buff_ + key_offset_[id];
 }
 
 uint64_t StaticMapIndex::GetKeyLen(uint64_t id) const {
-  assert(id < key_nums_);
+  terarkdb_assert(id < key_nums_);
   return key_offset_[id + 1] - key_offset_[id];
 }
 
 char *StaticMapIndex::GetValueOffset(uint64_t id) const {
-  assert(id < key_nums_);
+  terarkdb_assert(id < key_nums_);
   return value_buff_ + value_offset_[id];
 }
 
 uint64_t StaticMapIndex::GetValueLen(uint64_t id) const {
-  assert(id < key_nums_);
+  terarkdb_assert(id < key_nums_);
   return value_offset_[id + 1] - value_offset_[id];
 }
 
 Slice StaticMapIndex::GetKey(uint64_t id) const {
-  assert(key_buff_ != nullptr);
+  terarkdb_assert(key_buff_ != nullptr);
   return Slice(GetKeyOffset(id), GetKeyLen(id));
 }
 
 Slice StaticMapIndex::GetValue(uint64_t id) const {
-  assert(value_buff_ != nullptr);
+  terarkdb_assert(value_buff_ != nullptr);
   return Slice(GetValueOffset(id), GetValueLen(id));
 }
 
@@ -73,9 +93,9 @@ uint64_t StaticMapIndex::GetIndex(const Slice &key) {
       break;
     }
     Slice curr_key = GetKey(mid);
-    if (c_->Compare(key, curr_key) == 0) {
+    if (c_->CompareUserKey(key, curr_key) == 0) {
       return mid;
-    } else if (c_->Compare(key, curr_key) < 0) {
+    } else if (c_->CompareUserKey(key, curr_key) < 0) {
       r = mid - 1;
     } else {
       l = mid + 1;
@@ -86,7 +106,7 @@ uint64_t StaticMapIndex::GetIndex(const Slice &key) {
 
 bool StaticMapIndex::FindKey(const Slice &key) {
   uint64_t index = GetIndex(key);
-  if (index >= key_nums_ || c_->Compare(key, GetKey(index)) != 0) {
+  if (index >= key_nums_ || c_->CompareUserKey(key, GetKey(index)) != 0) {
     return false;
   } else {
     return true;
@@ -123,10 +143,11 @@ Status StaticMapIndex::BuildStaticMapIndex(
   char *key_buffer = new char[key_lens];
   char *value_buffer = new char[value_lens];
   i = 0;
+  IterKey iter_key;
+  ParsedInternalKey ikey;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     Slice curr_key = iter->key();
-    IterKey iter_key;
-    ParsedInternalKey ikey;
+
     if (!ParseInternalKey(curr_key, &ikey)) {
       status =
           Status::Corruption("ProcessGarbageCollection invalid InternalKey");

@@ -1806,8 +1806,11 @@ void VersionStorageInfo::ComputeCompactionScore(
       uint64_t total_size = 0;
       for (auto* f : files_[level]) {
         if (!f->being_compacted) {
-          total_size += f->compensated_file_size;
-          num_sorted_runs++;
+          if (immutable_cf_options.compensated_size_optimize) {
+            total_size += f->compensated_file_size;
+          } else {
+            total_size += f->fd.GetFileSize();
+          }
         }
       }
       if (compaction_style_ == kCompactionStyleUniversal) {
@@ -1827,16 +1830,38 @@ void VersionStorageInfo::ComputeCompactionScore(
         // Level-based involves L0->L0 compactions that can lead to oversized
         // L0 files. Take into account size as well to avoid later giant
         // compactions to the base level.
-        score =
-            std::max(score, static_cast<double>(total_size) /
-                                mutable_cf_options.max_bytes_for_level_base);
+        if (immutable_cf_options.level_compaction_dynamic_level_bytes &&
+            immutable_cf_options.score_modify_advanced) {
+          if (total_size >= mutable_cf_options.max_bytes_for_level_base) {
+            // When calculating estimated_compaction_needed_bytes, we assume
+            // L0 is qualified as pending compactions. We will need to make
+            // sure that it qualifies for compaction.
+            // It might be guafanteed by logic below anyway, but we are
+            // explicit here to make sure we don't stop writes with no
+            // compaction scheduled.
+            score = std::max(score, 1.01);
+          }
+          if (total_size > level_max_bytes_[base_level_]) {
+            score = std::max(
+                score, static_cast<double>(total_size) /
+                           static_cast<double>(level_max_bytes_[base_level_]));
+          }
+        } else {
+          score =
+              std::max(score, static_cast<double>(total_size) /
+                                  mutable_cf_options.max_bytes_for_level_base);
+        }
       }
     } else {
       // Compute the ratio of current size to size limit.
       uint64_t level_bytes_no_compacting = 0;
       for (auto f : files_[level]) {
         if (!f->being_compacted) {
-          level_bytes_no_compacting += f->compensated_file_size;
+          if (immutable_cf_options.compensated_size_optimize) {
+            level_bytes_no_compacting += f->compensated_file_size;
+          } else {
+            level_bytes_no_compacting += f->fd.GetFileSize();
+          }
         }
       }
       score = static_cast<double>(level_bytes_no_compacting) /
@@ -2768,7 +2793,11 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
     for (int i = 1; i < num_levels_; i++) {
       uint64_t total_size = 0;
       for (const auto& f : files_[i]) {
-        total_size += f->compensated_file_size;
+        if (ioptions.compensated_size_optimize) {
+          total_size += f->compensated_file_size;
+        } else {
+          total_size += f->fd.GetFileSize();
+        }
       }
       if (total_size > 0 && first_non_empty_level == -1) {
         first_non_empty_level = i;
@@ -2790,11 +2819,19 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
     } else {
       uint64_t l0_size = 0;
       for (const auto& f : files_[0]) {
-        l0_size += f->compensated_file_size;
+        if (ioptions.compensated_size_optimize) {
+          l0_size += f->compensated_file_size;
+        } else {
+          l0_size += f->fd.GetFileSize();
+        }
       }
 
-      uint64_t base_bytes_max =
-          std::max(options.max_bytes_for_level_base, l0_size);
+      uint64_t base_bytes_max = 0L;
+      if (ioptions.score_modify) {
+        base_bytes_max = options.max_bytes_for_level_base;
+      } else {
+        base_bytes_max = std::max(options.max_bytes_for_level_base, l0_size);
+      }
       uint64_t base_bytes_min = static_cast<uint64_t>(
           base_bytes_max / options.max_bytes_for_level_multiplier);
 
@@ -2837,13 +2874,17 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
       assert(base_level_size > 0);
       base_level_size = std::max(base_level_size, l0_size);
 
-      if (base_level_ == num_levels_ - 1) {
-        level_multiplier_ = 1.0;
+      if (ioptions.score_modify) {
+        level_multiplier_ = options.max_bytes_for_level_multiplier;
       } else {
-        level_multiplier_ =
-            std::pow(static_cast<double>(max_level_size) /
-                         static_cast<double>(base_level_size),
-                     1.0 / static_cast<double>(num_levels_ - base_level_ - 1));
+        if (base_level_ == num_levels_ - 1) {
+          level_multiplier_ = 1.0;
+        } else {
+          level_multiplier_ =
+              std::pow(static_cast<double>(max_level_size) /
+                           static_cast<double>(base_level_size),
+                       1.0 / static_cast<double>(num_levels_ - base_level_ - 1));
+        }
       }
 
       uint64_t level_size = base_level_size;

@@ -250,7 +250,7 @@ Status BuildTable(
         mutable_cf_options, ioptions.num_levels, ioptions.compaction_style);
 
     auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
-      assert(value.file_number() == uint64_t(-1));
+      terarkdb_assert(value.file_number() == kInvalidFileNumber);
       Status status;
       // hotness aware
       BlobBuilder* blob_builder_info = &separate_helper.cold_blob_builder_info;
@@ -259,12 +259,14 @@ Status BuildTable(
         ParsedInternalKey ikey;
         if (ParseInternalKey(key, &ikey)) {
           Slice logical_key = ikey.user_key;
-          if (separate_helper.drop_key_cache->Lookup(logical_key) != nullptr) {
+          auto ret = separate_helper.drop_key_cache->Lookup(logical_key);
+          if (ret != nullptr) {
             blob_builder_info = &separate_helper.hot_blob_builder_info;
-            RecordTick(ioptions.statistics, HOT_BLOB_VALUE_ENTRY);
+            RecordTick(ioptions.cf_statistics, HOT_BLOB_VALUE_ENTRY);
             is_cold_blob = false;
+            separate_helper.drop_key_cache->Release(ret);
           } else {
-            RecordTick(ioptions.statistics, COLD_BLOB_VALUE_ENTRY);
+            RecordTick(ioptions.cf_statistics, COLD_BLOB_VALUE_ENTRY);
           }
         } else {
           status = Status::Corruption("ParseInternalKey Failed");

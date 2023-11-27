@@ -192,6 +192,9 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"use_index_key_block",
          {offsetof(struct BlockBasedTableOptions, use_index_key_block),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"index_sep_ratio",
+         {offsetof(struct BlockBasedTableOptions, index_sep_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal, false, 0}},
         {"blob_single_key_block",
          {offsetof(struct BlockBasedTableOptions, blob_single_key_block),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}}};

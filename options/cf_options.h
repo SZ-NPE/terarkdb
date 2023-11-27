@@ -47,6 +47,12 @@ struct ImmutableCFOptions {
 
   bool hotness_aware;
 
+  bool score_modify = true;
+
+  bool score_modify_advanced = true;
+
+  bool compensated_size_optimize = true;
+
   CompactionFilterFactory* compaction_filter_factory;
 
   CompactionDispatcher* compaction_dispatcher;

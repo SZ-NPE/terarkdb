@@ -323,6 +323,8 @@ void CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
         auto ret = drop_key_cache_->Lookup(logical_key);
         if (ret == nullptr) {
           drop_key_cache_->Insert(logical_key, nullptr, 1, nullptr);
+        } else {
+          drop_key_cache_->Release(ret);
         }
       }
 

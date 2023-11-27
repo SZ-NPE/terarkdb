@@ -187,6 +187,12 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Default: false
   bool hotness_aware = false;
 
+  bool score_modify = true;
+  bool score_modify_advanced = true;
+
+  bool compensated_size_optimize = true;
+
+
   // This is a factory that provides compaction filter objects which allow
   // an application to modify/delete a key-value during background compaction.
   //
