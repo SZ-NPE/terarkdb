@@ -125,8 +125,10 @@ class Footer {
 
   // The block handle for the index block of the table
   const BlockHandle& index_handle() const { return index_handle_; }
+  const BlockHandle& index_key_handle() const { return index_key_handle_; }
 
   void set_index_handle(const BlockHandle& h) { index_handle_ = h; }
+  void set_index_key_handle(const BlockHandle& h) { index_key_handle_ = h; }
 
   uint64_t table_magic_number() const { return table_magic_number_; }
 
@@ -177,6 +179,7 @@ class Footer {
   ChecksumType checksum_;
   BlockHandle metaindex_handle_;
   BlockHandle index_handle_;
+  BlockHandle index_key_handle_;
   uint64_t table_magic_number_ = 0;
 };
 

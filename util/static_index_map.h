@@ -38,17 +38,29 @@ class StaticMapIndex : public Cleanable {
 
   uint64_t GetIndex(const Slice& key);
 
+  uint64_t SeekKeyForIndex(const Slice& key);
+
   bool FindKey(const Slice& key);
 
   bool empty() const { return key_nums_ == 0; }
 
   Status BuildStaticMapIndex(std::unique_ptr<InternalIteratorBase<Slice>> iter);
+  Status BuildStaticMapIndex(
+      std::vector<InternalIteratorBase<Slice>*> iter_list, uint64_t size = 0);
 
   static std::atomic<uint64_t> index_key_map_size;
 
   uint64_t GetKeyNums() { return key_nums_; }
 
   bool CompareKey(const Slice &key, const Slice& queried_key) { return c_->CompareUserKey(key, queried_key) != 0; }
+
+  void SeekToFirst();
+  void Seek(const Slice& key);
+  void Next();
+  void Prev();
+  Slice key();
+  Slice value();
+  bool Valid();
 
  private:
   const InternalKeyComparator* c_;
@@ -60,6 +72,9 @@ class StaticMapIndex : public Cleanable {
   uint64_t key_nums_;
   uint64_t key_len_;
   uint64_t value_len_;
+  uint64_t current_;
+
+  uint64_t build_offset_;
 };
 
 }  // namespace TERARKDB_NAMESPACE

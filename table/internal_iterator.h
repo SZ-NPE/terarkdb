@@ -68,6 +68,8 @@ class InternalIteratorCommon : public Cleanable {
 
   virtual void fetch_value() { return; }
 
+  virtual bool Recalibrate(const Slice& target, void* extra) { return false; }
+
   // If an error has occurred, return it.  Else return an ok status.
   // If non-blocking IO is requested and this operation cannot be
   // satisfied without doing some IO, then this returns Status::Incomplete().

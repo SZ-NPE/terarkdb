@@ -2172,7 +2172,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         ++counter.garbage_type;
         break;
       }
-      iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kValueTypeForSeek);
+      iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kTypeValueIndex);
       Status s;
       ValueType type = kTypeDeletion;
       SequenceNumber seq = kMaxSequenceNumber;

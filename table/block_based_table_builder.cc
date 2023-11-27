@@ -254,11 +254,15 @@ struct BlockBasedTableBuilder::Rep {
   BlockBuilder range_del_block;
   BlockBuilder index_key_block;
 
+  std::vector<std::pair<std::string*, std::string*>> index_keys;
+
   InternalKeySliceTransform internal_prefix_transform;
   std::unique_ptr<IndexBuilder> index_builder;
+  std::unique_ptr<IndexBuilder> index_key_builder;
   PartitionedIndexBuilder* p_index_builder_ = nullptr;
 
   std::string last_key;
+  std::string last_index_key;
   // Compression dictionary or nullptr
   const std::string* compression_dict;
   CompressionContext compression_ctx;
@@ -272,9 +276,13 @@ struct BlockBasedTableBuilder::Rep {
   size_t compressed_cache_key_prefix_size;
 
   BlockHandle pending_handle;  // Handle to add to index block
+  BlockHandle pending_index_key_block_handle;
+
+  bool index_key_block_need_flush{false};
 
   std::string compressed_output;
   std::unique_ptr<FlushBlockPolicy> flush_block_policy;
+  std::unique_ptr<FlushBlockPolicy> flush_index_key_block_policy;
   uint32_t column_family_id;
   const std::string& column_family_name;
   uint64_t creation_time = 0;
@@ -304,7 +312,15 @@ struct BlockBasedTableBuilder::Rep {
                        : table_options.data_block_index_type,
                    table_options.data_block_hash_table_util_ratio),
         range_del_block(1 /* block_restart_interval */),
-        index_key_block(table_options.block_restart_interval),
+        index_key_block(table_options.block_restart_interval,
+                        table_options.use_delta_encoding,
+                        false /* use_value_delta_encoding */,
+                        builder_opt.internal_comparator.user_comparator()
+                                ->CanKeysWithDifferentByteContentsBeEqual()
+                            ? BlockBasedTableOptions::kDataBlockBinarySearch
+                            : table_options.data_block_index_type,
+                        table_options.data_block_hash_table_util_ratio),
+
         internal_prefix_transform(builder_opt.moptions.prefix_extractor.get()),
         compression_dict(builder_opt.compression_dict),
         compression_ctx(builder_opt.compression_type,
@@ -315,6 +331,9 @@ struct BlockBasedTableBuilder::Rep {
         flush_block_policy(
             table_options.flush_block_policy_factory->NewFlushBlockPolicy(
                 table_options, data_block)),
+        flush_index_key_block_policy(
+            table_options.flush_block_policy_factory->NewFlushBlockPolicy(
+                table_options, index_key_block)),
         column_family_id(_column_family_id),
         column_family_name(builder_opt.column_family_name),
         creation_time(builder_opt.creation_time),
@@ -332,6 +351,12 @@ struct BlockBasedTableBuilder::Rep {
           table_options.index_type, &internal_comparator,
           &this->internal_prefix_transform, use_delta_encoding_for_index_values,
           table_options, meta_type));
+      if (meta_type == MetaType::KEYSST && table_options.use_index_key_block) {
+        index_key_builder.reset(IndexBuilder::CreateIndexBuilder(
+            table_options.index_type, &internal_comparator,
+            &this->internal_prefix_transform, use_delta_encoding_for_index_values,
+            table_options, meta_type));
+      }
     }
     if (builder_opt.skip_filters) {
       filter_builder = nullptr;
@@ -356,7 +381,13 @@ struct BlockBasedTableBuilder::Rep {
   Rep(const Rep&) = delete;
   Rep& operator=(const Rep&) = delete;
 
-  ~Rep() {}
+  ~Rep() {
+    for (auto it : index_keys) {
+      delete it.first;
+      delete it.second;
+    }
+    index_keys.clear();
+  }
 
   bool UpdateAndCheck(const Slice& key, const Slice& value) {
     if (meta_type == MetaType::BLOB && !data_block.empty() &&
@@ -364,6 +395,13 @@ struct BlockBasedTableBuilder::Rep {
       return true;
     }
     return flush_block_policy->Update(key, value);
+  }
+
+  bool UpdateAndCheckIndexKeyBlock(const Slice& key, const Slice& value) {
+    if (index_key_block_need_flush) {
+      return true;
+    }
+    return flush_index_key_block_policy->Update(key, value);
   }
 };
 
@@ -414,11 +452,11 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
   if (!s.ok()) {
     return s;
   }
-  if (r->props.num_entries > 0 &&
-      r->internal_comparator.Compare(key, Slice(r->last_key)) <= 0) {
-    assert(r->internal_comparator.Compare(key, Slice(r->last_key)) > 0);
-    return Status::Corruption("BlockBasedTableBuilder::Add: overlapping key");
-  }
+//  if (r->props.num_entries > 0 &&
+//      r->internal_comparator.Compare(key, Slice(r->last_key)) <= 0) {
+//    assert(r->internal_comparator.Compare(key, Slice(r->last_key)) > 0);
+//    return Status::Corruption("BlockBasedTableBuilder::Add: overlapping key");
+//  }
   
   const Slice& value = lazy_value.slice();
   ValueType value_type = ExtractValueType(key);
@@ -444,18 +482,45 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
     }
   }
 
+  if (is_separated && r->table_options.use_index_key_block) {
+    bool sgkv_flush_index_key_block_at_last = true;
+    if (sgkv_flush_index_key_block_at_last) {
+      auto key_str = new std::string(key.data(), key.size());
+      auto val_str = new std::string(value.data(), value.size());
+      r->index_keys.push_back(std::make_pair(key_str, val_str));
+    } else {
+      auto buildIndexKeyBlock = [this](const Slice& key, const Slice& value, Rep* r) {
+        bool sgkv_only_flush_single_block = true;
+        if (!sgkv_only_flush_single_block) {
+          auto should_flush_index_key_block = r->UpdateAndCheckIndexKeyBlock(key, value);
+          if (should_flush_index_key_block) {
+            FlushIndexKeyBlock();
+            r->index_key_builder->AddIndexEntry(&r->last_index_key, &key, r->pending_index_key_block_handle);
+          }
+        }
+        r->index_key_block.Add(key, value);
+        r->last_index_key.assign(key.data(), key.size());
+      };
+      buildIndexKeyBlock(key, value, r);
+    }
+    r->props.separated_entry_count += 1;
+  } else {
+    r->last_key.assign(key.data(), key.size());
+    r->data_block.Add(key, value);
+  }
+
   // Note: PartitionedFilterBlockBuilder requires key being added to filter
   // builder after being added to index builder.
   if (r->filter_builder != nullptr) {
     r->filter_builder->Add(ExtractUserKey(key));
   }
 
-  r->last_key.assign(key.data(), key.size());
-  r->data_block.Add(key, value);
-  if (is_separated && r->table_options.use_index_key_block && r->level != -1) {
-    r->index_key_block.Add(key, value);
-    r->props.separated_entry_count += 1;
-  }
+//  r->last_key.assign(key.data(), key.size());
+//  r->data_block.Add(key, value);
+//  if (is_separated && r->table_options.use_index_key_block && r->level != -1) {
+//    r->index_key_block.Add(key, value);
+//    r->props.separated_entry_count += 1;
+//  }
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
@@ -466,6 +531,9 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
   }
 
   r->index_builder->OnKeyAdded(key);
+  if (is_separated && r->table_options.use_index_key_block) {
+    r->index_key_builder->OnKeyAdded(key);
+  }
   NotifyCollectTableCollectorsOnAdd(key, value, r->offset,
                                     r->table_properties_collectors,
                                     r->ioptions.info_log);
@@ -504,6 +572,19 @@ void BlockBasedTableBuilder::Flush() {
   }
   r->props.data_size = r->offset;
   ++r->props.num_data_blocks;
+}
+
+void BlockBasedTableBuilder::FlushIndexKeyBlock() {
+  Rep* r = rep_;
+  assert(!r->closed);
+  if (!ok()) return;
+  if (r->index_key_block.empty()) return;
+  WriteBlock(&r->index_key_block, &r->pending_index_key_block_handle, true /* is_data_block */);
+  //******************************
+  r->props.data_size = r->offset;
+  ++r->props.num_data_blocks;
+  //******************************
+  r->index_key_block_need_flush = false;
 }
 
 void BlockBasedTableBuilder::WriteBlock(BlockBuilder* block,
@@ -800,6 +881,54 @@ void BlockBasedTableBuilder::WriteIndexBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteIndexKeyBlock(
+    MetaIndexBuilder* meta_index_builder, BlockHandle* index_key_block_handle) {
+  IndexBuilder::IndexBlocks index_blocks;
+  auto index_builder_status = rep_->index_key_builder->Finish(&index_blocks);
+  if (index_builder_status.IsIncomplete()) {
+    // We we have more than one index partition then meta_blocks are not
+    // supported for the index. Currently meta_blocks are used only by
+    // HashIndexBuilder which is not multi-partition.
+    assert(index_blocks.meta_blocks.empty());
+  } else if (ok() && !index_builder_status.ok()) {
+    rep_->status = index_builder_status;
+  }
+  if (ok()) {
+    for (const auto& item : index_blocks.meta_blocks) {
+      BlockHandle block_handle;
+      WriteBlock(item.second, &block_handle, false /* is_data_block */);
+      if (!ok()) {
+        break;
+      }
+      meta_index_builder->Add(item.first, block_handle);
+    }
+  }
+  if (ok()) {
+    if (rep_->table_options.enable_index_compression) {
+      WriteBlock(index_blocks.index_block_contents, index_key_block_handle, false);
+    } else {
+      WriteRawBlock(index_blocks.index_block_contents, kNoCompression,
+                    index_key_block_handle);
+    }
+  }
+  // If there are more index partitions, finish them and write them out
+  Status s = index_builder_status;
+  while (ok() && s.IsIncomplete()) {
+    s = rep_->index_key_builder->Finish(&index_blocks, *index_key_block_handle);
+    if (!s.ok() && !s.IsIncomplete()) {
+      rep_->status = s;
+      return;
+    }
+    if (rep_->table_options.enable_index_compression) {
+      WriteBlock(index_blocks.index_block_contents, index_key_block_handle, false);
+    } else {
+      WriteRawBlock(index_blocks.index_block_contents, kNoCompression,
+                    index_key_block_handle);
+    }
+    // The last index_block_handle will be for the partition index block
+  }
+}
+
 void BlockBasedTableBuilder::WritePropertiesBlock(
     MetaIndexBuilder* meta_index_builder) {
   BlockHandle properties_block_handle;
@@ -930,6 +1059,20 @@ void BlockBasedTableBuilder::WriteIndexKeyBlock(
   }
 }
 
+void BlockBasedTableBuilder::AddIndexEntry(
+    std::string* last_key_in_current_block,
+    const Slice* first_key_in_next_block, const BlockHandle& block_handle) {
+  rep_->index_builder->AddIndexEntry(last_key_in_current_block,
+                                     first_key_in_next_block, block_handle);
+}
+
+void BlockBasedTableBuilder::AddIndexKeyEntry(
+    std::string* last_key_in_current_block,
+    const Slice* first_key_in_next_block, const BlockHandle& block_handle) {
+  rep_->index_key_builder->AddIndexEntry(last_key_in_current_block,
+                                         first_key_in_next_block, block_handle);
+}
+
 Status BlockBasedTableBuilder::Finish(
     const TablePropertyCache* prop,
     const std::vector<SequenceNumber>* snapshots,
@@ -938,6 +1081,30 @@ Status BlockBasedTableBuilder::Finish(
   assert(r->status.ok());
   bool empty_data_block = r->data_block.empty();
   Flush();
+
+  auto buildIndexKeyBlock = [this](const Slice& key, const Slice& value, Rep* r) {
+    auto should_flush_index_key_block = r->UpdateAndCheckIndexKeyBlock(key, value);
+    if (should_flush_index_key_block) {
+      FlushIndexKeyBlock();
+      r->index_key_builder->AddIndexEntry(&r->last_index_key, &key, r->pending_index_key_block_handle);
+    }
+    r->index_key_block.Add(key, value);
+    r->last_index_key.assign(key.data(), key.size());
+  };
+  for (auto it : r->index_keys) {
+    std::string* key_sli = it.first;
+    std::string* val_sli = it.second;
+    buildIndexKeyBlock(Slice(key_sli->data(), key_sli->size()), Slice(val_sli->data(), val_sli->size()), r);
+  }
+  bool empty_index_block = r->index_key_block.empty();
+  FlushIndexKeyBlock();
+
+  for (auto it : r->index_keys) {
+    delete it.first;
+    delete it.second;
+  }
+  r->index_keys.clear();
+
   assert(!r->closed);
   r->closed = true;
 
@@ -961,6 +1128,11 @@ Status BlockBasedTableBuilder::Finish(
         &r->last_key, nullptr /* no next data block */, r->pending_handle);
   }
 
+  if (ok() && !empty_index_block) {
+    r->index_key_builder->AddIndexEntry(
+        &r->last_index_key, nullptr, r->pending_index_key_block_handle);
+  }
+
   // Write meta blocks and metaindex block with the following order.
   //    1. [meta block: filter]
   //    2. [meta block: index]
@@ -969,13 +1141,24 @@ Status BlockBasedTableBuilder::Finish(
   //    5. [meta block: properties]
   //    7. [meta block: index key]
   //    6. [metaindex block]
-  BlockHandle metaindex_block_handle, index_block_handle;
+  bool enable_index_key_block = r->level != -1 && r->table_options.use_index_key_block;
+  BlockHandle metaindex_block_handle, index_block_handle, index_key_block_handle;
   MetaIndexBuilder meta_index_builder;
   WriteFilterBlock(&meta_index_builder);
-  WriteIndexBlock(&meta_index_builder, &index_block_handle);
+  if (enable_index_key_block) {
+    if (r->props.num_entries == r->props.separated_entry_count) { // all index kSST
+      WriteIndexKeyBlock(&meta_index_builder, &index_block_handle);
+    } else {
+      WriteIndexBlock(&meta_index_builder, &index_block_handle);
+      WriteIndexKeyBlock(&meta_index_builder, &index_key_block_handle);
+    }
+  } else {
+    WriteIndexBlock(&meta_index_builder, &index_block_handle);
+  }
+//  WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
-  WriteIndexKeyBlock(&meta_index_builder);
+//  WriteIndexKeyBlock(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);
   if (ok()) {
     // flush the meta index block
@@ -1001,6 +1184,7 @@ Status BlockBasedTableBuilder::Finish(
                   r->table_options.format_version);
     footer.set_metaindex_handle(metaindex_block_handle);
     footer.set_index_handle(index_block_handle);
+    footer.set_index_key_handle(index_key_block_handle);
     footer.set_checksum(r->table_options.checksum);
     std::string footer_encoding;
     footer.EncodeTo(&footer_encoding);

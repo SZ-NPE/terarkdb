@@ -93,6 +93,7 @@ class BlockBasedTable : public TableReader {
                      const BlockBasedTableOptions& table_options,
                      const InternalKeyComparator& internal_key_comparator,
                      std::unique_ptr<RandomAccessFileReader>&& file,
+                     std::unique_ptr<RandomAccessFileReader>&& file2,
                      uint64_t file_number, uint64_t file_size,
                      std::unique_ptr<TableReader>* table_reader,
                      const SliceTransform* prefix_extractor = nullptr,
@@ -165,6 +166,8 @@ class BlockBasedTable : public TableReader {
   bool TEST_filter_block_preloaded() const;
   bool TEST_index_reader_preloaded() const;
 
+  Status LoadIndexKeyMapFromFile();
+
   // IndexReader is the interface that provide the functionality for index
   // access.
   class IndexReader {
@@ -187,6 +190,12 @@ class BlockBasedTable : public TableReader {
     virtual InternalIteratorBase<BlockHandle>* NewIterator(
         IndexBlockIter* iter = nullptr, bool total_order_seek = true,
         bool fill_cache = true) = 0;
+
+    virtual InternalIteratorBase<BlockHandle>* NewIndexKeyIterator(
+      IndexBlockIter* iter = nullptr, bool total_order_seek = true,
+        bool fill_cache = true) {
+        return nullptr;
+    }
 
     // The size of the index.
     virtual size_t size() const = 0;
@@ -328,6 +337,12 @@ class BlockBasedTable : public TableReader {
       CachableEntry<IndexReader>* index_entry = nullptr,
       GetContext* get_context = nullptr);
 
+  virtual InternalIteratorBase<BlockHandle>* NewIndexKeyIndexIterator(
+      const ReadOptions& read_options, bool need_upper_bound_check = false,
+      IndexBlockIter* input_iter = nullptr,
+      CachableEntry<IndexReader>* index_entry = nullptr,
+      GetContext* get_context = nullptr);
+
   // Read block cache from block caches (if set): block_cache and
   // block_cache_compressed.
   // On success, Status::OK with be returned and @block will be populated with
@@ -381,6 +396,12 @@ class BlockBasedTable : public TableReader {
   // helps avoid re-reading meta index block if caller already created one.
   Status CreateIndexReader(
       FilePrefetchBuffer* prefetch_buffer, IndexReader** index_reader,
+      InternalIteratorBase<Slice>* preloaded_meta_index_iter = nullptr,
+      const int level = -1);
+
+  Status CreateIndexReader(
+      FilePrefetchBuffer* prefetch_buffer, IndexReader** index_reader,
+      IndexReader** index_key_index_reader,
       InternalIteratorBase<Slice>* preloaded_meta_index_iter = nullptr,
       const int level = -1);
 
@@ -495,6 +516,7 @@ struct BlockBasedTable::Rep {
   const InternalKeyComparator& internal_comparator;
   Status status;
   std::unique_ptr<RandomAccessFileReader> file;
+  std::unique_ptr<RandomAccessFileReader> index_file;
   char cache_key_prefix[kMaxCacheKeyPrefixSize];
   size_t cache_key_prefix_size = 0;
   char persistent_cache_key_prefix[kMaxCacheKeyPrefixSize];
@@ -503,6 +525,8 @@ struct BlockBasedTable::Rep {
   size_t compressed_cache_key_prefix_size = 0;
   uint64_t dummy_index_reader_offset =
       0;  // ID that is unique for the block cache.
+  uint64_t dummy_index_key_reader_offset =
+      1;  // ID that is unique for the block cache.
   PersistentCacheOptions persistent_cache_options;
 
   // Footer contains the fixed table information
@@ -511,7 +535,9 @@ struct BlockBasedTable::Rep {
   // options.block_cache is nullptr; otherwise we will get the index block via
   // the block cache.
   std::unique_ptr<IndexReader> index_reader;
+  std::unique_ptr<IndexReader> index_key_index_reader;
   std::unique_ptr<FilterBlockReader> filter;
+  bool contain_index_key_block = false;
 
   enum class FilterType {
     kNoFilter,
@@ -554,6 +580,7 @@ struct BlockBasedTable::Rep {
   // push flush them out, hence they're pinned
   CachableEntry<FilterBlockReader> filter_entry;
   CachableEntry<IndexReader> index_entry;
+  CachableEntry<IndexReader> index_key_index_entry;
   std::shared_ptr<const FragmentedRangeTombstoneList> fragmented_range_dels;
 
   // If global_seqno is used, all Keys in this file will have the same
@@ -607,7 +634,41 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
         for_compaction_(for_compaction),
         gc_accelerate_(gc_accelerate) {}
 
-  ~BlockBasedTableIteratorBase() { delete index_iter_; }
+  BlockBasedTableIteratorBase(
+      BlockBasedTable* table, const ReadOptions& read_options,
+      const InternalKeyComparator& icomp,
+      InternalIteratorBase<BlockHandle>* index_iter,
+      InternalIteratorBase<BlockHandle>* index_key_index_iter,
+      bool check_filter, bool need_upper_bound_check,
+      const SliceTransform* prefix_extractor, bool is_index,
+      bool key_includes_seq = true, bool index_key_is_full = true,
+      bool for_compaction = false, bool gc_accelerate = false,
+      InternalIteratorBase<BlockHandle>* delta_index_iter = nullptr)
+      : table_(table),
+        read_options_(read_options),
+        icomp_(icomp),
+        index_iter_(index_iter),
+        index_key_index_iter_(index_key_index_iter),
+        block_iter_points_to_real_block_(false),
+        check_filter_(check_filter),
+        need_upper_bound_check_(need_upper_bound_check),
+        prefix_extractor_(prefix_extractor),
+        is_index_(is_index),
+        key_includes_seq_(key_includes_seq),
+        index_key_is_full_(index_key_is_full),
+        for_compaction_(for_compaction),
+        gc_accelerate_(gc_accelerate) {
+  }
+
+  ~BlockBasedTableIteratorBase() {
+    delete index_iter_;
+    if (table_->get_rep()->table_options.use_index_key_block &&
+        table_->get_rep()->level != -1 &&
+        table_->get_rep()->contain_index_key_block &&
+        index_key_index_iter_) {
+      delete index_key_index_iter_;
+    }
+  }
 
   void Seek(const Slice& target) override;
   void SeekForPrev(const Slice& target) override;
@@ -619,14 +680,36 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
     if (gc_accelerate_) {
       return !is_out_of_bound_ && index_iter_->Valid();
     }
-    return !is_out_of_bound_ && block_iter_points_to_real_block_ &&
-           block_iter_.Valid();
+
+    bool data_block_valid = !is_out_of_bound_ &&
+                            block_iter_points_to_real_block_ &&
+                            block_iter_.Valid();
+
+    if (table_->get_rep()->table_options.use_index_key_block) {
+      bool index_key_block_valid = !index_key_block_is_out_of_bound_ &&
+                                   index_key_block_iter_points_to_real_block_ &&
+                                   index_key_block_iter_.Valid();
+      return data_block_valid || index_key_block_valid;
+    }
+
+
+    return data_block_valid;
   }
+
   Slice key() const override {
     if (gc_accelerate_) {
       assert(index_iter_->Valid());
       return index_iter_->key();
     }
+
+    if (table_->get_rep()->table_options.use_index_key_block) {
+      if (current_is_index) {
+        return index_key_block_iter_.key();
+      } else {
+        return block_iter_.key();
+      }
+    }
+
     assert(Valid());
     return block_iter_.key();
   }
@@ -673,6 +756,21 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
     }
   }
 
+  void ResetIndexDataIter() {
+    if (index_key_block_iter_points_to_real_block_) {
+      index_key_block_iter_.Invalidate(Status::OK());
+      index_key_block_iter_points_to_real_block_ = false;
+    }
+  }
+
+  void SavePrevIndexKeyIndexValue() {
+    if (index_key_block_iter_points_to_real_block_) {
+      // Reseek. If they end up with the same data block, we shouldn't re-fetch
+      // the same data block.
+      prev_index_key_index_value = index_key_index_iter_->value();
+    }
+  }
+
   void SavePrevIndexValue() {
     if (block_iter_points_to_real_block_) {
       // Reseek. If they end up with the same data block, we shouldn't re-fetch
@@ -682,7 +780,9 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   }
 
   void InitDataBlock();
+  void InitIndexKeyDataBlock();
   void FindKeyForward();
+  void FindKeyForwardForIndexKey();
   void FindKeyBackward();
 
  protected:
@@ -690,9 +790,15 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   const ReadOptions read_options_;
   const InternalKeyComparator& icomp_;
   InternalIteratorBase<BlockHandle>* index_iter_;
+  InternalIteratorBase<BlockHandle>* index_key_index_iter_;
   TBlockIter block_iter_;
+  TBlockIter index_key_block_iter_;
+  mutable bool current_is_index = false;
+  mutable uint64_t current_of_index_map = -1;
   bool block_iter_points_to_real_block_;
+  bool index_key_block_iter_points_to_real_block_ = false;
   bool is_out_of_bound_ = false;
+  bool index_key_block_is_out_of_bound_ = false;
   bool check_filter_;
   // TODO(Zhongyi): pick a better name
   bool need_upper_bound_check_;
@@ -707,6 +813,7 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   // If this iterator is created for gc
   bool gc_accelerate_;
   BlockHandle prev_index_value_;
+  BlockHandle prev_index_key_index_value;
 
   static const size_t kInitReadaheadSize = 8 * 1024;
   // Found that 256 KB readahead size provides the best performance, based on

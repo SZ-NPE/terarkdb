@@ -189,37 +189,59 @@ Status TableCache::GetTableReaderImpl(
     bool force_memory) {
   std::string fname =
       TableFileName(ioptions_.cf_paths, fd.GetNumber(), fd.GetPathId());
-  std::unique_ptr<RandomAccessFile> file;
-  Status s = ioptions_.env->NewRandomAccessFile(fname, &file, env_options);
 
-  RecordTick(ioptions_.statistics, NO_FILE_OPENS);
+  auto CreateFileReader = [&](std::unique_ptr<RandomAccessFileReader>& file_reader) {
+    std::unique_ptr<RandomAccessFile> file;
+    Status s = ioptions_.env->NewRandomAccessFile(fname, &file, env_options);
+
+    RecordTick(ioptions_.statistics, NO_FILE_OPENS);
+    if (s.ok()) {
+      if (force_memory) {
+        file = NewMemoryRandomAccessFile(std::move(file), fd.GetFileSize());
+      } else if (readahead > 0 && !env_options.use_mmap_reads) {
+        // Not compatible with mmap files since ReadaheadRandomAccessFile requires its wrapped file's Read() to copy data into the provided scratch buffer, which mmap files don't use.
+        // TODO(ajkr): try madvise for mmap files in place of buffered readahead.
+        file = NewReadaheadRandomAccessFile(std::move(file), readahead);
+      }
+      if (!sequential_mode && ioptions_.advise_random_on_open) {
+        file->Hint(RandomAccessFile::RANDOM);
+      }
+      StopWatch sw(ioptions_.env, ioptions_.statistics, TABLE_OPEN_IO_MICROS);
+      file_reader = std::make_unique<RandomAccessFileReader>(
+          std::move(file), fname, ioptions_.env,
+          ioptions_.statistics, SST_READ_MICROS,
+          file_read_hist, ioptions_.rate_limiter,
+          for_compaction, ioptions_.listeners);
+    }
+    return s;
+  };
+  std::unique_ptr<RandomAccessFileReader> file_reader_1;
+  std::unique_ptr<RandomAccessFileReader> file_reader_2;
+  Status s = CreateFileReader(file_reader_1);
+
+  bool sgkv_enable_2_file_for_index_key_block = true;
+  if (s.ok() && level != -1 && sgkv_enable_2_file_for_index_key_block) {
+    s = CreateFileReader(file_reader_2);
+  }
   if (s.ok()) {
-    if (force_memory) {
-      file = NewMemoryRandomAccessFile(std::move(file), fd.GetFileSize());
-    } else if (readahead > 0 && !env_options.use_mmap_reads) {
-      // Not compatible with mmap files since ReadaheadRandomAccessFile requires
-      // its wrapped file's Read() to copy data into the provided scratch
-      // buffer, which mmap files don't use.
-      // TODO(ajkr): try madvise for mmap files in place of buffered readahead.
-      file = NewReadaheadRandomAccessFile(std::move(file), readahead);
+    if (file_reader_2 != nullptr) {
+      s = ioptions_.table_factory->NewTableReader(
+          TableReaderOptions(ioptions_, prefix_extractor, env_options,
+                             ioptions_.internal_comparator, fd.GetNumber(),
+                             skip_filters, immortal_tables_, level,
+                             fd.largest_seqno),
+          std::move(file_reader_1), std::move(file_reader_2), fd.GetFileSize(), table_reader,
+          prefetch_index_and_filter_in_cache);
+    } else {
+      s = ioptions_.table_factory->NewTableReader(
+          TableReaderOptions(ioptions_, prefix_extractor, env_options,
+                             ioptions_.internal_comparator, fd.GetNumber(),
+                             skip_filters, immortal_tables_, level,
+                             fd.largest_seqno), std::move(file_reader_1),
+          fd.GetFileSize(), table_reader,
+          prefetch_index_and_filter_in_cache);
     }
-    if (!sequential_mode && ioptions_.advise_random_on_open) {
-      file->Hint(RandomAccessFile::RANDOM);
-    }
-    StopWatch sw(ioptions_.env, ioptions_.statistics, TABLE_OPEN_IO_MICROS);
-    std::unique_ptr<RandomAccessFileReader> file_reader(
-        new RandomAccessFileReader(
-            std::move(file), fname, ioptions_.env,
-            ioptions_.statistics, SST_READ_MICROS,
-            file_read_hist, ioptions_.rate_limiter, for_compaction,
-            ioptions_.listeners));
-    s = ioptions_.table_factory->NewTableReader(
-        TableReaderOptions(ioptions_, prefix_extractor, env_options,
-                           ioptions_.internal_comparator, skip_filters,
-                           immortal_tables_, level, fd.GetNumber(),
-                           fd.largest_seqno),
-        std::move(file_reader), fd.GetFileSize(), table_reader,
-        prefetch_index_and_filter_in_cache);
+
     TEST_SYNC_POINT("TableCache::GetTableReader:0");
   }
   return s;

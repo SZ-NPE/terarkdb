@@ -25,7 +25,10 @@
 
 #undef min
 
+#ifdef GC_READAHEAD
 extern thread_local int gc_read_ahead_size;
+extern thread_local int ik_block_read_ahead_size;
+#endif
 
 namespace TERARKDB_NAMESPACE {
 
@@ -663,6 +666,11 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
     #ifdef GC_READAHEAD
     if (gc_read_ahead_size != -1) {
       actual_readahead_size = gc_read_ahead_size;
+    }
+
+    bool sgkv_enable_control_for_index_block_read = false;
+    if (sgkv_enable_control_for_index_block_read && ik_block_read_ahead_size != -1) {
+      actual_readahead_size = ik_block_read_ahead_size;
     }
     #endif                    
 

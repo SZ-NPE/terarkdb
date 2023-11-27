@@ -130,6 +130,9 @@ void Footer::EncodeTo(std::string* dst) const {
     const size_t original_size = dst->size();
     metaindex_handle_.EncodeTo(dst);
     index_handle_.EncodeTo(dst);
+    if (index_key_handle_.offset() != ~static_cast<uint64_t>(0)) {
+      index_key_handle_.EncodeTo(dst);
+    }
     dst->resize(original_size + 2 * BlockHandle::kMaxEncodedLength);  // Padding
     PutFixed32(dst, static_cast<uint32_t>(table_magic_number() & 0xffffffffu));
     PutFixed32(dst, static_cast<uint32_t>(table_magic_number() >> 32));
@@ -139,6 +142,9 @@ void Footer::EncodeTo(std::string* dst) const {
     dst->push_back(static_cast<char>(checksum_));
     metaindex_handle_.EncodeTo(dst);
     index_handle_.EncodeTo(dst);
+    if (index_key_handle_.offset() != ~static_cast<uint64_t>(0)) {
+      index_key_handle_.EncodeTo(dst);
+    }
     dst->resize(original_size + kNewVersionsEncodedLength - 12);  // Padding
     PutFixed32(dst, version());
     PutFixed32(dst, static_cast<uint32_t>(table_magic_number() & 0xffffffffu));
@@ -200,6 +206,9 @@ Status Footer::DecodeFrom(Slice* input) {
   Status result = metaindex_handle_.DecodeFrom(input);
   if (result.ok()) {
     result = index_handle_.DecodeFrom(input);
+  }
+  if (result.ok()) {
+    result = index_key_handle_.DecodeFrom(input);
   }
   if (result.ok()) {
     // We skip over any leftover data (just padding for now) in "input"

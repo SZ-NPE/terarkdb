@@ -12,6 +12,7 @@
 #include "db/dbformat.h"
 #include "rocksdb/terark_namespace.h"
 #include "rocksdb/types.h"
+#include "table/format.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -21,6 +22,7 @@ class Arena;
 template <class TValue>
 class InternalIteratorBase;
 using InternalIterator = InternalIteratorBase<LazyBuffer>;
+using InternalIndexIterator = InternalIteratorBase<BlockHandle>;
 
 // Return an iterator that provided the union of the data in
 // children[0,n-1].  Takes ownership of the child iterators and
@@ -32,6 +34,10 @@ using InternalIterator = InternalIteratorBase<LazyBuffer>;
 // REQUIRES: n >= 0
 extern InternalIterator* NewMergingIterator(
     const InternalKeyComparator* comparator, InternalIterator** children, int n,
+    Arena* arena = nullptr, bool prefix_seek_mode = false);
+
+extern InternalIndexIterator* NewMergingIndexIterator(
+    const InternalKeyComparator* comparator, InternalIndexIterator** children, int n,
     Arena* arena = nullptr, bool prefix_seek_mode = false);
 
 class MergingIterator;

@@ -104,6 +104,26 @@ uint64_t StaticMapIndex::GetIndex(const Slice &key) {
   return -1;
 }
 
+uint64_t StaticMapIndex::SeekKeyForIndex(const Slice &key) {
+  uint64_t l = 0;
+  uint64_t r = key_nums_ - 1;
+  while (l <= r) {
+    uint64_t mid = l + ((r - l) >> 1);
+    if (r == -1) {
+      break;
+    }
+    Slice curr_key = GetKey(mid);
+    if (c_->CompareUserKey(key, curr_key) == 0) {
+      return mid;
+    } else if (c_->CompareUserKey(key, curr_key) < 0) {
+      r = mid - 1;
+    } else {
+      l = mid + 1;
+    }
+  }
+  return l;
+}
+
 bool StaticMapIndex::FindKey(const Slice &key) {
   uint64_t index = GetIndex(key);
   if (index >= key_nums_ || c_->CompareUserKey(key, GetKey(index)) != 0) {
@@ -111,6 +131,111 @@ bool StaticMapIndex::FindKey(const Slice &key) {
   } else {
     return true;
   }
+}
+
+void StaticMapIndex::SeekToFirst() {
+  current_ = 0;
+}
+void StaticMapIndex::Seek(const Slice& key) {
+  current_ = SeekKeyForIndex(key);
+}
+
+void StaticMapIndex::Next() {
+  current_++;
+}
+
+void StaticMapIndex::Prev() {
+  current_--;
+}
+
+Slice StaticMapIndex::key() {
+  // Slice key_slice = GetKey(current_);
+  // ParsedInternalKey parsed_key;
+  // if (ParseInternalKey(biter.key(), &parsed_key)) {
+  //   parsed_key.type = kTypeValueIndex;
+  //   key_slice.
+  //   AppendInternalKey(&key_slice, ikey);
+  // }
+  return GetKey(current_);
+}
+
+Slice StaticMapIndex::value() {
+  return GetValue(current_);
+}
+
+bool StaticMapIndex::Valid() {
+  return current_ < key_nums_;
+}
+
+Status StaticMapIndex::BuildStaticMapIndex(
+    std::vector<InternalIteratorBase<Slice>*> iter_list, uint64_t size) {
+  Status status;
+  if (size == 0) {
+    for (auto iter : iter_list) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        size++;
+      }
+    }
+  }
+
+  uint64_t key_nums = size;
+  if (key_nums == 0) {
+    return status;
+  }
+  uint64_t *key_offset = new uint64_t[key_nums + 1];
+  uint64_t *value_offset = new uint64_t[key_nums + 1];
+  uint64_t key_lens = 0;
+  uint64_t value_lens = 0;
+  uint64_t i = 0;
+  for (auto iter : iter_list) {
+    status = iter->status();
+    if (!status.ok()) {
+      return status;
+    }
+
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      key_offset[i] = key_lens;
+      value_offset[i] = value_lens;
+      key_lens += iter->key().size();
+      value_lens += iter->value().size();
+      i++;
+    }
+  }
+  key_offset[key_nums] = key_lens;
+  value_offset[key_nums] = value_lens;
+
+
+  char *key_buffer = new char[key_lens];
+  char *value_buffer = new char[value_lens];
+  i = 0;
+  for (auto iter : iter_list) {
+    IterKey iter_key;
+    ParsedInternalKey ikey;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      Slice curr_key = iter->key();
+      if (!ParseInternalKey(curr_key, &ikey)) {
+        status =
+            Status::Corruption("ProcessGarbageCollection invalid InternalKey");
+        break;
+      }
+      iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kTypeValueIndex);
+      memcpy(key_buffer + key_offset[i], iter_key.GetInternalKey().data(),
+             iter_key.Size());
+      memcpy(value_buffer + value_offset[i], iter->value().data(),
+             iter->value().size());
+      i++;
+    }
+  }
+
+  key_buff_ = key_buffer;
+  value_buff_ = value_buffer;
+  key_offset_ = key_offset;
+  value_offset_ = value_offset;
+  key_nums_ = key_nums;
+  key_len_ = key_lens;
+  value_len_ = value_lens;
+  index_key_map_size.fetch_add(Size(), std::memory_order_seq_cst);
+  return status;
 }
 
 Status StaticMapIndex::BuildStaticMapIndex(
@@ -153,7 +278,7 @@ Status StaticMapIndex::BuildStaticMapIndex(
           Status::Corruption("ProcessGarbageCollection invalid InternalKey");
       break;
     }
-    iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kValueTypeForSeek);
+    iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kTypeValueIndex);
     // Used for GC GetKey: Insert key, value to key_buffer and value_buffer
     // The format adapts to which passed in by the GetKey operation
     // key: user_key + Pack(sequence, kValueTypeForSeek)  value:

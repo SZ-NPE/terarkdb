@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <queue>
 #include <set>
 
 #include "rocksdb/terark_namespace.h"
@@ -118,13 +119,13 @@ class IteratorWrapperBase {
       assert(iter_->status().ok());
     }
   }
-
   InternalIteratorBase<TValue>* iter_;
   bool valid_;
   Slice key_;
 };
 
 using IteratorWrapper = IteratorWrapperBase<LazyBuffer>;
+using IndexIteratorWrapper = IteratorWrapperBase<BlockHandle>;
 
 class CombinedInternalIterator : public InternalIterator {
  public:

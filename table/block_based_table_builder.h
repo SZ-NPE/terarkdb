@@ -91,7 +91,7 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Get table properties
   TableProperties GetTableProperties() const override;
 
- private:
+ protected:
   // Return non-ok iff some error has been detected.
   Status status() const;
 
@@ -129,6 +129,16 @@ class BlockBasedTableBuilder : public TableBuilder {
   // the same data block.  Most clients should not need to use this method.
   // REQUIRES: Finish(), Abandon() have not been called
   void Flush();
+
+  void FlushIndexKeyBlock();
+  void AddIndexEntry(std::string* last_key_in_current_block,
+                     const Slice* first_key_in_next_block,
+                     const BlockHandle& block_handle);
+  void AddIndexKeyEntry(std::string* last_key_in_current_block,
+                        const Slice* first_key_in_next_block,
+                        const BlockHandle& block_handle);
+  void WriteIndexKeyBlock(MetaIndexBuilder* meta_index_builder,
+                          BlockHandle* index_block_handle);
 
   // Some compression libraries fail when the raw size is bigger than int. If
   // uncompressed size is bigger than kCompressionSizeLimit, don't compress it

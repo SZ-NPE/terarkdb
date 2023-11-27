@@ -27,6 +27,32 @@ class MaxIteratorComparator {
   const InternalKeyComparator* comparator_;
 };
 
+class MaxIndexIteratorComparator {
+ public:
+  MaxIndexIteratorComparator(const InternalKeyComparator* comparator)
+      : comparator_(comparator) {}
+
+  bool operator()(IndexIteratorWrapper* a, IndexIteratorWrapper* b) const {
+    return comparator_->Compare(a->key(), b->key()) < 0;
+  }
+
+ private:
+  const InternalKeyComparator* comparator_;
+};
+
+class MinIndexIteratorComparator {
+ public:
+  MinIndexIteratorComparator(const InternalKeyComparator* comparator)
+      : comparator_(comparator) {}
+
+  bool operator()(IndexIteratorWrapper* a, IndexIteratorWrapper* b) const {
+    return comparator_->Compare(a->key(), b->key()) > 0;
+  }
+
+ private:
+  const InternalKeyComparator* comparator_;
+};
+
 // When used with std::priority_queue, this comparison functor puts the
 // iterator with the min/smallest key on top.
 class MinIteratorComparator {
