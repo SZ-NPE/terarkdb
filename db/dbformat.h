@@ -26,6 +26,8 @@
 #include "util/arena.h"
 #include "util/coding.h"
 #include "util/logging.h"
+#include "rocksdb/perf_context.h"
+
 
 namespace TERARKDB_NAMESPACE {
 
@@ -187,6 +189,7 @@ class InternalKeyComparator
 
   int Compare(const InternalKey& a, const InternalKey& b) const;
   int Compare(const ParsedInternalKey& a, const ParsedInternalKey& b) const;
+  int CompareUserKey(const Slice& a, const Slice& b) const;
   virtual const Comparator* GetRootComparator() const override {
     return user_comparator_->GetRootComparator();
   }
@@ -267,7 +270,6 @@ inline int InternalKeyComparator::Compare(const InternalKey& a,
 
 inline int InternalKeyComparator::CompareUserKey(const Slice& a,
                                                  const Slice& b) const {
-
   int r = 0;
   if (is_foreground_operation()) {
     r = user_comparator_->Compare(ExtractUserKey(a), ExtractUserKey(b));

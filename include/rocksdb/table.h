@@ -267,6 +267,8 @@ struct BlockBasedTableOptions {
   // engine option [validity_check_accelerate] must be false as well
   bool use_index_key_block = false;
 
+  double index_sep_ratio = 0.9;
+
   // [HUST: Read accelerate]
   // Keep one key-value one block in blob file
   // Store full index in index block

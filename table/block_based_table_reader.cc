@@ -121,6 +121,7 @@ void DeleteCachedEntry(const Slice& /*key*/, void* value) {
 
 void DeleteCachedFilterEntry(const Slice& key, void* value);
 void DeleteCachedIndexEntry(const Slice& key, void* value);
+void DeleteIndexKeyBlockEntry(const Slice& key, void* value);
 
 // Release the cached entry and decrement its ref count.
 void ReleaseCachedEntry(void* arg, void* h) {
@@ -1086,8 +1087,8 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
           "Encountered error while reading data from index key block %s",
           s.ToString().c_str());
     } else {
-      rep->index_key_map =
-          std::make_unique<StaticMapIndex>(&rep->ioptions.internal_comparator);
+      rep->index_key_map = std::make_unique<StaticMapIndex>(
+          &rep->ioptions.internal_comparator, rep->ioptions.statistics);
       s = rep->index_key_map->BuildStaticMapIndex(std::move(iter));
 
       if (cache_ != nullptr) {
@@ -3591,7 +3592,6 @@ void DeleteIndexKeyBlockEntry(const Slice& key, void* value) {
 #endif
   StaticMapIndex* map_index = reinterpret_cast<StaticMapIndex*>(value);
   delete map_index;
-  index_map_cache_evict_count++;
 }
 
 }  // anonymous namespace

@@ -62,6 +62,7 @@ struct TablePropertiesNames {
   static const std::string kCompression;
   static const std::string kCreationTime;
   static const std::string kOldestKeyTime;
+  static const std::string kSeparatedEntryCount;
   static const std::string kUseIndexKeyBlock;
   static const std::string kSSTMetaType;
   static const std::string kBlobSingleKeyBlock;
@@ -210,6 +211,8 @@ struct TablePropertiesBase {
   // 0 is the default key sst in LSM-tree
   // 1 is the value sst (blob)
   uint64_t meta_type = 0;
+
+  uint64_t separated_entry_count = 0;
 
   // 0 is the default the version not support gc read accelerate
   // 1 is the version that support gc read accelerate

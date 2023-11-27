@@ -55,32 +55,32 @@ StaticMapIndex::StaticMapIndex(StaticMapIndex& other) {
 }
 
 char *StaticMapIndex::GetKeyOffset(uint64_t id) const {
-  terarkdb_assert(id < key_nums_);
+  assert(id < key_nums_);
   return key_buff_ + key_offset_[id];
 }
 
 uint64_t StaticMapIndex::GetKeyLen(uint64_t id) const {
-  terarkdb_assert(id < key_nums_);
+  assert(id < key_nums_);
   return key_offset_[id + 1] - key_offset_[id];
 }
 
 char *StaticMapIndex::GetValueOffset(uint64_t id) const {
-  terarkdb_assert(id < key_nums_);
+  assert(id < key_nums_);
   return value_buff_ + value_offset_[id];
 }
 
 uint64_t StaticMapIndex::GetValueLen(uint64_t id) const {
-  terarkdb_assert(id < key_nums_);
+  assert(id < key_nums_);
   return value_offset_[id + 1] - value_offset_[id];
 }
 
 Slice StaticMapIndex::GetKey(uint64_t id) const {
-  terarkdb_assert(key_buff_ != nullptr);
+  assert(key_buff_ != nullptr);
   return Slice(GetKeyOffset(id), GetKeyLen(id));
 }
 
 Slice StaticMapIndex::GetValue(uint64_t id) const {
-  terarkdb_assert(value_buff_ != nullptr);
+  assert(value_buff_ != nullptr);
   return Slice(GetValueOffset(id), GetValueLen(id));
 }
 

@@ -86,6 +86,9 @@ std::string TablePropertiesBase::ToString(const std::string& prop_delim,
                  num_entries != 0 ? 1.0 * raw_value_size / num_entries : 0.0,
                  prop_delim, kv_delim);
 
+  AppendProperty(result, "separated entry count", separated_entry_count,
+                 prop_delim, kv_delim);
+
   AppendProperty(result, "data block size", data_size, prop_delim, kv_delim);
   char index_block_size_str[80];
   snprintf(index_block_size_str, sizeof(index_block_size_str),
@@ -176,6 +179,7 @@ void TableProperties::Add(const TableProperties& tp) {
   num_deletions += tp.num_deletions;
   num_merge_operands += tp.num_merge_operands;
   num_range_deletions += tp.num_range_deletions;
+  separated_entry_count += tp.separated_entry_count;
 }
 
 const std::string TablePropertiesNames::kDataSize = "rocksdb.data.size";
@@ -222,6 +226,8 @@ const std::string TablePropertiesNames::kCompression = "rocksdb.compression";
 const std::string TablePropertiesNames::kCreationTime = "rocksdb.creation.time";
 const std::string TablePropertiesNames::kOldestKeyTime =
     "rocksdb.oldest.key.time";
+const std::string TablePropertiesNames::kSeparatedEntryCount =
+    "rocksdb.separated.entry.count";
 const std::string TablePropertiesNames::kUseIndexKeyBlock =
     "rocksdb.use.index.key.block";
 const std::string TablePropertiesNames::kSSTMetaType = "rocksdb.sst.meta.type";
