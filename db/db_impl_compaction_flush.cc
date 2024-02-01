@@ -228,14 +228,14 @@ Status DBImpl::FlushMemTableToOutputFile(
     autovector<ColumnFamilyData*> cfds = {cfd};
     FlushRequestVec flush_req_vec;
     // Let's re-schedule this cfd for flush
-    WriteThread::Writer w;
-    write_thread_.EnterUnbatched(&w, &mutex_);
+    // WriteThread::Writer w;
+    // write_thread_.EnterUnbatched(&w, &mutex_);
     ProcessAtomicFlushGroup(&cfds, &flush_req_vec);
     assert(cfds.size() == 1);
     assert(flush_req_vec.size() == 1 && flush_req_vec.front().size() == 1);
     PrepareFlushReqVec(flush_req_vec, true /* force_flush */);
     SchedulePendingFlush(flush_req_vec, FlushReason::kInstallTimeout);
-    write_thread_.ExitUnbatched(&w);
+    // write_thread_.ExitUnbatched(&w);
   }
   return s;
 }
