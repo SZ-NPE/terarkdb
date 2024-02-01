@@ -1811,6 +1811,7 @@ void VersionStorageInfo::ComputeCompactionScore(
           } else {
             total_size += f->fd.GetFileSize();
           }
+          num_sorted_runs++;
         }
       }
       if (compaction_style_ == kCompactionStyleUniversal) {
