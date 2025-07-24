@@ -7,18 +7,18 @@
 
 #include "db/dbformat.h"
 #include "db/map_builder.h"
+#include "rocksdb/cleanable.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/coding.h"
-#include "rocksdb/cleanable.h"
 
 namespace TERARKDB_NAMESPACE {
 
 class StaticMapIndex : public Cleanable {
  public:
   StaticMapIndex(const InternalKeyComparator* c, Statistics* s);
-  StaticMapIndex(StaticMapIndex& other);
+  explicit StaticMapIndex(StaticMapIndex& other);
 
   ~StaticMapIndex();
 
@@ -48,7 +48,9 @@ class StaticMapIndex : public Cleanable {
 
   uint64_t GetKeyNums() { return key_nums_; }
 
-  bool CompareKey(const Slice &key, const Slice& queried_key) { return c_->CompareUserKey(key, queried_key) != 0; }
+  bool CompareKey(const Slice& key, const Slice& queried_key) {
+    return c_->CompareUserKey(key, queried_key) != 0;
+  }
 
  private:
   const InternalKeyComparator* c_;

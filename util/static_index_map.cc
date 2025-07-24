@@ -4,9 +4,9 @@
 #include <vector>
 
 #include "db/dbformat.h"
+#include "rocksdb/perf_context.h"
 #include "rocksdb/slice.h"
 #include "table/table_reader.h"
-#include "rocksdb/perf_context.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -36,16 +36,17 @@ StaticMapIndex::~StaticMapIndex() {
   }
 }
 
-StaticMapIndex::StaticMapIndex(StaticMapIndex& other) {
+StaticMapIndex::StaticMapIndex(StaticMapIndex &other) : Cleanable() {
   if (other.key_buff_ != nullptr) {
     key_buff_ = new char[other.key_len_];
     value_buff_ = new char[other.value_len_];
-    key_offset_ = new uint64_t[other.key_nums_ + 1];
-    value_offset_ = new uint64_t[other.key_nums_ + 1];
-    memcpy(key_offset_, other.key_offset_, sizeof(uint64_t) * (other.key_nums_ + 1));
-    memcpy(value_offset_, other.value_offset_, sizeof(uint64_t) * (other.key_nums_ + 1));
-    memcpy(key_buff_, other.key_buff_, sizeof(char) * (other.key_len_));
-    memcpy(value_buff_, other.value_buff_, sizeof(char) * (other.value_len_));
+    uint64_t capacity = other.key_nums_ + 1;
+    key_offset_ = new uint64_t[capacity];
+    value_offset_ = new uint64_t[capacity];
+    memcpy(key_offset_, other.key_offset_, sizeof(uint64_t) * capacity);
+    memcpy(value_offset_, other.value_offset_, sizeof(uint64_t) * capacity);
+    memcpy(key_buff_, other.key_buff_, sizeof(char) * other.key_len_);
+    memcpy(value_buff_, other.value_buff_, sizeof(char) * other.value_len_);
 
     index_key_map_size.store(other.index_key_map_size);
     key_nums_ = other.key_nums_;

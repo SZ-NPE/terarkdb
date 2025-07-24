@@ -26,6 +26,7 @@ namespace TERARKDB_NAMESPACE {
 class VersionSet;
 
 const uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
+extern const uint64_t kInvalidFileNumber;
 
 extern uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id);
 

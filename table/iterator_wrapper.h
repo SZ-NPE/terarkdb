@@ -30,7 +30,7 @@ class IteratorWrapperBase {
       : iter_(nullptr) {
     Set(_iter);
   }
-  ~IteratorWrapperBase() {}
+  virtual ~IteratorWrapperBase() {}
   InternalIteratorBase<TValue>* iter() const { return iter_; }
 
   // Set the underlying Iterator to _iter and return

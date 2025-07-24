@@ -584,7 +584,7 @@ DEFINE_bool(show_table_properties, false,
 
 DEFINE_string(db, "", "Use the db with the following name.");
 
-//YCSB
+// YCSB
 DEFINE_int64(load_duration, 0, "The loading duration of YCSB");
 DEFINE_string(ycsb_workload, "", "The workload of YCSB");
 DEFINE_int64(ycsb_request_speed, 100, "The request speed of YCSB, in MB/s");
@@ -2103,8 +2103,6 @@ class Benchmark {
   int64_t num_;
   int value_size_;
   int fixed_value_size_;
-  int kv_sep_size_;
-  double small_kv_ratio_;
   int key_size_;
   int prefix_size_;
   int kv_sep_size_;
@@ -2444,13 +2442,11 @@ class Benchmark {
         prefix_extractor_(NewFixedPrefixTransform(FLAGS_prefix_size)),
         num_(FLAGS_num),
         value_size_(FLAGS_value_size),
-        small_kv_ratio_(FLAGS_small_kv_ratio),
         fixed_value_size_(FLAGS_value_size),
-        kv_sep_size_(FLAGS_kv_sep_size),
         key_size_(FLAGS_key_size),
         prefix_size_(FLAGS_prefix_size),
-        small_kv_ratio_(FLAGS_small_kv_ratio),
         kv_sep_size_(FLAGS_blob_size),
+        small_kv_ratio_(FLAGS_small_kv_ratio),
         keys_per_prefix_(FLAGS_keys_per_prefix),
         entries_per_batch_(1),
         reads_(FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads),
@@ -2646,8 +2642,6 @@ class Benchmark {
       deletes_ = (FLAGS_deletes < 0 ? FLAGS_num : FLAGS_deletes);
       value_size_ = FLAGS_value_size;
       fixed_value_size_ = FLAGS_value_size;
-      small_kv_ratio_ = FLAGS_small_kv_ratio;
-      kv_sep_size_ = FLAGS_kv_sep_size;
       key_size_ = FLAGS_key_size;
       small_kv_ratio_ = FLAGS_small_kv_ratio;
       kv_sep_size_ = FLAGS_blob_size;
@@ -2887,7 +2881,8 @@ class Benchmark {
       } else if (name == "stats") {
         PrintStats("rocksdb.stats");
         if (FLAGS_statistics) {
-          fprintf(stdout, "STATISTICS in stats:\n%s\n", dbstats->ToString().c_str());
+          fprintf(stdout, "STATISTICS in stats:\n%s\n",
+                  dbstats->ToString().c_str());
         }
       } else if (name == "resetstats") {
         ResetStats();
@@ -3000,9 +2995,10 @@ class Benchmark {
 #endif  // ROCKSDB_LITE
 
     // if (FLAGS_statistics) {
-    //   #ifdef SZ_DBG
-    //   fprintf(stdout, "Total value size : %ld MB)\n", total_value_size / 1024 / 1024);
-    //   #endif
+    // #ifdef SZ_DBG
+    //   fprintf(stdout, "Total value size : %ld MB)\n",
+    //           total_value_size / 1024 / 1024);
+    // #endif
     //   fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
     // }
     if (FLAGS_simcache_size >= 0) {
@@ -4713,8 +4709,7 @@ class Benchmark {
           // We use same rand_num as seed for key and column family so that we
           // can deterministically find the cfh corresponding to a particular
           // key while reading the key.
-          batch.Put(db_with_cfh->GetCfh(rand_num), key,
-                    gen.Generate(vLength));
+          batch.Put(db_with_cfh->GetCfh(rand_num), key, gen.Generate(vLength));
         }
         bytes += vLength + key_size_;
         ++num_written;
@@ -5740,7 +5735,8 @@ class Benchmark {
         gets_done++;
         thread->stats.FinishedOps(&db_, db_.db, 1, kRead);
       } else if (put_weight > 0) {
-        int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
+        int32_t vlength = GetValueSizeWithRatio(
+            &thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
 
         // then do all the corresponding number of puts
         // for all the gets we have done earlier
@@ -5866,7 +5862,8 @@ class Benchmark {
             key.size() + value_size_, Env::IO_HIGH, nullptr /*stats*/,
             RateLimiter::OpType::kWrite);
       }
-      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
+      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
 
       int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
                                               kv_sep_size_, small_kv_ratio_);
@@ -5913,7 +5910,8 @@ class Benchmark {
                 status.ToString().c_str());
         exit(1);
       }
-      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
+      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
 
       int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
                                               kv_sep_size_, small_kv_ratio_);
@@ -5971,7 +5969,8 @@ class Benchmark {
         value.clear();
       }
 
-      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_, kv_sep_size_, small_kv_ratio_);
+      int32_t vlength = GetValueSizeWithRatio(&thread->rand, fixed_value_size_,
+                                              kv_sep_size_, small_kv_ratio_);
 
       // Update the value (by appending data)
       int32_t vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
@@ -6023,8 +6022,8 @@ class Benchmark {
       int64_t key_rand = thread->rand.Next() % merge_keys_;
       GenerateKeyFromInt(key_rand, merge_keys_, &key, -1);
 
-      vLength = GetValueSizeWithRatio(&thread->rand, value_size_,
-                                      kv_sep_size_, small_kv_ratio_);
+      vLength = GetValueSizeWithRatio(&thread->rand, value_size_, kv_sep_size_,
+                                      small_kv_ratio_);
       Status s;
       if (FLAGS_num_column_families > 1) {
         s = db_with_cfh->db->Merge(write_options_,
