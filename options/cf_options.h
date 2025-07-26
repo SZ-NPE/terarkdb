@@ -185,6 +185,7 @@ struct MutableCFOptions {
         max_bytes_for_level_multiplier(0),
         garbage_ratio_stop_writes_trigger(0),
         blob_file_bytes_limit(0),
+        gc_adpative_readahead(false),
         max_sequential_skip_in_iterations(0),
         paranoid_file_checks(false),
         report_bg_io_stats(false),
@@ -252,6 +253,7 @@ struct MutableCFOptions {
   // GC related options
   double garbage_ratio_stop_writes_trigger;
   uint64_t blob_file_bytes_limit;
+  bool gc_adpative_readahead;
 
   // Misc options
   uint64_t max_sequential_skip_in_iterations;

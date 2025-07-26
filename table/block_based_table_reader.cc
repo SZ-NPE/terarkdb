@@ -48,6 +48,8 @@
 #include "util/string_util.h"
 #include "util/sync_point.h"
 
+extern thread_local int bts_file_level;
+
 namespace TERARKDB_NAMESPACE {
 
 extern const uint64_t kBlockBasedTableMagicNumber;
@@ -1073,7 +1075,8 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     ROCKS_LOG_WARN(rep->ioptions.info_log,
                    "Error when seeking to index key block from file: %s",
                    s.ToString().c_str());
-  } else if (found_index_key_block && !rep->index_key_handle.get()->IsNull() && !index_in_cache) {
+  } else if (found_index_key_block && !rep->index_key_handle.get()->IsNull() &&
+             !index_in_cache) {
     ReadOptions read_options;
     read_options.fill_cache = false;
     std::unique_ptr<InternalIteratorBase<Slice>> iter(
@@ -1110,7 +1113,8 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
                            index_key_map->Size(), &DeleteIndexKeyBlockEntry,
                            nullptr, Cache::Priority::HIGH);
         if (cache_status.IsOKButNoSpace()) {
-          std::unique_ptr<StaticMapIndex> copied_index(new StaticMapIndex(*index_key_map));
+          std::unique_ptr<StaticMapIndex> copied_index(
+              new StaticMapIndex(*index_key_map));
           rep->index_key_map = std::move(copied_index);
         }
         if (cache_status.ok()) {
@@ -1211,6 +1215,7 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     // pre-load these blocks, which will kept in member variables in Rep
     // and with a same life-time as this table object.
     IndexReader* index_reader = nullptr;
+    bts_file_level = level;
     s = new_table->CreateIndexReader(prefetch_buffer.get(), &index_reader,
                                      meta_iter.get(), level);
     if (s.ok()) {
@@ -1892,6 +1897,7 @@ TBlockIter* BlockBasedTable::NewDataBlockIterator(
     {
       StopWatch sw(rep->ioptions.env, rep->ioptions.statistics,
                    READ_BLOCK_GET_MICROS);
+      bts_file_level = rep->level;
       s = ReadBlockFromFile(
           rep->file.get(), prefetch_buffer, rep->footer, ro, handle,
           &block_value, rep->ioptions,
@@ -1901,6 +1907,7 @@ TBlockIter* BlockBasedTable::NewDataBlockIterator(
           is_index ? kDisableGlobalSequenceNumber : rep->global_seqno,
           rep->table_options.read_amp_bytes_per_bit,
           GetMemoryAllocator(rep->table_options));
+      bts_file_level = -2;
     }
     if (s.ok()) {
       block.value = block_value.release();
@@ -2331,13 +2338,13 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::Next() {
   if (gc_accelerate_) {
     assert(index_iter_->Valid());
     index_iter_->Next();
-// #ifndef NDEBUG
-//     if (index_iter_->Valid()) {
-//       fetch_value();
-//       assert(index_iter_->key().ToString() ==
-//                       block_iter_.key().ToString());
-//     }
-// #endif  // !NDEBUG
+    // #ifndef NDEBUG
+    //     if (index_iter_->Valid()) {
+    //       fetch_value();
+    //       assert(index_iter_->key().ToString() ==
+    //                       block_iter_.key().ToString());
+    //     }
+    // #endif  // !NDEBUG
     return;
   }
   assert(block_iter_points_to_real_block_);
@@ -2583,9 +2590,9 @@ Status BlockBasedTable::GetKeyFromMap(
         RecordTick(statistics, INDEX_KEY_MAP_CACHE_HIT);
 #ifndef NDEBUG
         std::cout << "[tid:" << std::this_thread::get_id()
-                  << "] Hit in index cache with key "
-                  << index_cache_key << " file no " << rep_->file_number
-                  << " with entry size " << index_key_map->Size() << std::endl;
+                  << "] Hit in index cache with key " << index_cache_key
+                  << " file no " << rep_->file_number << " with entry size "
+                  << index_key_map->Size() << std::endl;
 #endif
 
       } else if (!rep_->index_key_handle.get()->IsNull()) {
@@ -2593,8 +2600,8 @@ Status BlockBasedTable::GetKeyFromMap(
 
         bool force_load_index_map_to_cache = false;
         if (force_load_index_map_to_cache) {
-          index_key_map = new StaticMapIndex(&rep_->ioptions.internal_comparator,
-                                             rep_->ioptions.statistics);
+          index_key_map = new StaticMapIndex(
+              &rep_->ioptions.internal_comparator, rep_->ioptions.statistics);
           ReadOptions read_options;
           read_options.fill_cache = false;
           std::unique_ptr<InternalIteratorBase<Slice>> iter(
@@ -2605,18 +2612,20 @@ Status BlockBasedTable::GetKeyFromMap(
           std::cout << "[tid:" << std::this_thread::get_id()
                     << "] read and insert to index cache with key "
                     << index_cache_key << " file no " << rep_->file_number
-                    << " with entry size " << index_key_map->Size() << std::endl;
+                    << " with entry size " << index_key_map->Size()
+                    << std::endl;
 #endif
           Status cache_status =
               cache_->Insert(unique_key_for_index_key_block, index_key_map,
                              index_key_map->Size(), &DeleteIndexKeyBlockEntry,
                              &cache_handle, Cache::Priority::HIGH);
           if (cache_status.IsOKButNoSpace()) {
-            std::unique_ptr<StaticMapIndex> copied_index(new StaticMapIndex(*index_key_map));
+            std::unique_ptr<StaticMapIndex> copied_index(
+                new StaticMapIndex(*index_key_map));
             rep_->index_key_map = std::move(copied_index);
           }
 
-          if (cache_status.ok()){
+          if (cache_status.ok()) {
             cache_->TEST_mark_as_data_block(unique_key_for_index_key_block,
                                             index_key_map->Size());
             RecordTick(statistics, INDEX_KEY_MAP_CACHE_ADD);
@@ -2630,7 +2639,6 @@ Status BlockBasedTable::GetKeyFromMap(
 #endif
       }
     }
-
 
     bool is_fg_read = is_foreground_operation();
     if (index_key_map != nullptr && !index_key_map->empty()) {
@@ -2662,7 +2670,7 @@ Status BlockBasedTable::GetKeyFromMap(
             &matched);
         found = true;
         break;
-      } while(-1);
+      } while (-1);
 
       if (is_fg_read && !found) {
         s = Status::NotFound("not found in index key map for fg read");
@@ -2675,7 +2683,6 @@ Status BlockBasedTable::GetKeyFromMap(
         s = Status::NotFound("not found in index key map for gc lookup");
       }
     }
-
 
     if (matched && filter != nullptr && !filter->IsBlockBased()) {
       RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_FULL_TRUE_POSITIVE);
@@ -2715,11 +2722,13 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
   // garbage collection, get key from index_key_map
   bool is_gc_lookup = get_context->is_getkey();
   bool enable_fg_read_acc = true;
-  bool accelerate_fg_read = enable_fg_read_acc && is_foreground_operation() && rep_->level != -1;
+  bool accelerate_fg_read =
+      enable_fg_read_acc && is_foreground_operation() && rep_->level != -1;
 
   if (rep_->table_properties_base.use_index_key_block == true &&
       rep_->table_options.use_index_key_block &&
-      (rep_->index_key_map != nullptr || rep_->table_options.index_key_cache != nullptr) &&
+      (rep_->index_key_map != nullptr ||
+       rep_->table_options.index_key_cache != nullptr) &&
       (is_gc_lookup || accelerate_fg_read)) {
     s = GetKeyFromMap(read_options, key, get_context, prefix_extractor,
                       &filter_entry, no_io);
@@ -2728,8 +2737,6 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
     if ((is_gc_lookup && s.ok()) || s.ok()) {
       return s;
     }
-
-
   }
 
   FilterBlockReader* filter = filter_entry.value;

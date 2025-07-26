@@ -39,6 +39,8 @@
 #include "util/stop_watch.h"
 #include "util/sync_point.h"
 
+thread_local int bts_file_level = -2;
+
 namespace TERARKDB_NAMESPACE {
 
 class TableFactory;
@@ -52,16 +54,16 @@ TableBuilder* NewTableBuilder(
     WritableFileWriter* file, const CompressionType compression_type,
     const CompressionOptions& compression_opts, int level,
     double compaction_load, const std::string* compression_dict,
-    bool skip_filters, uint64_t meta_type, uint64_t creation_time, uint64_t oldest_key_time,
-    SstPurpose sst_purpose) {
+    bool skip_filters, uint64_t meta_type, uint64_t creation_time,
+    uint64_t oldest_key_time, SstPurpose sst_purpose) {
   assert((column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          column_family_name.empty());
   return ioptions.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, internal_comparator,
                           int_tbl_prop_collector_factories, compression_type,
-                          compression_opts, compression_dict, skip_filters, meta_type,
-                          column_family_name, level, compaction_load,
+                          compression_opts, compression_dict, skip_filters,
+                          meta_type, column_family_name, level, compaction_load,
                           creation_time, oldest_key_time, sst_purpose),
       column_family_id, file);
 }
@@ -118,8 +120,9 @@ Status BuildTable(
       TableFileName(ioptions.cf_paths, sst_meta()->fd.GetNumber(),
                     sst_meta()->fd.GetPathId());
 #ifndef ROCKSDB_LITE
-  EventHelpers::NotifyTableFileCreationStarted(
-      ioptions.listeners, dbname, column_family_name, key_fname, job_id, reason);
+  EventHelpers::NotifyTableFileCreationStarted(ioptions.listeners, dbname,
+                                               column_family_name, key_fname,
+                                               job_id, reason);
 #endif  // !ROCKSDB_LITE
   TableProperties key_tp;
 
@@ -132,11 +135,12 @@ Status BuildTable(
       bool use_direct_writes = env_options.use_direct_writes;
       TEST_SYNC_POINT_CALLBACK("BuildTable:create_file", &use_direct_writes);
 #endif  // !NDEBUG
+      bts_file_level = level;
       s = NewWritableFile(env, key_fname, &file, env_options);
       if (!s.ok()) {
         EventHelpers::LogAndNotifyTableFileCreationFinished(
-            event_logger, ioptions.listeners, dbname, column_family_name, key_fname,
-            job_id, sst_meta()->fd, key_tp, reason, s);
+            event_logger, ioptions.listeners, dbname, column_family_name,
+            key_fname, job_id, sst_meta()->fd, key_tp, reason, s);
         return s;
       }
       file->SetIOPriority(io_priority);
@@ -150,7 +154,8 @@ Status BuildTable(
           int_tbl_prop_collector_factories, column_family_id,
           column_family_name, file_writer.get(), compression, compression_opts,
           level, compaction_load, nullptr /* compression_dict */,
-          false /* skip_filters */, 0 /* meta_type */, creation_time, oldest_key_time);
+          false /* skip_filters */, 0 /* meta_type */, creation_time,
+          oldest_key_time);
     }
 
     MergeHelper merge(env, internal_comparator.user_comparator(),
@@ -214,6 +219,7 @@ Status BuildTable(
     }
 
     auto finish_output_blob_sst = [&](BlobBuilder& blob_builder_info) {
+      bts_file_level = -1;
       Status status;
       TableBuilder* blob_builder = blob_builder_info.builder.get();
       FileMetaData* blob_meta = blob_builder_info.current_output;
@@ -316,30 +322,32 @@ Status BuildTable(
         blob_builder_info->fname =
             TableFileName(ioptions.cf_paths, blob_meta->fd.GetNumber(),
                           blob_meta->fd.GetPathId());
+        bts_file_level = -1;
         status = NewWritableFile(env, blob_builder_info->fname, &blob_file,
                                  env_options);
         if (!status.ok()) {
           EventHelpers::LogAndNotifyTableFileCreationFinished(
               event_logger, ioptions.listeners, dbname, column_family_name,
-              blob_builder_info->fname, job_id, blob_meta->fd, TableProperties(), reason, status);
+              blob_builder_info->fname, job_id, blob_meta->fd,
+              TableProperties(), reason, status);
           return status;
         }
         blob_file->SetIOPriority(io_priority);
         blob_file->SetWriteLifeTimeHint(write_hint);
 
-        blob_builder_info->file_writer.reset(
-            new WritableFileWriter(std::move(blob_file), blob_builder_info->fname, env_options,
-                                   ioptions.statistics, ioptions.listeners));
+        blob_builder_info->file_writer.reset(new WritableFileWriter(
+            std::move(blob_file), blob_builder_info->fname, env_options,
+            ioptions.statistics, ioptions.listeners));
         blob_builder_info->builder.reset(NewTableBuilder(
             ioptions, mutable_cf_options, internal_comparator,
             int_tbl_prop_collector_factories_for_blob, column_family_id,
-            column_family_name, blob_builder_info->file_writer.get(), 
-            compression, compression_opts, -1 /* level */, 
+            column_family_name, blob_builder_info->file_writer.get(),
+            compression, compression_opts, -1 /* level */,
             0 /* compaction_load */, nullptr, true, 1));
         blob_builder = blob_builder_info->builder.get();
-        if(is_cold_blob){
+        if (is_cold_blob) {
           RecordTick(ioptions.statistics, COLD_BLOB_FILE_NUM);
-        }else{
+        } else {
           RecordTick(ioptions.statistics, HOT_BLOB_FILE_NUM);
         }
       }
@@ -447,7 +455,8 @@ Status BuildTable(
 
     // Finish and check for builder errors
     key_tp = key_builder->GetTableProperties();
-    bool empty = key_builder->NumEntries() == 0 && key_tp.num_range_deletions == 0;
+    bool empty =
+        key_builder->NumEntries() == 0 && key_tp.num_range_deletions == 0;
     if (s.ok()) {
       s = c_iter.status();
     }
@@ -463,7 +472,6 @@ Status BuildTable(
                            .GetNumber(),
                        separate_helper.hot_blob_builder_info.current_output->fd
                            .GetFileSize());
-
       }
     }
     if (separate_helper.cold_blob_builder_info.builder) {
@@ -474,10 +482,10 @@ Status BuildTable(
         ROCKS_LOG_INFO(ioptions.info_log,
                        "finish output cold blob sst: file_number %" PRIu64
                        " file_size %" PRIu64,
-                       separate_helper.cold_blob_builder_info.current_output
-                           ->fd.GetNumber(),
-                       separate_helper.cold_blob_builder_info.current_output
-                           ->fd.GetFileSize());
+                       separate_helper.cold_blob_builder_info.current_output->fd
+                           .GetNumber(),
+                       separate_helper.cold_blob_builder_info.current_output->fd
+                           .GetFileSize());
       }
     }
     if (!s.ok() || empty) {
@@ -502,7 +510,8 @@ Status BuildTable(
       uint64_t file_size = key_builder->FileSize();
       sst_meta()->fd.file_size = file_size;
       sst_meta()->marked_for_compaction =
-          key_builder->NeedCompact() ? FileMetaData::kMarkedFromTableBuilder : 0;
+          key_builder->NeedCompact() ? FileMetaData::kMarkedFromTableBuilder
+                                     : 0;
       sst_meta()->prop.num_entries = key_builder->NumEntries();
       assert(sst_meta()->fd.GetFileSize() > 0);
       // refresh now that builder is finished

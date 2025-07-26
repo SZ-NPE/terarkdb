@@ -45,6 +45,8 @@
 #include "util/stop_watch.h"
 #include "util/xxhash.h"
 
+extern thread_local int bts_file_level;
+
 namespace TERARKDB_NAMESPACE {
 
 extern const std::string kHashIndexPrefixesBlock;
@@ -408,6 +410,7 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
   //   return AddFullRecord(key, lazy_value);
   // }
   Rep* r = rep_;
+  bts_file_level = r->level;
   assert(!r->closed);
   assert(ok());
   auto s = lazy_value.fetch();
@@ -419,13 +422,13 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
     assert(r->internal_comparator.Compare(key, Slice(r->last_key)) > 0);
     return Status::Corruption("BlockBasedTableBuilder::Add: overlapping key");
   }
-  
+
   const Slice& value = lazy_value.slice();
   ValueType value_type = ExtractValueType(key);
   bool is_separated = false;
   if (value_type == kTypeValueIndex || value_type == kTypeMergeIndex) {
     is_separated = true;
-  } 
+  }
 
   auto should_flush = r->UpdateAndCheck(key, value);
   if (should_flush) {
@@ -608,6 +611,7 @@ void BlockBasedTableBuilder::WriteRawBlock(const Slice& block_contents,
                                            BlockHandle* handle,
                                            bool is_data_block) {
   Rep* r = rep_;
+  bts_file_level = r->level;
   StopWatch sw(r->ioptions.env, r->ioptions.statistics, WRITE_RAW_BLOCK_MICROS);
   handle->set_offset(r->offset);
   handle->set_size(block_contents.size());
@@ -918,10 +922,13 @@ void BlockBasedTableBuilder::WriteIndexKeyBlock(
   bool enable_last_level_replicated = false;
   Rep* r = rep_;
   if (ok() && r->table_options.use_index_key_block &&
-      !r->index_key_block.empty() && // 1. 全是小 KV 时不建立 index key map
-      ( (enable_last_level_replicated && r->level == 6) ||
-       (static_cast<double> (r->props.separated_entry_count) /
-        static_cast<double> (r->props.num_entries)) < r->table_options.index_sep_ratio)) { // 【2. index 特别多时也不建立 index key map】
+      !r->index_key_block.empty() &&
+      ((enable_last_level_replicated && r->level == 6) ||
+       (static_cast<double>(r->props.separated_entry_count) /
+        static_cast<double>(r->props.num_entries)) <
+           r->table_options.index_sep_ratio)) {
+    // 1. not to construct index key map for all small kvs
+    // 2. not to construct index key map if too much index
     BlockHandle index_key_block_handle;
     WriteRawBlock(r->index_key_block.Finish(), kNoCompression,
                   &index_key_block_handle);
@@ -935,6 +942,7 @@ Status BlockBasedTableBuilder::Finish(
     const std::vector<SequenceNumber>* snapshots,
     const std::vector<uint64_t>* inheritance_tree) {
   Rep* r = rep_;
+  bts_file_level = r->level;
   assert(r->status.ok());
   bool empty_data_block = r->data_block.empty();
   Flush();
@@ -1005,6 +1013,7 @@ Status BlockBasedTableBuilder::Finish(
     std::string footer_encoding;
     footer.EncodeTo(&footer_encoding);
     assert(r->status.ok());
+    bts_file_level = r->level;
     r->status = r->file->Append(footer_encoding);
     if (r->status.ok()) {
       r->offset += footer_encoding.size();

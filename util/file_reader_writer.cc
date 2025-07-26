@@ -15,17 +15,20 @@
 #include "monitoring/histogram.h"
 #include "monitoring/iostats_context_imp.h"
 #include "port/port.h"
+#include "rocksdb/perf_context.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/random.h"
 #include "util/rate_limiter.h"
 #include "util/string_util.h"
 #include "util/sync_point.h"
 #include "utilities/util/factory.h"
-#include "rocksdb/perf_context.h"
 
 #undef min
 
+#ifdef GC_READAHEAD
 extern thread_local int gc_read_ahead_size;
+extern thread_local bool revert_rh_buffer;
+#endif
 
 namespace TERARKDB_NAMESPACE {
 
@@ -124,6 +127,7 @@ Status RandomAccessFileReader::Read(uint64_t offset, size_t n, Slice* result,
       AlignedBuffer buf;
       buf.Alignment(alignment);
       buf.AllocateNewBuffer(read_size);
+
       while (buf.CurrentSize() < read_size) {
         size_t allowed;
         if (for_compaction_ && rate_limiter_ != nullptr) {
@@ -221,13 +225,13 @@ Status RandomAccessFileReader::Read(uint64_t offset, size_t n, Slice* result,
     if (diff > 0) {
       RecordTick(stats_, RANDOM_IO_READ_BYTES, diff);
       if (is_flush_operation()) {
-          RecordTick(stats_, FLUSH_IO_READ_BYTES, diff);
+        RecordTick(stats_, FLUSH_IO_READ_BYTES, diff);
       } else if (is_compaction_operation()) {
-          RecordTick(stats_, COMPACTION_IO_READ_BYTES, diff);
+        RecordTick(stats_, COMPACTION_IO_READ_BYTES, diff);
       } else if (is_foreground_operation()) {
-          RecordTick(stats_, FG_IO_READ_BYTES, diff);
+        RecordTick(stats_, FG_IO_READ_BYTES, diff);
       } else if (is_garbage_collenction_operation()) {
-          RecordTick(stats_, GC_IO_READ_BYTES, diff);
+        RecordTick(stats_, GC_IO_READ_BYTES, diff);
       }
     }
   }
@@ -242,6 +246,7 @@ Status WritableFileWriter::Append(const Slice& data) {
   size_t left = data.size();
   Status s;
   pending_sync_ = true;
+
   TEST_KILL_RANDOM("WritableFileWriter::Append:0",
                    rocksdb_kill_odds * REDUCE_ODDS2);
 
@@ -514,7 +519,27 @@ Status WritableFileWriter::WriteBuffered(const char* data, size_t size,
         old_size = next_write_offset_;
       }
 #endif
-      s = writable_file_->Append(Slice(src, allowed));
+
+      {
+        MeasureTime(stats_, FS_APPEND_IO_SIZE, allowed);
+        StopWatch sw_total(Env::Default(), stats_, FS_APPEND_IO_MICROS);
+
+        Histograms hist_size_type = HISTOGRAM_ENUM_MAX;
+        Histograms hist_micro_type = HISTOGRAM_ENUM_MAX;
+        if (file_name_.find("log") != std::string::npos) {
+          hist_size_type = FS_WAL_IO_SIZE;
+          hist_micro_type = FS_WAL_IO_MICROS;
+        } else if (file_name_.find("sst") != std::string::npos) {
+          hist_size_type = FS_SST_IO_SIZE;
+          hist_micro_type = FS_SST_IO_MICROS;
+        }
+
+        {
+          MeasureTime(stats_, hist_size_type, allowed);
+          StopWatch sw(Env::Default(), stats_, hist_micro_type);
+          s = writable_file_->Append(Slice(src, allowed));
+        }
+      }
 #ifndef ROCKSDB_LITE
       if (ShouldNotifyListeners()) {
         auto finish_ts = std::chrono::system_clock::now();
@@ -535,6 +560,17 @@ Status WritableFileWriter::WriteBuffered(const char* data, size_t size,
 
     IOSTATS_ADD(bytes_written, allowed);
     TEST_KILL_RANDOM("WritableFileWriter::WriteBuffered:0", rocksdb_kill_odds);
+
+    RecordTick(stats_, IO_WRITE_BYTES, allowed);
+    if (is_flush_operation()) {
+      RecordTick(stats_, FLUSH_IO_WRITE_BYTES, allowed);
+    } else if (is_compaction_operation()) {
+      RecordTick(stats_, COMPACTION_IO_WRITE_BYTES, allowed);
+    } else if (is_foreground_operation()) {
+      RecordTick(stats_, FG_IO_WRITE_BYTES, allowed);
+    } else if (is_garbage_collenction_operation()) {
+      RecordTick(stats_, GC_IO_WRITE_BYTES, allowed);
+    }
 
     left -= allowed;
     src += allowed;
@@ -658,21 +694,20 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
 
   virtual Status Read(uint64_t offset, size_t n, Slice* result,
                       char* scratch) const override {
-
     size_t actual_readahead_size = readahead_size_;
-    #ifdef GC_READAHEAD
+#ifdef GC_READAHEAD
     if (gc_read_ahead_size != -1) {
       actual_readahead_size = gc_read_ahead_size;
     }
-    #endif                    
+#endif
 
-    #ifdef DISABLE_READAHEAD
-        return file_->Read(offset, n, result, scratch);
-    #else
-      if (n + alignment_ >= actual_readahead_size) {
-        return file_->Read(offset, n, result, scratch);
-      }
-    #endif
+#ifdef DISABLE_READAHEAD
+    return file_->Read(offset, n, result, scratch);
+#else
+    if (n + alignment_ >= actual_readahead_size) {
+      return file_->Read(offset, n, result, scratch);
+    }
+#endif
 
     std::unique_lock<std::mutex> lk(lock_);
 
@@ -754,6 +789,22 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
       *cached_len = 0;
       return false;
     }
+#ifdef GC_READAHEAD
+    if (gc_read_ahead_size != -1 && revert_rh_buffer &&
+        gc_read_ahead_size != buffer_.CurrentSize()) {
+      // if (gc_read_ahead_size != -1 && gc_read_ahead_size !=
+      // buffer_.CurrentSize()) {
+      *cached_len = 0;
+      return false;
+    }
+
+    if (offset + n > buffer_offset_ + buffer_.CurrentSize()) {
+      *cached_len = 0;
+      return false;
+    }
+
+#endif
+
     uint64_t offset_in_buffer = offset - buffer_offset_;
     *cached_len = std::min(
         buffer_.CurrentSize() - static_cast<size_t>(offset_in_buffer), n);

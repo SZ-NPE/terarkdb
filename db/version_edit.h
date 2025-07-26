@@ -234,6 +234,8 @@ struct FileMetaData {
     return gc_status == kGarbageCollectionPermitted;
   }
   void set_gc_candidate() { gc_status = kGarbageCollectionCandidate; }
+
+  uint64_t raw_size() const { return prop.raw_key_size + prop.raw_value_size; }
 };
 
 // A compressed copy of file meta data that just contain minimum data needed

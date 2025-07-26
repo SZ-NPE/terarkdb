@@ -37,6 +37,8 @@ option(WITH_WINDOWS_UTF8_FILENAMES "use UTF8 as characterset for opening files, 
 option(WITH_BYTEDANCE_METRICS "build with bytedance internal metrics" OFF)
 option(WITH_ASAN "build with ASAN" OFF)
 option(WITH_GFLAGS "build with GFlags" ON)
+option(WITH_BYTESTORE "build with Bytestore Distributed Storage" ON)
+option(MOCK_BYTESTORE "use Bytestore mock api" ON)
 include(CMakeDependentOption)
 # Tests are excluded from Release builds
 CMAKE_DEPENDENT_OPTION(WITH_TESTS "build with tests" ON "CMAKE_BUILD_TYPE STREQUAL Debug" OFF)
@@ -198,6 +200,32 @@ if(WITH_ZSTD)
   include_directories(${zstd_INCLUDE_DIR})
   list(APPEND THIRDPARTY_LIBS zstd)
   message("[terarkdb] zstd include dir : ${zstd_INCLUDE_DIR}")
+endif()
+
+if(WITH_BYTESTORE)
+  if(MOCK_BYTESTORE)
+    message("[terarkdb] with bytestore mock")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUSE_LOG_STORE -DUSE_BYTESTORE_MOCK")
+  else()
+    message("[terarkdb] with bytestore")
+    if(NOT EXISTS ${CMAKE_BINARY_DIR}/bytestore)
+      file(REMOVE_RECURSE ${CMAKE_BINARY_DIR}/bytestore)
+      file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/bytestore)
+      file(DOWNLOAD ${BYTESTORE_DOWNLOAD_URL} ${CMAKE_BINARY_DIR}/bytestore.tar.gz STATUS download_status)
+      list(GET download_status 0 download_result)
+      list(GET download_status 1 download_message)
+      if(download_result EQUAL 0)
+        message("[terarkdb] bytestore download successful")
+        execute_process(COMMAND ${CMAKE_COMMAND} -E tar xvzf ${CMAKE_BINARY_DIR}/bytestore.tar.gz WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bytestore)
+        message("[terarkdb] bytestore include dir: ${CMAKE_BINARY_DIR}/bytestore")
+      else()
+        message(FATAL_ERROR "bytestore download failed: ${download_message}")
+      endif()
+    endif()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -L${CMAKE_BINARY_DIR}/bytestore -lbytestore -DUSE_LOG_STORE")
+    include_directories(${CMAKE_BINARY_DIR}/bytestore/include/bytestore/)
+    link_directories(${CMAKE_BINARY_DIR}/bytestore)
+  endif()
 endif()
 
 string(TIMESTAMP GIT_DATE_TIME "%Y/%m/%d %H:%M:%S" UTC)
@@ -819,6 +847,17 @@ IF(WITH_TESTS OR WITH_TOOLS)
                       util/testutil.cc)
 ENDIF()
 
+if(WITH_BYTESTORE)
+  LIST(APPEND SOURCES
+    bytestore_fs/bytestore_env.cc
+    bytestore_fs/bytestore_fs.cc
+    bytestore_fs/bytestore_fs_impl.cc
+    env/env_bytestore.cc)
+  if(MOCK_BYTESTORE)
+    LIST(APPEND SOURCES bytestore_fs/mock.cc)
+  endif()
+endif()
+
 # Scan more sources
 FILE(GLOB CONSOLE_SOURCES utilities/console/*.cc)
 FILE(GLOB TEST_CONSOLE_SOURCES utilities/console/*_test.cc)
@@ -1040,7 +1079,7 @@ if(WITH_TESTS)
         db/listener_test.cc
         db/log_test.cc
         db/manual_compaction_test.cc
-        db/map_builder_test
+        db/map_builder_test.cc
         db/memtable_list_test.cc
         db/merge_helper_test.cc
         db/merge_test.cc

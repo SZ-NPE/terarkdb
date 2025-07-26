@@ -268,16 +268,14 @@ enum Tickers : uint32_t {
   GC_OUTPUT_FILES,
   GC_GETKEY_READ_BYTES,
 
-  
-
   GC_COUNT,
   GC_READ_COUNT,
   GC_GETKEY_COUNT,
   GC_WRITE_COUNT,
+  GC_FETCH_VAL_COUNT,
 
   GC_WRITE_INDEX_KEY_BLOCK_COUNT,
   GC_INDEX_KEY_MAP_READ_COUNT,
-
 
   READ_BLOB_VALID,
   READ_BLOB_INVALID,
@@ -291,7 +289,6 @@ enum Tickers : uint32_t {
   INDEX_KEY_MAP_CACHE_HIT,
   INDEX_KEY_MAP_CACHE_MISS,
   INDEX_KEY_MAP_MEM_HIT,
-
 
   BLOCK_CACHE_HIT_GET_KEYS,
   BLOCK_CACHE_MISS_GET_KEYS,
@@ -342,6 +339,7 @@ enum Histograms : uint32_t {
   MANIFEST_FILE_SYNC_MICROS,
   // garbage collection latency
   GC_GET_KEY_TIME,
+  GC_FETCH_VALUE_TIME,
   GC_READ_TIME,
   GC_WRITE_TIME,
   GC_ALL_TIME,
@@ -384,6 +382,13 @@ enum Histograms : uint32_t {
   INSTALL_SUPER_VERSION_TIME,
   BUILD_VERSION_TIME,
 
+  FS_APPEND_IO_SIZE,
+  FS_APPEND_IO_MICROS,
+  FS_SST_IO_SIZE,
+  FS_SST_IO_MICROS,
+  FS_WAL_IO_SIZE,
+  FS_WAL_IO_MICROS,
+
   HISTOGRAM_ENUM_MAX,
 };
 
@@ -399,6 +404,7 @@ struct HistogramData {
   // zero-initialize new members since old Statistics::histogramData()
   // implementations won't write them.
   double max = 0.0;
+  double min = 0.0;
   uint64_t count = 0;
   uint64_t sum = 0;
 };

@@ -161,7 +161,7 @@ enum UpdateStatus {     // Return status For inplace update callback
 
 class AtomicFlushGroup {
  public:
-  virtual ~AtomicFlushGroup(){};
+  virtual ~AtomicFlushGroup() {};
 };
 
 struct AdvancedColumnFamilyOptions {
@@ -674,6 +674,8 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through SetOptions() API
   uint64_t blob_file_bytes_limit = 0;
+
+  bool gc_adpative_readahead = false;
 
   // ---------------- OPTIONS NOT SUPPORTED ANYMORE ----------------
 

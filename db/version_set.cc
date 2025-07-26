@@ -57,6 +57,8 @@
 #include "util/sync_point.h"
 #include "utilities/util/valvec.hpp"
 
+extern thread_local int bts_file_level;
+
 namespace TERARKDB_NAMESPACE {
 
 namespace {
@@ -379,7 +381,7 @@ struct MarkedFilesComp {
 
 }  // anonymous namespace
 
-VersionStorageInfo::~VersionStorageInfo() { delete[](files_ - 1); }
+VersionStorageInfo::~VersionStorageInfo() { delete[] (files_ - 1); }
 
 Version::~Version() {
   assert(refs_ == 0);
@@ -831,8 +833,10 @@ Status Version::GetPropertiesOfAllTables(TablePropertiesCollection* props,
                       file_meta->fd.GetPathId());
     // 1. If the table is already present in table cache, load table
     // properties from there.
+    bts_file_level = level;
     std::shared_ptr<const TableProperties> table_properties;
     Status s = GetTableProperties(&table_properties, file_meta, &fname);
+    bts_file_level = -2;
     if (s.ok()) {
       props->insert({fname, table_properties});
     } else {
@@ -2881,10 +2885,10 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
         if (base_level_ == num_levels_ - 1) {
           level_multiplier_ = 1.0;
         } else {
-          level_multiplier_ =
-              std::pow(static_cast<double>(max_level_size) /
-                           static_cast<double>(base_level_size),
-                       1.0 / static_cast<double>(num_levels_ - base_level_ - 1));
+          level_multiplier_ = std::pow(
+              static_cast<double>(max_level_size) /
+                  static_cast<double>(base_level_size),
+              1.0 / static_cast<double>(num_levels_ - base_level_ - 1));
         }
       }
 
@@ -4207,7 +4211,7 @@ Status VersionSet::ReduceNumberOfLevels(const std::string& dbname,
     new_files_list[new_levels - 1] = vstorage->LevelFiles(first_nonempty_level);
   }
 
-  delete[](vstorage->files_ - 1);
+  delete[] (vstorage->files_ - 1);
   vstorage->files_ = new_files_list;
   vstorage->num_levels_ = new_levels;
 

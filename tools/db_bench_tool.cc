@@ -878,6 +878,14 @@ DEFINE_string(zbd_path, "", "Path of zone block device.");
 DEFINE_string(aux_path, "", "Aux path for zenfs.");
 #endif
 
+#ifdef USE_LOG_STORE
+DEFINE_string(bytestore_uri, "blob://region-01/cluster-01/pool-01/",
+              "Path of bytestore");
+DEFINE_bool(enable_rdma, false, "bytestore_env enable rdma");
+#endif
+
+DEFINE_string(db_log_dir, "", "DB info log dir");
+
 static std::shared_ptr<TERARKDB_NAMESPACE::Env> env_guard;
 
 static TERARKDB_NAMESPACE::Env* FLAGS_env = TERARKDB_NAMESPACE::Env::Default();
@@ -3714,6 +3722,7 @@ class Benchmark {
     options.create_missing_column_families = FLAGS_num_column_families > 1;
     options.statistics = dbstats;
     options.wal_dir = FLAGS_wal_dir;
+    options.db_log_dir = FLAGS_db_log_dir;
     options.create_if_missing = !FLAGS_use_existing_db;
     options.dump_malloc_stats = FLAGS_dump_malloc_stats;
     options.stats_dump_period_sec =
@@ -6608,9 +6617,8 @@ int db_bench_tool(int argc, char** argv) {
       fprintf(stderr, "No Env registered for URI: %s\n", FLAGS_env_uri.c_str());
       exit(1);
     }
-  }
 #ifdef WITH_ZENFS
-  else if (!FLAGS_zbd_path.empty()) {
+  } else if (!FLAGS_zbd_path.empty()) {
     if (metrics_reporter_factory == nullptr) {
       metrics_reporter_factory =
           std::make_shared<ByteDanceMetricsReporterFactory>();
@@ -6624,11 +6632,19 @@ int db_bench_tool(int argc, char** argv) {
               s.ToString().c_str());
       exit(1);
     }
-  }
-
 #endif  // WITH_ZENFS
+#ifdef USE_LOG_STORE
+  } else if (!FLAGS_bytestore_uri.empty()) {
+    Status s =
+        NewBytestoreEnv(&FLAGS_env, FLAGS_bytestore_uri, FLAGS_enable_rdma);
+    if (!s.ok()) {
+      fprintf(stderr, "Error: Init bytestore env failed.\nStatus : %s\n",
+              s.ToString().c_str());
+      exit(1);
+    }
+#endif
 #endif  // ROCKSDB_LITE
-  if (!FLAGS_hdfs.empty()) {
+  } else if (!FLAGS_hdfs.empty()) {
     FLAGS_env = new TERARKDB_NAMESPACE::HdfsEnv(FLAGS_hdfs);
   }
 

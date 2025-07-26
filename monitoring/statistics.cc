@@ -148,6 +148,7 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_GETKEY_READ_BYTES, "rocksdb.gc.getkey.read.bytes"},
     {GC_COUNT, "lavakv.gc.total.count"},
     {GC_READ_COUNT, "lavakv.gc.read.count"},
+    {GC_FETCH_VAL_COUNT, "lavakv.gc.fetch.value.count"},
     {GC_GETKEY_COUNT, "lavakv.gc.getkey.count"},
     {GC_WRITE_COUNT, "lavakv.gc.write.count"},
     {GC_WRITE_INDEX_KEY_BLOCK_COUNT, "lavakv.gc.index.block.write.count"},
@@ -185,8 +186,7 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {FG_IO_READ_BYTES, "rocksdb.fg.io.read.bytes"},
     {FG_IO_WRITE_BYTES, "rocksdb.fg.io.write.bytes"},
     {GC_IO_READ_BYTES, "rocksdb.gc.io.read.bytes"},
-    {GC_IO_WRITE_BYTES, "rocksdb.gc.io.write.bytes"}
-};
+    {GC_IO_WRITE_BYTES, "rocksdb.gc.io.write.bytes"}};
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
     {DB_GET, "rocksdb.db.get.micros"},
@@ -203,6 +203,7 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
     {READ_BLOCK_COMPACTION_MICROS, "rocksdb.read.block.compaction.micros"},
     {READ_BLOCK_GET_MICROS, "rocksdb.read.block.get.micros"},
     {GC_GET_KEY_TIME, "lavakv.garbage.collection.getkey.micros"},
+    {GC_FETCH_VALUE_TIME, "lavakv.garbage.collection.fetchvalue.micros"},
     {GC_READ_TIME, "lavakv.garbage.collection.read.micros"},
     {GC_WRITE_TIME, "lavakv.garbage.collection.write.micros"},
     {GC_ALL_TIME, "lavakv.garbage.collection.all.micros"},
@@ -230,6 +231,12 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
     {PICK_GARBAGE_COLLECTION_TIME, "rocksdb.pick.gc.micros"},
     {INSTALL_SUPER_VERSION_TIME, "rocksdb.install.super.version.micros"},
     {BUILD_VERSION_TIME, "rocksdb.build.version.micros"},
+    {FS_APPEND_IO_SIZE, "lavakv.fs.append.io.size"},
+    {FS_APPEND_IO_MICROS, "lavakv.fs.append.io.micros"},
+    {FS_SST_IO_SIZE, "lavakv.fs.sst.io.size"},
+    {FS_SST_IO_MICROS, "lavakv.fs.sst.io.micros"},
+    {FS_WAL_IO_SIZE, "lavakv.wal.io.size"},
+    {FS_WAL_IO_MICROS, "lavakv.wal.io.micros"},
 };
 
 std::shared_ptr<Statistics> CreateDBStatistics() {
