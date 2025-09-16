@@ -88,6 +88,9 @@
 #include "util/sync_point.h"
 #include "utilities/trace/bytedance_metrics_reporter.h"
 
+
+thread_local int read_file_type = 0; // 0 - default, 1 - sst, 2 - blob
+
 #ifdef WITH_ZENFS
 #include "utilities/trace/zbd_stat.h"
 #endif

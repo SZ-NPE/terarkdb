@@ -48,6 +48,9 @@
 #include "util/string_util.h"
 #include "util/sync_point.h"
 
+
+extern thread_local int read_file_type;
+
 namespace TERARKDB_NAMESPACE {
 
 extern const uint64_t kBlockBasedTableMagicNumber;
@@ -831,7 +834,9 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     s = file->Prefetch(prefetch_off, prefetch_len);
   } else {
     prefetch_buffer.reset(new FilePrefetchBuffer(nullptr, 0, 0, true, true));
+    read_file_type = level > -1 ? 1 : 2;
     s = prefetch_buffer->Prefetch(file.get(), prefetch_off, prefetch_len);
+    read_file_type = 0;
   }
   s = ReadFooterFromFile(file.get(), prefetch_buffer.get(), file_size, &footer,
                          kBlockBasedTableMagicNumber);
@@ -918,10 +923,12 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     s = meta_iter->status();
     TableProperties* table_properties = nullptr;
     if (s.ok()) {
+      read_file_type = rep->level > -1 ? 1 : 2;
       s = ReadProperties(
           meta_iter->value(), rep->file.get(), prefetch_buffer.get(),
           rep->footer, rep->ioptions, &table_properties,
           false /* compression_type_missing */, nullptr /* memory_allocator */);
+      read_file_type = 0;
     }
 
     if (!s.ok()) {
@@ -1191,8 +1198,10 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     }
     if (s.ok() && prefetch_filter) {
       // Hack: Call GetFilter() to implicitly add filter to the block_cache
+      read_file_type = rep->level > -1 ? 1 : 2;
       auto filter_entry =
           new_table->GetFilter(rep->table_prefix_extractor.get());
+      read_file_type = 0;
       if (filter_entry.value != nullptr && prefetch_all) {
         filter_entry.value->CacheDependencies(
             pin_all, rep->table_prefix_extractor.get());
@@ -1211,8 +1220,10 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     // pre-load these blocks, which will kept in member variables in Rep
     // and with a same life-time as this table object.
     IndexReader* index_reader = nullptr;
+    read_file_type = level > -1 ? 1 : 2;
     s = new_table->CreateIndexReader(prefetch_buffer.get(), &index_reader,
                                      meta_iter.get(), level);
+    read_file_type = 0;
     if (s.ok()) {
       rep->index_reader.reset(index_reader);
       // The partitions of partitioned index are always stored in cache. They
@@ -1225,9 +1236,11 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
       // Set filter block
       if (rep->filter_policy) {
         const bool is_a_filter_partition = true;
+        read_file_type = rep->level > -1 ? 1 : 2;
         auto filter = new_table->ReadFilter(
             prefetch_buffer.get(), rep->filter_handle, !is_a_filter_partition,
             rep->table_prefix_extractor.get());
+        read_file_type = 0;
         rep->filter.reset(filter);
         // Refer to the comment above about paritioned indexes always being
         // cached
@@ -1890,6 +1903,7 @@ TBlockIter* BlockBasedTable::NewDataBlockIterator(
     }
     std::unique_ptr<Block> block_value;
     {
+      read_file_type = rep->level > -1 ? 1 : 2;
       StopWatch sw(rep->ioptions.env, rep->ioptions.statistics,
                    READ_BLOCK_GET_MICROS);
       s = ReadBlockFromFile(
@@ -1901,6 +1915,7 @@ TBlockIter* BlockBasedTable::NewDataBlockIterator(
           is_index ? kDisableGlobalSequenceNumber : rep->global_seqno,
           rep->table_options.read_amp_bytes_per_bit,
           GetMemoryAllocator(rep->table_options));
+      read_file_type = 0;
     }
     if (s.ok()) {
       block.value = block_value.release();
@@ -2014,6 +2029,7 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
       CompressionType raw_block_comp_type;
       BlockContents raw_block_contents;
       {
+        read_file_type = rep->level > -1 ? 1 : 2;
         StopWatch sw(rep->ioptions.env, statistics, READ_BLOCK_GET_MICROS);
         BlockFetcher block_fetcher(
             rep->file.get(), prefetch_buffer, rep->footer, ro, handle,
@@ -2024,6 +2040,7 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
             GetMemoryAllocatorForCompressedBlock(rep->table_options));
         s = block_fetcher.ReadBlockContents();
         raw_block_comp_type = block_fetcher.get_compression_type();
+        read_file_type = 0;
       }
 
       if (s.ok()) {
@@ -3082,6 +3099,16 @@ Status BlockBasedTable::CreateIndexReader(
   // If prefix_extractor does not match prefix_extractor_name from table
   // properties, turn off Hash Index by setting total_order_seek to true
 
+  class BinarySearchGuard {
+    public:
+      BinarySearchGuard(int level) {
+        read_file_type = level > -1 ? 1 : 2;
+      } 
+      ~BinarySearchGuard() {
+        read_file_type = 0;
+      }
+  };
+
   switch (index_type) {
     case BlockBasedTableOptions::kTwoLevelIndexSearch: {
       return PartitionIndexReader::Create(
@@ -3095,6 +3122,7 @@ Status BlockBasedTable::CreateIndexReader(
           GetMemoryAllocator(rep_->table_options));
     }
     case BlockBasedTableOptions::kBinarySearch: {
+      BinarySearchGuard guard(rep_->level);
       return BinarySearchIndexReader::Create(
           file, prefetch_buffer, footer, footer.index_handle(), rep_->ioptions,
           icomparator, index_reader, rep_->persistent_cache_options,

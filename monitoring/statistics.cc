@@ -185,7 +185,13 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {FG_IO_READ_BYTES, "rocksdb.fg.io.read.bytes"},
     {FG_IO_WRITE_BYTES, "rocksdb.fg.io.write.bytes"},
     {GC_IO_READ_BYTES, "rocksdb.gc.io.read.bytes"},
-    {GC_IO_WRITE_BYTES, "rocksdb.gc.io.write.bytes"}
+    {GC_IO_WRITE_BYTES, "rocksdb.gc.io.write.bytes"},
+    {FG_IO_READ_COUNTS, "rocksdb.fg.io.read.counts"},
+    {FG_IO_READ_SST_COUNTS, "rocksdb.fg.io.read.sst.counts"},
+    {FG_IO_READ_BLOB_COUNTS, "rocksdb.fg.io.read.blob.counts"},
+    {ALL_IO_READ_COUNTS, "rocksdb.all.io.read.counts"},
+    {ALL_IO_READ_SST_COUNTS, "rocksdb.all.io.read.sst.counts"},
+    {ALL_IO_READ_BLOB_COUNTS, "rocksdb.all.io.read.blob.counts"}
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

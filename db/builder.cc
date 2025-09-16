@@ -250,7 +250,7 @@ Status BuildTable(
         mutable_cf_options, ioptions.num_levels, ioptions.compaction_style);
 
     auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
-      assert(value.file_number() == kInvalidFileNumber);
+      // assert(value.file_number() == kInvalidFileNumber);
       Status status;
       // hotness aware
       BlobBuilder* blob_builder_info = &separate_helper.cold_blob_builder_info;

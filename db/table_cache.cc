@@ -28,6 +28,8 @@
 #include "util/stop_watch.h"
 #include "util/sync_point.h"
 
+extern thread_local int read_file_type;
+
 namespace TERARKDB_NAMESPACE {
 
 namespace {
@@ -474,7 +476,9 @@ Status TableCache::Get(const ReadOptions& options,
     t->UpdateMaxCoveringTombstoneSeq(options, ExtractUserKey(k),
                                      get_context->max_covering_tombstone_seq());
     if (!file_meta.prop.is_map_sst()) {
+      read_file_type = level > -1 ? 1 : 2;
       s = t->Get(options, k, get_context, prefix_extractor, skip_filters);
+      read_file_type = 0;  // reset to default
     } else if (dependence_map.empty()) {
       s = Status::Corruption(
           "TableCache::Get: Composite sst depend files missing");

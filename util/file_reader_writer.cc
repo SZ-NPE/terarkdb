@@ -26,6 +26,7 @@
 #undef min
 
 extern thread_local int gc_read_ahead_size;
+extern thread_local int read_file_type;
 
 namespace TERARKDB_NAMESPACE {
 
@@ -226,8 +227,22 @@ Status RandomAccessFileReader::Read(uint64_t offset, size_t n, Slice* result,
           RecordTick(stats_, COMPACTION_IO_READ_BYTES, diff);
       } else if (is_foreground_operation()) {
           RecordTick(stats_, FG_IO_READ_BYTES, diff);
+          RecordTick(stats_, FG_IO_READ_COUNTS, 1);
+          if (read_file_type == 1) {
+            RecordTick(stats_, FG_IO_READ_SST_COUNTS, 1);
+          } else if (read_file_type == 2) {
+            RecordTick(stats_, FG_IO_READ_BLOB_COUNTS, 1);
+          }
       } else if (is_garbage_collenction_operation()) {
           RecordTick(stats_, GC_IO_READ_BYTES, diff);
+      }
+      RecordTick(stats_, ALL_IO_READ_COUNTS, 1);
+      if (read_file_type == 1) {
+        RecordTick(stats_, ALL_IO_READ_SST_COUNTS, 1);
+      } else if (read_file_type == 2) {
+        RecordTick(stats_, ALL_IO_READ_BLOB_COUNTS, 1);
+      } else {
+        assert(read_file_type != 0);
       }
     }
   }
