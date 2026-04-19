@@ -268,14 +268,15 @@ void LIRSCacheShard::SetCapacity(size_t capacity) {
   stack_capacity_ = capacity_ * irr_ratio_;
 }
 
-Cache::Handle* LIRSCacheShard::Lookup(const Slice& key, uint32_t hash) {
+Cache::Handle* LIRSCacheShard::Lookup(const Slice& key, uint32_t hash,
+                                      bool record_hit) {
   MutexLock l(&mutex_);
   LIRSHandle* h = table_.Lookup(key, hash);
   if (h != nullptr) {
     if (!h->Remote()) {
-      if (h->refs == 1) {
+      if (h->refs == 1 && record_hit) {
         LIRS_Remove(h);
-      } else {
+      } else if (record_hit) {
         if (h->LIR()) {
           AdjustToStackTop(h);
         } else if (h->HIR()) {

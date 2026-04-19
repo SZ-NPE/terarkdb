@@ -322,7 +322,7 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
     result.max_subcompactions = 1;
   }
 
-  if (result.blob_size < 8) {
+  if (result.blob_size > 0 && result.blob_size < 8) {
     result.blob_size = 8;
   }
   if (result.blob_large_key_ratio > 1) {
@@ -446,7 +446,8 @@ ColumnFamilyData::ColumnFamilyData(
       queued_for_garbage_collection_(false),
       prev_compaction_needed_bytes_(0),
       allow_2pc_(db_options.allow_2pc),
-      last_memtable_id_(0) {
+      last_memtable_id_(0),
+      hotness_tracker_(cf_options.enable_hotness_tracker ? std::make_shared<HotnessTracker>(1000000, 1000000) : nullptr) {
   Ref();
 
   // if _dummy_versions is nullptr, then this is a dummy column family.
@@ -973,9 +974,10 @@ bool ColumnFamilyData::NeedsCompaction() const {
 
 bool ColumnFamilyData::NeedsGarbageCollection() const {
   auto vstorage = current_->storage_info();
-  return !vstorage->IsPickGarbageCollectionFail() &&
+  bool res = !vstorage->IsPickGarbageCollectionFail() &&
          (vstorage->blob_marked_for_compaction() ||
           vstorage->total_garbage_ratio() >= mutable_cf_options_.blob_gc_ratio);
+  return res;
 }
 
 Compaction* ColumnFamilyData::PickCompaction(

@@ -439,6 +439,9 @@ bool Compaction::IsTrivialMove() const {
   // assert inputs_.size() == 1
 
   for (const auto& file : inputs_.front().files) {
+    if (!file->prop.dependence.empty()) {
+      return false;
+    }
     std::vector<FileMetaData*> file_grand_parents;
     if (output_level_ + 1 >= number_levels_) {
       continue;

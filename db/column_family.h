@@ -27,6 +27,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/chash_set.h"
+#include "util/hotness_tracker.h"
 #include "util/thread_local.h"
 
 namespace TERARKDB_NAMESPACE {
@@ -413,6 +414,10 @@ class ColumnFamilyData {
     return initial_cf_options_;
   }
 
+  std::shared_ptr<HotnessTracker> hotness_tracker() const {
+    return hotness_tracker_;
+  }
+
   Env::WriteLifeTimeHint CalculateSSTWriteHint(int level);
 
   Status AddDirectories();
@@ -502,6 +507,8 @@ class ColumnFamilyData {
 
   // Memtable id to track flush.
   std::atomic<uint64_t> last_memtable_id_;
+
+  std::shared_ptr<HotnessTracker> hotness_tracker_;
 
   // Directories corresponding to cf_paths.
   std::vector<std::unique_ptr<Directory>> data_dirs_;

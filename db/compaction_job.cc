@@ -776,6 +776,9 @@ int CompactionJob::Prepare(int sub_compaction_slots) {
              compact_->compaction->level()) > 0);
   write_hint_ =
       c->column_family_data()->CalculateSSTWriteHint(c->output_level());
+  if (c->mutable_cf_options()->get_blob_config().blob_size != size_t(-1)) {
+    write_hint_ = Env::WLTH_EXTREME;
+  }
   // Is this compaction producing files at the bottommost level?
   bottommost_level_ = c->bottommost_level();
 
@@ -2261,6 +2264,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   if (status.ok()) {
     status = s;
   }
+  if (status.ok() && !sub_compact->blob_outputs.empty()) {
+    RecordTick(db_options_.statistics.get(), GC_REWRITE_BLOB_BYTES,
+               sub_compact->blob_outputs.front().meta.fd.GetFileSize());
+  }
   if (status.ok()) {
     if (counter.has_run && counter.run_live) {
       counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
@@ -2309,6 +2316,18 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
           sub_compact->compaction->immutable_cf_options()->cf_paths,
           meta.fd.GetNumber(), meta.fd.GetPathId());
       env_->DeleteFile(fname);
+
+      if (meta.prop.num_entries == 0) {
+        for (auto f : files) {
+          RecordTick(db_options_.statistics.get(), GC_WHOLE_FILE_DELETE);
+          RecordTick(db_options_.statistics.get(), GC_WHOLE_FILE_DELETE_BYTES, f->fd.GetFileSize());
+          ROCKS_LOG_INFO(db_options_.info_log,
+                         "[%s] [JOB %d] ★染色删除★ Table #%" PRIu64
+                         " size %" PRIu64,
+                         cfd->GetName().c_str(), job_id_, f->fd.GetNumber(), f->fd.GetFileSize());
+        }
+      }
+
       sub_compact->blob_outputs.clear();
     }
   }
@@ -3095,7 +3114,7 @@ Status CompactionJob::OpenCompactionOutputBlob(
 
   sub_compact->blob_outputs.push_back(out);
   writable_file->SetIOPriority(Env::IO_LOW);
-  writable_file->SetWriteLifeTimeHint(write_hint_);
+  writable_file->SetWriteLifeTimeHint(Env::WLTH_EXTREME);
   writable_file->SetPreallocationBlockSize(static_cast<size_t>(
       sub_compact->compaction->OutputFilePreallocationSize()));
   const auto& listeners =

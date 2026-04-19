@@ -156,15 +156,19 @@ Status BuildTable(
                       snapshots.empty() ? 0 : snapshots.back(),
                       snapshot_checker);
 
-    struct BuilderSeparateHelper : public SeparateHelper {
-      std::vector<FileMetaData>* output = nullptr;
-      std::vector<TableProperties>* prop = nullptr;
+    struct BlobOutput {
       std::string fname;
       TableProperties tp;
       std::unique_ptr<WritableFileWriter> file_writer;
       std::unique_ptr<TableBuilder> builder;
       FileMetaData* current_output = nullptr;
       TableProperties* current_prop = nullptr;
+    };
+
+    struct BuilderSeparateHelper : public SeparateHelper {
+      std::vector<FileMetaData>* output = nullptr;
+      std::vector<TableProperties>* prop = nullptr;
+      BlobOutput blobs[2]; // 0 for cold, 1 for hot
       std::unique_ptr<ValueExtractor> value_meta_extractor;
       Status (*trans_to_separate_callback)(void* args, const Slice& key,
                                            LazyBuffer& value) = nullptr;
@@ -200,35 +204,36 @@ Status BuildTable(
           ioptions.value_meta_extractor_factory->CreateValueExtractor(context);
     }
 
-    auto finish_output_blob_sst = [&] {
+    auto finish_output_blob_sst = [&](int hot_idx) {
       Status status;
-      TableBuilder* blob_builder = separate_helper.builder.get();
-      FileMetaData* blob_meta = separate_helper.current_output;
+      auto& bstate = separate_helper.blobs[hot_idx];
+      TableBuilder* blob_builder = bstate.builder.get();
+      FileMetaData* blob_meta = bstate.current_output;
       blob_meta->prop.num_entries = blob_builder->NumEntries();
       blob_meta->prop.num_deletions = 0;
       blob_meta->prop.purpose = kEssenceSst;
       blob_meta->prop.flags |= TablePropertyCache::kNoRangeDeletions;
       status = blob_builder->Finish(&blob_meta->prop, nullptr);
-      TableProperties& tp = *separate_helper.current_prop;
+      TableProperties& tp = *bstate.current_prop;
       if (status.ok()) {
         blob_meta->fd.file_size = blob_builder->FileSize();
         tp = blob_builder->GetTableProperties();
         blob_meta->prop.raw_key_size = tp.raw_key_size;
         blob_meta->prop.raw_value_size = tp.raw_value_size;
         StopWatch sw(env, ioptions.statistics, TABLE_SYNC_MICROS);
-        status = separate_helper.file_writer->Sync(ioptions.use_fsync);
+        status = bstate.file_writer->Sync(ioptions.use_fsync);
       }
       if (status.ok()) {
-        status = separate_helper.file_writer->Close();
+        status = bstate.file_writer->Close();
       }
-      separate_helper.file_writer.reset();
+      bstate.file_writer.reset();
       EventHelpers::LogAndNotifyTableFileCreationFinished(
           event_logger, ioptions.listeners, dbname, column_family_name,
-          separate_helper.fname, job_id, blob_meta->fd, tp,
+          bstate.fname, job_id, blob_meta->fd, tp,
           TableFileCreationReason::kFlush, status);
 
-      separate_helper.builder.reset();
-      return s;
+      bstate.builder.reset();
+      return status;
     };
 
     size_t target_blob_file_size = MaxBlobSize(
@@ -237,11 +242,26 @@ Status BuildTable(
     auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
       assert(value.file_number() == uint64_t(-1));
       Status status;
-      TableBuilder* blob_builder = separate_helper.builder.get();
-      FileMetaData* blob_meta = separate_helper.current_output;
+
+      ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(column_family_id);
+      auto hotness_tracker = cfd ? cfd->hotness_tracker() : nullptr;
+      Slice user_key = ExtractUserKey(key);
+      bool is_hot = false;
+      if (hotness_tracker) {
+        is_hot = hotness_tracker->IsHot(user_key, HotnessTracker::Hash(user_key));
+      }
+      int hot_idx = is_hot ? 1 : 0;
+      auto& bstate = separate_helper.blobs[hot_idx];
+
+      TableBuilder* blob_builder = bstate.builder.get();
+      FileMetaData* blob_meta = bstate.current_output;
+      auto s = value.fetch();
+      if (!s.ok()) {
+        return s;
+      }
       if (blob_builder != nullptr &&
           blob_builder->FileSize() > target_blob_file_size) {
-        status = finish_output_blob_sst();
+        status = finish_output_blob_sst(hot_idx);
         blob_builder = nullptr;
       }
       if (status.ok() && blob_builder == nullptr) {
@@ -251,40 +271,40 @@ Status BuildTable(
         TEST_SYNC_POINT_CALLBACK("BuildTable:create_file", &use_direct_writes);
 #endif  // !NDEBUG
         separate_helper.output->emplace_back();
-        blob_meta = separate_helper.current_output =
+        blob_meta = bstate.current_output =
             &separate_helper.output->back();
         if (separate_helper.prop == nullptr) {
-          separate_helper.current_prop = &separate_helper.tp;
+          bstate.current_prop = &bstate.tp;
         } else {
           separate_helper.prop->emplace_back();
-          separate_helper.current_prop = &separate_helper.prop->back();
+          bstate.current_prop = &separate_helper.prop->back();
         }
         blob_meta->fd = FileDescriptor(versions_->NewFileNumber(),
                                        sst_meta()->fd.GetPathId(), 0);
-        separate_helper.fname =
+        bstate.fname =
             TableFileName(ioptions.cf_paths, blob_meta->fd.GetNumber(),
                           blob_meta->fd.GetPathId());
-        status = NewWritableFile(env, separate_helper.fname, &blob_file,
+        status = NewWritableFile(env, bstate.fname, &blob_file,
                                  env_options);
         if (!status.ok()) {
           EventHelpers::LogAndNotifyTableFileCreationFinished(
               event_logger, ioptions.listeners, dbname, column_family_name,
-              fname, job_id, blob_meta->fd, TableProperties(), reason, status);
+              bstate.fname, job_id, blob_meta->fd, TableProperties(), reason, status);
           return status;
         }
         blob_file->SetIOPriority(io_priority);
-        blob_file->SetWriteLifeTimeHint(write_hint);
+        blob_file->SetWriteLifeTimeHint(hot_idx == 1 ? Env::WLTH_SHORT : Env::WLTH_EXTREME);
 
-        separate_helper.file_writer.reset(
-            new WritableFileWriter(std::move(blob_file), fname, env_options,
+        bstate.file_writer.reset(
+            new WritableFileWriter(std::move(blob_file), bstate.fname, env_options,
                                    ioptions.statistics, ioptions.listeners));
-        separate_helper.builder.reset(NewTableBuilder(
+        bstate.builder.reset(NewTableBuilder(
             ioptions, mutable_cf_options, internal_comparator,
             int_tbl_prop_collector_factories_for_blob, column_family_id,
-            column_family_name, separate_helper.file_writer.get(), compression,
+            column_family_name, bstate.file_writer.get(), compression,
             compression_opts, -1 /* level */, 0 /* compaction_load */, nullptr,
             true));
-        blob_builder = separate_helper.builder.get();
+        blob_builder = bstate.builder.get();
       }
       if (status.ok()) {
         status = blob_builder->Add(key, value);
@@ -301,6 +321,10 @@ Status BuildTable(
 
     separate_helper.output = meta_vec;
     separate_helper.prop = table_properties_vec;
+    separate_helper.output->reserve(separate_helper.output->size() + 2);
+    if (separate_helper.prop != nullptr) {
+      separate_helper.prop->reserve(separate_helper.prop->size() + 2);
+    }
     BlobConfig blob_config = mutable_cf_options.get_blob_config();
     if (ioptions.table_factory->IsBuilderNeedSecondPass()) {
       blob_config.blob_size = size_t(-1);
@@ -393,11 +417,16 @@ Status BuildTable(
     if (s.ok()) {
       s = c_iter.status();
     }
-    if (separate_helper.builder) {
-      if (!s.ok() || empty) {
-        separate_helper.builder->Abandon();
-      } else {
-        s = finish_output_blob_sst();
+    for (int i = 0; i < 2; ++i) {
+      if (separate_helper.blobs[i].builder) {
+        if (!s.ok() || empty) {
+          separate_helper.blobs[i].builder->Abandon();
+        } else {
+          Status blob_s = finish_output_blob_sst(i);
+          if (s.ok()) {
+            s = blob_s;
+          }
+        }
       }
     }
     if (!s.ok() || empty) {
