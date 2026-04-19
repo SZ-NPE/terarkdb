@@ -11,7 +11,7 @@
 #define __STDC_FORMAT_MACROS
 #endif
 
-#include "cache/lru_cache.h"
+#include "cache/fifo_cache.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -23,12 +23,12 @@
 
 namespace TERARKDB_NAMESPACE {
 
-LRUHandleTable::LRUHandleTable() : list_(nullptr), length_(0), elems_(0) {
+FIFOHandleTable::FIFOHandleTable() : list_(nullptr), length_(0), elems_(0) {
   Resize();
 }
 
-LRUHandleTable::~LRUHandleTable() {
-  ApplyToAllCacheEntries([](LRUHandle* h) {
+FIFOHandleTable::~FIFOHandleTable() {
+  ApplyToAllCacheEntries([](FIFOHandle* h) {
     if (h->refs == 1) {
       h->Free();
     }
@@ -36,13 +36,13 @@ LRUHandleTable::~LRUHandleTable() {
   delete[] list_;
 }
 
-LRUHandle* LRUHandleTable::Lookup(const Slice& key, uint32_t hash) {
+FIFOHandle* FIFOHandleTable::Lookup(const Slice& key, uint32_t hash) {
   return *FindPointer(key, hash);
 }
 
-LRUHandle* LRUHandleTable::Insert(LRUHandle* h) {
-  LRUHandle** ptr = FindPointer(h->key(), h->hash);
-  LRUHandle* old = *ptr;
+FIFOHandle* FIFOHandleTable::Insert(FIFOHandle* h) {
+  FIFOHandle** ptr = FindPointer(h->key(), h->hash);
+  FIFOHandle* old = *ptr;
   h->next_hash = (old == nullptr ? nullptr : old->next_hash);
   *ptr = h;
   if (old == nullptr) {
@@ -56,9 +56,9 @@ LRUHandle* LRUHandleTable::Insert(LRUHandle* h) {
   return old;
 }
 
-LRUHandle* LRUHandleTable::Remove(const Slice& key, uint32_t hash) {
-  LRUHandle** ptr = FindPointer(key, hash);
-  LRUHandle* result = *ptr;
+FIFOHandle* FIFOHandleTable::Remove(const Slice& key, uint32_t hash) {
+  FIFOHandle** ptr = FindPointer(key, hash);
+  FIFOHandle* result = *ptr;
   if (result != nullptr) {
     *ptr = result->next_hash;
     --elems_;
@@ -66,28 +66,28 @@ LRUHandle* LRUHandleTable::Remove(const Slice& key, uint32_t hash) {
   return result;
 }
 
-LRUHandle** LRUHandleTable::FindPointer(const Slice& key, uint32_t hash) {
-  LRUHandle** ptr = &list_[hash & (length_ - 1)];
+FIFOHandle** FIFOHandleTable::FindPointer(const Slice& key, uint32_t hash) {
+  FIFOHandle** ptr = &list_[hash & (length_ - 1)];
   while (*ptr != nullptr && ((*ptr)->hash != hash || key != (*ptr)->key())) {
     ptr = &(*ptr)->next_hash;
   }
   return ptr;
 }
 
-void LRUHandleTable::Resize() {
+void FIFOHandleTable::Resize() {
   uint32_t new_length = 16;
   while (new_length < elems_ * 1.5) {
     new_length *= 2;
   }
-  LRUHandle** new_list = new LRUHandle*[new_length];
+  FIFOHandle** new_list = new FIFOHandle*[new_length];
   memset(new_list, 0, sizeof(new_list[0]) * new_length);
   uint32_t count = 0;
   for (uint32_t i = 0; i < length_; i++) {
-    LRUHandle* h = list_[i];
+    FIFOHandle* h = list_[i];
     while (h != nullptr) {
-      LRUHandle* next = h->next_hash;
+      FIFOHandle* next = h->next_hash;
       uint32_t hash = h->hash;
-      LRUHandle** ptr = &new_list[hash & (new_length - 1)];
+      FIFOHandle** ptr = &new_list[hash & (new_length - 1)];
       h->next_hash = *ptr;
       *ptr = h;
       h = next;
@@ -101,7 +101,7 @@ void LRUHandleTable::Resize() {
 }
 
 template <class CacheMonitor>
-LRUCacheShardTemplate<CacheMonitor>::LRUCacheShardTemplate(
+FIFOCacheShardTemplate<CacheMonitor>::FIFOCacheShardTemplate(
     size_t capacity, bool strict_capacity_limit, double high_pri_pool_ratio,
     const typename CacheMonitor::Options& options)
     : CacheMonitor(options),
@@ -110,35 +110,34 @@ LRUCacheShardTemplate<CacheMonitor>::LRUCacheShardTemplate(
       high_pri_pool_ratio_(high_pri_pool_ratio),
       high_pri_pool_capacity_(0) {
   // Make empty circular linked list
-  lru_.next = &lru_;
-  lru_.prev = &lru_;
-  lru_low_pri_ = &lru_;
+  fifo_.next = &fifo_;
+  fifo_.prev = &fifo_;
+  fifo_low_pri_ = &fifo_;
   SetCapacity(capacity);
 }
 
 template <class CacheMonitor>
-LRUCacheShardTemplate<CacheMonitor>::~LRUCacheShardTemplate() {}
+FIFOCacheShardTemplate<CacheMonitor>::~FIFOCacheShardTemplate() {}
 
 template <class CacheMonitor>
-bool LRUCacheShardTemplate<CacheMonitor>::Unref(LRUHandle* e) {
+bool FIFOCacheShardTemplate<CacheMonitor>::Unref(FIFOHandle* e) {
   assert(e->refs > 0);
-  e->refs--;
-  return e->refs == 0;
+  return e->refs.fetch_sub(1, std::memory_order_relaxed) == 1;
 }
 
 // Call deleter and free
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::EraseUnRefEntries() {
-  autovector<LRUHandle*> last_reference_list;
+void FIFOCacheShardTemplate<CacheMonitor>::EraseUnRefEntries() {
+  autovector<FIFOHandle*> last_reference_list;
   {
-    MutexLock l(&mutex_);
-    while (lru_.next != &lru_) {
-      LRUHandle* old = lru_.next;
+    WriteLock l(&mutex_);
+    while (fifo_.next != &fifo_) {
+      FIFOHandle* old = fifo_.next;
       assert(old->InCache());
       assert(old->refs ==
-             1);  // LRU list contains elements which may be evicted
-      LRU_Remove(old);
+             1);  // FIFO list contains elements which may be evicted
+      FIFO_Remove(old);
       table_.Remove(old->key(), old->hash);
       old->SetInCache(false);
       Unref(old);
@@ -153,53 +152,53 @@ void LRUCacheShardTemplate<CacheMonitor>::EraseUnRefEntries() {
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::ApplyToAllCacheEntries(
+void FIFOCacheShardTemplate<CacheMonitor>::ApplyToAllCacheEntries(
     void (*callback)(void*, size_t), bool thread_safe) {
   if (thread_safe) {
-    mutex_.Lock();
+    mutex_.ReadLock();
   }
   table_.ApplyToAllCacheEntries(
-      [callback](LRUHandle* h) { callback(h->value, h->charge); });
+      [callback](FIFOHandle* h) { callback(h->value, h->charge); });
   if (thread_safe) {
-    mutex_.Unlock();
+    mutex_.ReadUnlock();
   }
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::TEST_GetLRUList(
-    LRUHandle** lru, LRUHandle** lru_low_pri) {
-  *lru = &lru_;
-  *lru_low_pri = lru_low_pri_;
+void FIFOCacheShardTemplate<CacheMonitor>::TEST_GetFIFOList(
+    FIFOHandle** fifo, FIFOHandle** fifo_low_pri) {
+  *fifo = &fifo_;
+  *fifo_low_pri = fifo_low_pri_;
 }
 
 template <class CacheMonitor>
-size_t LRUCacheShardTemplate<CacheMonitor>::TEST_GetLRUSize() {
-  LRUHandle* lru_handle = lru_.next;
-  size_t lru_size = 0;
-  while (lru_handle != &lru_) {
-    lru_size++;
-    lru_handle = lru_handle->next;
+size_t FIFOCacheShardTemplate<CacheMonitor>::TEST_GetFIFOSize() {
+  FIFOHandle* fifo_handle = fifo_.next;
+  size_t fifo_size = 0;
+  while (fifo_handle != &fifo_) {
+    fifo_size++;
+    fifo_handle = fifo_handle->next;
   }
-  return lru_size;
+  return fifo_size;
 }
 
 template <class CacheMonitor>
-double LRUCacheShardTemplate<CacheMonitor>::GetHighPriPoolRatio() {
-  MutexLock l(&mutex_);
+double FIFOCacheShardTemplate<CacheMonitor>::GetHighPriPoolRatio() {
+  ReadLock l(&mutex_);
   return high_pri_pool_ratio_;
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::LRU_Remove(LRUHandle* e) {
+void FIFOCacheShardTemplate<CacheMonitor>::FIFO_Remove(FIFOHandle* e) {
   assert(e->next != nullptr);
   assert(e->prev != nullptr);
-  if (lru_low_pri_ == e) {
-    lru_low_pri_ = e->prev;
+  if (fifo_low_pri_ == e) {
+    fifo_low_pri_ = e->prev;
   }
   e->next->prev = e->prev;
   e->prev->next = e->next;
   e->prev = e->next = nullptr;
-  LRUUsageSub(e);
+  FIFOUsageSub(e);
   if (e->InHighPriPool()) {
     assert(high_pri_pool_usage_ >= e->charge);
     HighPriPoolUsageSub(e);
@@ -207,13 +206,13 @@ void LRUCacheShardTemplate<CacheMonitor>::LRU_Remove(LRUHandle* e) {
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::LRU_Insert(LRUHandle* e) {
+void FIFOCacheShardTemplate<CacheMonitor>::FIFO_Insert(FIFOHandle* e) {
   assert(e->next == nullptr);
   assert(e->prev == nullptr);
   if (high_pri_pool_ratio_ > 0 && (e->IsHighPri() || e->HasHit())) {
-    // Inset "e" to head of LRU list.
-    e->next = &lru_;
-    e->prev = lru_.prev;
+    // Inset "e" to head of FIFO list.
+    e->next = &fifo_;
+    e->prev = fifo_.prev;
     e->prev->next = e;
     e->next->prev = e;
     e->SetInHighPriPool(true);
@@ -221,52 +220,52 @@ void LRUCacheShardTemplate<CacheMonitor>::LRU_Insert(LRUHandle* e) {
     MaintainPoolSize();
   } else {
     // Insert "e" to the head of low-pri pool. Note that when
-    // high_pri_pool_ratio is 0, head of low-pri pool is also head of LRU list.
-    e->next = lru_low_pri_->next;
-    e->prev = lru_low_pri_;
+    // high_pri_pool_ratio is 0, head of low-pri pool is also head of FIFO list.
+    e->next = fifo_low_pri_->next;
+    e->prev = fifo_low_pri_;
     e->prev->next = e;
     e->next->prev = e;
     e->SetInHighPriPool(false);
-    lru_low_pri_ = e;
+    fifo_low_pri_ = e;
   }
-  LRUUsageAdd(e);
+  FIFOUsageAdd(e);
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::MaintainPoolSize() {
+void FIFOCacheShardTemplate<CacheMonitor>::MaintainPoolSize() {
   while (high_pri_pool_usage_ > high_pri_pool_capacity_) {
     // Overflow last entry in high-pri pool to low-pri pool.
-    lru_low_pri_ = lru_low_pri_->next;
-    assert(lru_low_pri_ != &lru_);
-    lru_low_pri_->SetInHighPriPool(false);
-    HighPriPoolUsageSub(lru_low_pri_);
+    fifo_low_pri_ = fifo_low_pri_->next;
+    assert(fifo_low_pri_ != &fifo_);
+    fifo_low_pri_->SetInHighPriPool(false);
+    HighPriPoolUsageSub(fifo_low_pri_);
   }
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::EvictFromLRU(
-    size_t charge, autovector<LRUHandle*>* deleted) {
-  while (usage_ + charge > capacity_ && lru_.next != &lru_) {
-    LRUHandle* old = lru_.next;
+void FIFOCacheShardTemplate<CacheMonitor>::EvictFromFIFO(
+    size_t charge, autovector<FIFOHandle*>* deleted) {
+  while (usage_ + charge > capacity_ && fifo_.next != &fifo_) {
+    FIFOHandle* old = fifo_.next;
     assert(old->InCache());
-    assert(old->refs == 1);  // LRU list contains elements which may be evicted
-    LRU_Remove(old);
+    FIFO_Remove(old);
     table_.Remove(old->key(), old->hash);
     old->SetInCache(false);
-    Unref(old);
-    UsageSub(old);
-    deleted->push_back(old);
+    if (Unref(old)) {
+      UsageSub(old);
+      deleted->push_back(old);
+    }
   }
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::SetCapacity(size_t capacity) {
-  autovector<LRUHandle*> last_reference_list;
+void FIFOCacheShardTemplate<CacheMonitor>::SetCapacity(size_t capacity) {
+  autovector<FIFOHandle*> last_reference_list;
   {
-    MutexLock l(&mutex_);
+    WriteLock l(&mutex_);
     capacity_ = capacity;
     high_pri_pool_capacity_ = capacity_ * high_pri_pool_ratio_;
-    EvictFromLRU(0, &last_reference_list);
+    EvictFromFIFO(0, &last_reference_list);
   }
   // we free the entries here outside of mutex for
   // performance reasons
@@ -276,24 +275,21 @@ void LRUCacheShardTemplate<CacheMonitor>::SetCapacity(size_t capacity) {
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::SetStrictCapacityLimit(
+void FIFOCacheShardTemplate<CacheMonitor>::SetStrictCapacityLimit(
     bool strict_capacity_limit) {
-  MutexLock l(&mutex_);
+  WriteLock l(&mutex_);
   strict_capacity_limit_ = strict_capacity_limit;
 }
 
 template <class CacheMonitor>
-Cache::Handle* LRUCacheShardTemplate<CacheMonitor>::Lookup(const Slice& key,
+Cache::Handle* FIFOCacheShardTemplate<CacheMonitor>::Lookup(const Slice& key,
                                                            uint32_t hash,
                                                            bool record_hit) {
-  MutexLock l(&mutex_);
-  LRUHandle* e = table_.Lookup(key, hash);
+  ReadLock l(&mutex_);
+  FIFOHandle* e = table_.Lookup(key, hash);
   if (e != nullptr) {
     assert(e->InCache());
-    if (e->refs == 1 && record_hit) {
-      LRU_Remove(e);
-    }
-    e->refs++;
+    e->refs.fetch_add(1, std::memory_order_relaxed);
     if (record_hit) {
       e->SetHit();
     }
@@ -302,35 +298,31 @@ Cache::Handle* LRUCacheShardTemplate<CacheMonitor>::Lookup(const Slice& key,
 }
 
 template <class CacheMonitor>
-bool LRUCacheShardTemplate<CacheMonitor>::Ref(Cache::Handle* h) {
-  LRUHandle* handle = reinterpret_cast<LRUHandle*>(h);
-  MutexLock l(&mutex_);
-  if (handle->InCache() && handle->refs == 1) {
-    LRU_Remove(handle);
-  }
-  handle->refs++;
+bool FIFOCacheShardTemplate<CacheMonitor>::Ref(Cache::Handle* h) {
+  FIFOHandle* handle = reinterpret_cast<FIFOHandle*>(h);
+  handle->refs.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::SetHighPriorityPoolRatio(
+void FIFOCacheShardTemplate<CacheMonitor>::SetHighPriorityPoolRatio(
     double high_pri_pool_ratio) {
-  MutexLock l(&mutex_);
+  WriteLock l(&mutex_);
   high_pri_pool_ratio_ = high_pri_pool_ratio;
   high_pri_pool_capacity_ = capacity_ * high_pri_pool_ratio_;
   MaintainPoolSize();
 }
 
 template <class CacheMonitor>
-bool LRUCacheShardTemplate<CacheMonitor>::Release(Cache::Handle* handle,
+bool FIFOCacheShardTemplate<CacheMonitor>::Release(Cache::Handle* handle,
                                                   bool force_erase) {
   if (handle == nullptr) {
     return false;
   }
-  LRUHandle* e = reinterpret_cast<LRUHandle*>(handle);
+  FIFOHandle* e = reinterpret_cast<FIFOHandle*>(handle);
   bool last_reference = false;
   {
-    MutexLock l(&mutex_);
+    WriteLock l(&mutex_);
     last_reference = Unref(e);
     if (last_reference) {
       UsageSub(e);
@@ -339,18 +331,12 @@ bool LRUCacheShardTemplate<CacheMonitor>::Release(Cache::Handle* handle,
       // The item is still in cache, and nobody else holds a reference to it
       if (usage_ > capacity_ || force_erase) {
         // the cache is full
-        // The LRU list must be empty since the cache is full
-        assert(!(usage_ > capacity_) || lru_.next == &lru_);
-        // take this opportunity and remove the item
         table_.Remove(e->key(), e->hash);
         e->SetInCache(false);
         Unref(e);
         UsageSub(e);
+        FIFO_Remove(e);
         last_reference = true;
-      } else if (e->next == nullptr && e->prev == nullptr) {
-        // Entries returned by Lookup(record_hit = false) stay on the LRU list.
-        // Only reinsert entries that were detached earlier.
-        LRU_Insert(e);
       }
     }
   }
@@ -363,17 +349,17 @@ bool LRUCacheShardTemplate<CacheMonitor>::Release(Cache::Handle* handle,
 }
 
 template <class CacheMonitor>
-Status LRUCacheShardTemplate<CacheMonitor>::Insert(
+Status FIFOCacheShardTemplate<CacheMonitor>::Insert(
     const Slice& key, uint32_t hash, void* value, size_t charge,
     void (*deleter)(const Slice& key, void* value), Cache::Handle** handle,
     Cache::Priority priority) {
   // Allocate the memory here outside of the mutex
   // If the cache is full, we'll have to release it
   // It shouldn't happen very often though.
-  LRUHandle* e = reinterpret_cast<LRUHandle*>(
-      new char[sizeof(LRUHandle) - 1 + key.size()]);
+  FIFOHandle* e = reinterpret_cast<FIFOHandle*>(
+      new char[sizeof(FIFOHandle) - 1 + key.size()]);
   Status s;
-  autovector<LRUHandle*> last_reference_list;
+  autovector<FIFOHandle*> last_reference_list;
 
   e->value = value;
   e->deleter = deleter;
@@ -383,20 +369,20 @@ Status LRUCacheShardTemplate<CacheMonitor>::Insert(
   e->hash = hash;
   e->refs = (handle == nullptr
                  ? 1
-                 : 2);  // One from LRUCache, one for the returned handle
+                 : 2);  // One from FIFOCache, one for the returned handle
   e->next = e->prev = nullptr;
   e->SetInCache(true);
   e->SetPriority(priority);
   memcpy(e->key_data, key.data(), key.size());
 
   {
-    MutexLock l(&mutex_);
+    WriteLock l(&mutex_);
 
-    // Free the space following strict LRU policy until enough space
-    // is freed or the lru list is empty
-    EvictFromLRU(charge, &last_reference_list);
+    // Free the space following strict FIFO policy until enough space
+    // is freed or the fifo list is empty
+    EvictFromFIFO(charge, &last_reference_list);
 
-    if (usage_ - lru_usage_ + charge > capacity_ &&
+    if (usage_ - fifo_usage_ + charge > capacity_ &&
         (strict_capacity_limit_ || handle == nullptr)) {
       if (handle == nullptr) {
         // Don't insert the entry but still return ok, as if the entry inserted
@@ -405,27 +391,24 @@ Status LRUCacheShardTemplate<CacheMonitor>::Insert(
       } else {
         delete[] reinterpret_cast<char*>(e);
         *handle = nullptr;
-        s = Status::Incomplete("Insert failed due to LRU cache being full.");
+        s = Status::Incomplete("Insert failed due to FIFO cache being full.");
       }
     } else {
       // insert into the cache
       // note that the cache might get larger than its capacity if not enough
       // space was freed
-      LRUHandle* old = table_.Insert(e);
+      FIFOHandle* old = table_.Insert(e);
       UsageAdd(e);
       if (old != nullptr) {
         old->SetInCache(false);
+        FIFO_Remove(old);
         if (Unref(old)) {
           UsageSub(old);
-          // old is on LRU because it's in cache and its reference count
-          // was just 1 (Unref returned 0)
-          LRU_Remove(old);
           last_reference_list.push_back(old);
         }
       }
-      if (handle == nullptr) {
-        LRU_Insert(e);
-      } else {
+      FIFO_Insert(e);
+      if (handle != nullptr) {
         *handle = reinterpret_cast<Cache::Handle*>(e);
       }
       s = Status::OK();
@@ -442,22 +425,20 @@ Status LRUCacheShardTemplate<CacheMonitor>::Insert(
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::Erase(const Slice& key,
+void FIFOCacheShardTemplate<CacheMonitor>::Erase(const Slice& key,
                                                 uint32_t hash) {
-  LRUHandle* e;
+  FIFOHandle* e;
   bool last_reference = false;
   {
-    MutexLock l(&mutex_);
+    WriteLock l(&mutex_);
     e = table_.Remove(key, hash);
     if (e != nullptr) {
+      e->SetInCache(false);
+      FIFO_Remove(e);
       last_reference = Unref(e);
-      if (last_reference && e->InCache()) {
-        LRU_Remove(e);
-      }
       if (last_reference) {
         UsageSub(e);
       }
-      e->SetInCache(false);
     }
   }
 
@@ -469,24 +450,24 @@ void LRUCacheShardTemplate<CacheMonitor>::Erase(const Slice& key,
 }
 
 template <class CacheMonitor>
-size_t LRUCacheShardTemplate<CacheMonitor>::GetUsage() const {
-  MutexLock l(&mutex_);
+size_t FIFOCacheShardTemplate<CacheMonitor>::GetUsage() const {
+  ReadLock l(&mutex_);
   return usage_;
 }
 
 template <class CacheMonitor>
-size_t LRUCacheShardTemplate<CacheMonitor>::GetPinnedUsage() const {
-  MutexLock l(&mutex_);
-  assert(usage_ >= lru_usage_);
-  return usage_ - lru_usage_;
+size_t FIFOCacheShardTemplate<CacheMonitor>::GetPinnedUsage() const {
+  ReadLock l(&mutex_);
+  assert(usage_ >= fifo_usage_);
+  return usage_ - fifo_usage_;
 }
 
 template <class CacheMonitor>
-std::string LRUCacheShardTemplate<CacheMonitor>::GetPrintableOptions() const {
+std::string FIFOCacheShardTemplate<CacheMonitor>::GetPrintableOptions() const {
   const int kBufferSize = 200;
   char buffer[kBufferSize];
   {
-    MutexLock l(&mutex_);
+    ReadLock l(&mutex_);
     snprintf(buffer, kBufferSize, "    high_pri_pool_ratio: %.3lf\n",
              high_pri_pool_ratio_);
   }
@@ -494,44 +475,44 @@ std::string LRUCacheShardTemplate<CacheMonitor>::GetPrintableOptions() const {
 }
 
 template <>
-LRUCacheBase<LRUCacheDiagnosableShard>::LRUCacheBase(
+FIFOCacheBase<FIFOCacheDiagnosableShard>::FIFOCacheBase(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
-    const typename LRUCacheDiagnosableShard::MonitorOptions& options,
+    const typename FIFOCacheDiagnosableShard::MonitorOptions& options,
     std::shared_ptr<MemoryAllocator> allocator)
     : ShardedCache(capacity, num_shard_bits, strict_capacity_limit,
                    std::move(allocator)) {
   num_shards_ = 1 << num_shard_bits;
   shards_ =
-      reinterpret_cast<LRUCacheDiagnosableShard*>(port::cacheline_aligned_alloc(
-          sizeof(LRUCacheDiagnosableShard) * num_shards_));
+      reinterpret_cast<FIFOCacheDiagnosableShard*>(port::cacheline_aligned_alloc(
+          sizeof(FIFOCacheDiagnosableShard) * num_shards_));
   size_t per_shard = (capacity + (num_shards_ - 1)) / num_shards_;
   for (int i = 0; i < num_shards_; i++) {
-    new (&shards_[i]) LRUCacheDiagnosableShard(per_shard, strict_capacity_limit,
+    new (&shards_[i]) FIFOCacheDiagnosableShard(per_shard, strict_capacity_limit,
                                                high_pri_pool_ratio, options);
   }
 }
 
-template <class LRUCacheShardType>
-LRUCacheBase<LRUCacheShardType>::LRUCacheBase(
+template <class FIFOCacheShardType>
+FIFOCacheBase<FIFOCacheShardType>::FIFOCacheBase(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
-    const typename LRUCacheShardType::MonitorOptions& options,
+    const typename FIFOCacheShardType::MonitorOptions& options,
     std::shared_ptr<MemoryAllocator> allocator)
     : ShardedCache(capacity, num_shard_bits, strict_capacity_limit,
                    std::move(allocator)) {
   num_shards_ = 1 << num_shard_bits;
-  shards_ = reinterpret_cast<LRUCacheShardType*>(
-      port::cacheline_aligned_alloc(sizeof(LRUCacheShardType) * num_shards_));
+  shards_ = reinterpret_cast<FIFOCacheShardType*>(
+      port::cacheline_aligned_alloc(sizeof(FIFOCacheShardType) * num_shards_));
   size_t per_shard = (capacity + (num_shards_ - 1)) / num_shards_;
   for (int i = 0; i < num_shards_; i++) {
-    new (&shards_[i]) LRUCacheShardType(per_shard, strict_capacity_limit,
+    new (&shards_[i]) FIFOCacheShardType(per_shard, strict_capacity_limit,
                                         high_pri_pool_ratio, options);
   }
 }
 
-template <class LRUCacheShardType>
-std::string LRUCacheBase<LRUCacheShardType>::DumpLRUCacheStatistics() {
+template <class FIFOCacheShardType>
+std::string FIFOCacheBase<FIFOCacheShardType>::DumpFIFOCacheStatistics() {
   std::string res;
   res.append("Cache Summary: \n");
   res.append("usage: " + std::to_string(GetUsage()) +
@@ -546,54 +527,54 @@ std::string LRUCacheBase<LRUCacheShardType>::DumpLRUCacheStatistics() {
 
 #ifdef WITH_DIAGNOSE_CACHE
 template <>
-const char* LRUCacheBase<LRUCacheDiagnosableShard>::Name() const {
-  return "DiagnosableLRUCache";
+const char* FIFOCacheBase<FIFOCacheDiagnosableShard>::Name() const {
+  return "DiagnosableFIFOCache";
 }
 #endif
 
-template <class LRUCacheShardType>
-const char* LRUCacheBase<LRUCacheShardType>::Name() const {
-  return "LRUCache";
+template <class FIFOCacheShardType>
+const char* FIFOCacheBase<FIFOCacheShardType>::Name() const {
+  return "FIFOCache";
 }
 
-template <class LRUCacheShardType>
-LRUCacheBase<LRUCacheShardType>::~LRUCacheBase() {
+template <class FIFOCacheShardType>
+FIFOCacheBase<FIFOCacheShardType>::~FIFOCacheBase() {
   if (shards_ != nullptr) {
     assert(num_shards_ > 0);
     for (int i = 0; i < num_shards_; i++) {
-      shards_[i].~LRUCacheShardType();
+      shards_[i].~FIFOCacheShardType();
     }
     port::cacheline_aligned_free(shards_);
   }
 }
 
-template <class LRUCacheShardType>
-CacheShard* LRUCacheBase<LRUCacheShardType>::GetShard(int shard) {
+template <class FIFOCacheShardType>
+CacheShard* FIFOCacheBase<FIFOCacheShardType>::GetShard(int shard) {
   return reinterpret_cast<CacheShard*>(&shards_[shard]);
 }
 
-template <class LRUCacheShardType>
-const CacheShard* LRUCacheBase<LRUCacheShardType>::GetShard(int shard) const {
+template <class FIFOCacheShardType>
+const CacheShard* FIFOCacheBase<FIFOCacheShardType>::GetShard(int shard) const {
   return reinterpret_cast<CacheShard*>(&shards_[shard]);
 }
 
-template <class LRUCacheShardType>
-void* LRUCacheBase<LRUCacheShardType>::Value(Handle* handle) {
-  return reinterpret_cast<const LRUHandle*>(handle)->value;
+template <class FIFOCacheShardType>
+void* FIFOCacheBase<FIFOCacheShardType>::Value(Handle* handle) {
+  return reinterpret_cast<const FIFOHandle*>(handle)->value;
 }
 
-template <class LRUCacheShardType>
-size_t LRUCacheBase<LRUCacheShardType>::GetCharge(Handle* handle) const {
-  return reinterpret_cast<const LRUHandle*>(handle)->charge;
+template <class FIFOCacheShardType>
+size_t FIFOCacheBase<FIFOCacheShardType>::GetCharge(Handle* handle) const {
+  return reinterpret_cast<const FIFOHandle*>(handle)->charge;
 }
 
-template <class LRUCacheShardType>
-uint32_t LRUCacheBase<LRUCacheShardType>::GetHash(Handle* handle) const {
-  return reinterpret_cast<const LRUHandle*>(handle)->hash;
+template <class FIFOCacheShardType>
+uint32_t FIFOCacheBase<FIFOCacheShardType>::GetHash(Handle* handle) const {
+  return reinterpret_cast<const FIFOHandle*>(handle)->hash;
 }
 
-template <class LRUCacheShardType>
-void LRUCacheBase<LRUCacheShardType>::DisownData() {
+template <class FIFOCacheShardType>
+void FIFOCacheBase<FIFOCacheShardType>::DisownData() {
 // Do not drop data if compile with ASAN to suppress leak warning.
 #if defined(__clang__)
 #if !defined(__has_feature) || !__has_feature(address_sanitizer)
@@ -608,26 +589,26 @@ void LRUCacheBase<LRUCacheShardType>::DisownData() {
 #endif  // __clang__
 }
 
-template <class LRUCacheShardType>
-size_t LRUCacheBase<LRUCacheShardType>::TEST_GetLRUSize() {
-  size_t lru_size_of_all_shards = 0;
+template <class FIFOCacheShardType>
+size_t FIFOCacheBase<FIFOCacheShardType>::TEST_GetFIFOSize() {
+  size_t fifo_size_of_all_shards = 0;
   for (int i = 0; i < num_shards_; i++) {
-    lru_size_of_all_shards += shards_[i].TEST_GetLRUSize();
+    fifo_size_of_all_shards += shards_[i].TEST_GetFIFOSize();
   }
-  return lru_size_of_all_shards;
+  return fifo_size_of_all_shards;
 }
 
-// template <class LRUCacheShardType>
-// double LRUCacheBase<LRUCacheShardType>::GetHighPriPoolRatio()
+// template <class FIFOCacheShardType>
+// double FIFOCacheBase<FIFOCacheShardType>::GetHighPriPoolRatio()
 
-std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts) {
-  return NewLRUCache(cache_opts.capacity, cache_opts.num_shard_bits,
+std::shared_ptr<Cache> NewFIFOCache(const FIFOCacheOptions& cache_opts) {
+  return NewFIFOCache(cache_opts.capacity, cache_opts.num_shard_bits,
                      cache_opts.strict_capacity_limit,
                      cache_opts.high_pri_pool_ratio,
                      cache_opts.memory_allocator);
 }
 
-std::shared_ptr<Cache> NewLRUCache(
+std::shared_ptr<Cache> NewFIFOCache(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
     std::shared_ptr<MemoryAllocator> memory_allocator) {
@@ -641,22 +622,22 @@ std::shared_ptr<Cache> NewLRUCache(
   if (num_shard_bits < 0) {
     num_shard_bits = GetDefaultCacheShardBits(capacity);
   }
-  return std::make_shared<LRUCache>(
+  return std::make_shared<FIFOCache>(
       capacity, num_shard_bits, strict_capacity_limit, high_pri_pool_ratio,
-      LRUCacheShard::MonitorOptions{}, std::move(memory_allocator));
+      FIFOCacheShard::MonitorOptions{}, std::move(memory_allocator));
 }
 
 #ifdef WITH_DIAGNOSE_CACHE
-std::shared_ptr<Cache> NewDiagnosableLRUCache(
-    const LRUCacheOptions& cache_opts) {
+std::shared_ptr<Cache> NewDiagnosableFIFOCache(
+    const FIFOCacheOptions& cache_opts) {
   assert(cache_opts.is_diagnose);
-  return NewDiagnosableLRUCache(cache_opts.capacity, cache_opts.num_shard_bits,
+  return NewDiagnosableFIFOCache(cache_opts.capacity, cache_opts.num_shard_bits,
                                 cache_opts.strict_capacity_limit,
                                 cache_opts.high_pri_pool_ratio,
                                 cache_opts.memory_allocator, cache_opts.topk);
 }
 
-std::shared_ptr<Cache> NewDiagnosableLRUCache(
+std::shared_ptr<Cache> NewDiagnosableFIFOCache(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
     std::shared_ptr<MemoryAllocator> memory_allocator, size_t topk) {
@@ -670,33 +651,33 @@ std::shared_ptr<Cache> NewDiagnosableLRUCache(
   if (num_shard_bits < 0) {
     num_shard_bits = GetDefaultCacheShardBits(capacity);
   }
-  return std::make_shared<DiagnosableLRUCache>(
+  return std::make_shared<DiagnosableFIFOCache>(
       capacity, num_shard_bits, strict_capacity_limit, high_pri_pool_ratio,
-      LRUCacheDiagnosableShard::MonitorOptions{topk},
+      FIFOCacheDiagnosableShard::MonitorOptions{topk},
       std::move(memory_allocator));
 }
 
-template class LRUCacheShardTemplate<LRUCacheDiagnosableMonitor>;
-template class LRUCacheBase<LRUCacheDiagnosableShard>;
+template class FIFOCacheShardTemplate<FIFOCacheDiagnosableMonitor>;
+template class FIFOCacheBase<FIFOCacheDiagnosableShard>;
 #else
-std::shared_ptr<Cache> NewDiagnosableLRUCache(
-    const LRUCacheOptions& cache_opts) {
-  return NewLRUCache(cache_opts.capacity, cache_opts.num_shard_bits,
+std::shared_ptr<Cache> NewDiagnosableFIFOCache(
+    const FIFOCacheOptions& cache_opts) {
+  return NewFIFOCache(cache_opts.capacity, cache_opts.num_shard_bits,
                      cache_opts.strict_capacity_limit,
                      cache_opts.high_pri_pool_ratio,
                      cache_opts.memory_allocator);
 }
 
-std::shared_ptr<Cache> NewDiagnosableLRUCache(
+std::shared_ptr<Cache> NewDiagnosableFIFOCache(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
     std::shared_ptr<MemoryAllocator> memory_allocator, size_t /* topk */) {
-  return NewLRUCache(capacity, num_shard_bits, strict_capacity_limit,
+  return NewFIFOCache(capacity, num_shard_bits, strict_capacity_limit,
                      high_pri_pool_ratio, memory_allocator);
 }
 #endif
 
-template class LRUCacheShardTemplate<LRUCacheNoMonitor>;
-template class LRUCacheBase<LRUCacheShard>;
+template class FIFOCacheShardTemplate<FIFOCacheNoMonitor>;
+template class FIFOCacheBase<FIFOCacheShard>;
 
 }  // namespace TERARKDB_NAMESPACE

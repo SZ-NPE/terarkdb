@@ -29,7 +29,7 @@ class CacheShard {
                         size_t charge,
                         void (*deleter)(const Slice& key, void* value),
                         Cache::Handle** handle, Cache::Priority priority) = 0;
-  virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) = 0;
+  virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true) = 0;
   virtual bool Ref(Cache::Handle* handle) = 0;
   virtual bool Release(Cache::Handle* handle, bool force_erase = false) = 0;
   virtual void Erase(const Slice& key, uint32_t hash) = 0;
@@ -48,6 +48,8 @@ class CacheShard {
 // Keys are sharded by the highest num_shard_bits bits of hash value.
 class ShardedCache : public Cache {
  public:
+  using Cache::Erase;
+
   ShardedCache(size_t capacity, int num_shard_bits, bool strict_capacity_limit,
                std::shared_ptr<MemoryAllocator> memory_allocator = nullptr);
   virtual ~ShardedCache() = default;
@@ -65,7 +67,11 @@ class ShardedCache : public Cache {
   virtual Status Insert(const Slice& key, void* value, size_t charge,
                         void (*deleter)(const Slice& key, void* value),
                         Handle** handle, Priority priority) override;
+  virtual Status Insert(const Slice& key, uint32_t hash, void* value, size_t charge,
+                        void (*deleter)(const Slice& key, void* value),
+                        Handle** handle, Priority priority) override;
   virtual Handle* Lookup(const Slice& key, Statistics* stats) override;
+  virtual Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit, Statistics* stats) override;
   virtual bool Ref(Handle* handle) override;
   virtual bool Release(Handle* handle, bool force_erase = false) override;
   virtual void Erase(const Slice& key) override;
@@ -82,10 +88,11 @@ class ShardedCache : public Cache {
 
   int GetNumShardBits() const { return num_shard_bits_; }
 
- private:
   static inline uint32_t HashSlice(const Slice& s) {
     return Hash(s.data(), s.size(), 0);
   }
+
+ private:
 
   uint32_t Shard(uint32_t hash) {
     // Note, hash >> 32 yields hash in gcc, not the zero we expect!
