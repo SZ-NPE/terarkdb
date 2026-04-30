@@ -1224,7 +1224,7 @@ class MemTableInserter : public WriteBatch::Handler {
         MaybeAdvanceSeq(BATCH_BOUNDRY);
       } else {
         auto cfd = cf_mems_->current();
-        if (cfd && cfd->hotness_tracker()) {
+        if (recovering_log_number_ == 0 && cfd && cfd->hotness_tracker()) {
           cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
         }
       }
@@ -1323,7 +1323,7 @@ class MemTableInserter : public WriteBatch::Handler {
       MaybeAdvanceSeq(BATCH_BOUNDRY);
     } else {
       auto cfd = cf_mems_->current();
-      if (cfd && cfd->hotness_tracker()) {
+      if (recovering_log_number_ == 0 && cfd && cfd->hotness_tracker()) {
         cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
       }
     }
@@ -1549,7 +1549,7 @@ class MemTableInserter : public WriteBatch::Handler {
             MaybeAdvanceSeq(BATCH_BOUNDRY);
           } else {
             auto cfd = cf_mems_->current();
-            if (cfd && cfd->hotness_tracker()) {
+            if (recovering_log_number_ == 0 && cfd && cfd->hotness_tracker()) {
               cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
             }
           }

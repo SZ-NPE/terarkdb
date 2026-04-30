@@ -295,6 +295,8 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       disable_auto_compactions(options.disable_auto_compactions),
       max_subcompactions(options.max_subcompactions),
       blob_size(options.blob_size),
+      hotness_window_capacity(options.hotness_window_capacity),
+      hotness_hot_capacity(options.hotness_hot_capacity),
       blob_large_key_ratio(options.blob_large_key_ratio),
       blob_gc_ratio(options.blob_gc_ratio),
       precise_gc(options.precise_gc),

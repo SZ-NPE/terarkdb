@@ -972,6 +972,12 @@ DEFINE_bool(disable_auto_compactions, false, "Do not auto trigger compactions");
 DEFINE_bool(enable_lazy_compaction, true, "Enable map or link compaction");
 
 DEFINE_uint64(blob_size, size_t(-1), "Key Value Separate blob size");
+DEFINE_bool(enable_hotness_tracker, false,
+            "Enable hotness-based hot/cold blob routing");
+DEFINE_uint64(hotness_window_capacity, 1000000,
+              "FIFO observation window capacity for HotnessTracker");
+DEFINE_uint64(hotness_hot_capacity, 1000000,
+              "Promoted hot-set capacity for HotnessTracker");
 
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
@@ -3572,6 +3578,9 @@ class Benchmark {
     options.disable_auto_compactions = FLAGS_disable_auto_compactions;
     options.enable_lazy_compaction = FLAGS_enable_lazy_compaction;
     options.blob_size = FLAGS_blob_size;
+    options.enable_hotness_tracker = FLAGS_enable_hotness_tracker;
+    options.hotness_window_capacity = FLAGS_hotness_window_capacity;
+    options.hotness_hot_capacity = FLAGS_hotness_hot_capacity;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;

@@ -157,6 +157,8 @@ struct MutableCFOptions {
         disable_auto_compactions(false),
         max_subcompactions(0),
         blob_size(0),
+        hotness_window_capacity(0),
+        hotness_hot_capacity(0),
         blob_large_key_ratio(0),
         blob_gc_ratio(0),
         precise_gc(false),
@@ -219,6 +221,8 @@ struct MutableCFOptions {
   bool disable_auto_compactions;
   uint32_t max_subcompactions;
   size_t blob_size;
+  size_t hotness_window_capacity;
+  size_t hotness_hot_capacity;
   double blob_large_key_ratio;
   double blob_gc_ratio;
   bool precise_gc;

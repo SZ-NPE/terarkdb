@@ -169,6 +169,8 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.disable_auto_compactions =
       mutable_cf_options.disable_auto_compactions;
   cf_opts.blob_size = mutable_cf_options.blob_size;
+  cf_opts.hotness_window_capacity = mutable_cf_options.hotness_window_capacity;
+  cf_opts.hotness_hot_capacity = mutable_cf_options.hotness_hot_capacity;
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
   cf_opts.precise_gc = mutable_cf_options.precise_gc;
@@ -1928,6 +1930,17 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::blob_size), OptionType::kSizeT,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, blob_size)}},
+        {"enable_hotness_tracker",
+         {offset_of(&ColumnFamilyOptions::enable_hotness_tracker),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"hotness_window_capacity",
+         {offset_of(&ColumnFamilyOptions::hotness_window_capacity),
+          OptionType::kSizeT, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_window_capacity)}},
+        {"hotness_hot_capacity",
+         {offset_of(&ColumnFamilyOptions::hotness_hot_capacity),
+          OptionType::kSizeT, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_hot_capacity)}},
         {"blob_large_key_ratio",
          {offset_of(&ColumnFamilyOptions::blob_large_key_ratio),
           OptionType::kDouble, OptionVerificationType::kNormal, true,

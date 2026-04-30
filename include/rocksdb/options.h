@@ -310,6 +310,12 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Enable Hotness Tracker for Hot-Cold Separation
   bool enable_hotness_tracker = false;
 
+  // Capacity of the FIFO observation window used by HotnessTracker.
+  size_t hotness_window_capacity = 1000000;
+
+  // Capacity of the promoted hot set used by HotnessTracker.
+  size_t hotness_hot_capacity = 1000000;
+
   // Don't separate Value if key.size > value.size * blob_large_key_ratio
   // valid [0 , 1]
   double blob_large_key_ratio = 0.25;

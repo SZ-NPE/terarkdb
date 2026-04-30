@@ -447,7 +447,11 @@ ColumnFamilyData::ColumnFamilyData(
       prev_compaction_needed_bytes_(0),
       allow_2pc_(db_options.allow_2pc),
       last_memtable_id_(0),
-      hotness_tracker_(cf_options.enable_hotness_tracker ? std::make_shared<HotnessTracker>(1000000, 1000000) : nullptr) {
+      hotness_tracker_(cf_options.enable_hotness_tracker
+                           ? std::make_shared<HotnessTracker>(
+                                 cf_options.hotness_window_capacity,
+                                 cf_options.hotness_hot_capacity)
+                           : nullptr) {
   Ref();
 
   // if _dummy_versions is nullptr, then this is a dummy column family.
