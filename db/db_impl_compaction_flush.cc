@@ -3047,11 +3047,22 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             garbage_collection_job_stats, job_context->job_id);
 
+    const uint64_t gc_begin_ts = env_->NowMicros();
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[%s] [JOB %d] GarbageCollection begin: ts=%" PRIu64,
+                   c->column_family_data()->GetName().c_str(),
+                   job_context->job_id, gc_begin_ts);
     mutex_.Unlock();
     garbage_collection_job.Run();
     TEST_SYNC_POINT("DBImpl::BackgroundGarbageCollection:NonTrivial:AfterRun");
     mutex_.Lock();
+    const uint64_t gc_run_end_ts = env_->NowMicros();
     status = garbage_collection_job.Install(*c->mutable_cf_options());
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[%s] [JOB %d] GarbageCollection end: status=%s, run_micros=%" PRIu64,
+                   c->column_family_data()->GetName().c_str(),
+                   job_context->job_id, status.ToString().c_str(),
+                   gc_run_end_ts - gc_begin_ts);
     if (status.ok()) {
       InstallSuperVersionAndScheduleWork(
           c->column_family_data(), &job_context->superversion_contexts[0],

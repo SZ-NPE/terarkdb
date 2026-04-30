@@ -2050,13 +2050,17 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
 
   // I/O measurement variables
   PerfLevel prev_perf_level = PerfLevel::kEnableTime;
+  uint64_t prev_read_bytes = 0, prev_write_bytes = 0;
   uint64_t prev_write_nanos = 0;
   uint64_t prev_fsync_nanos = 0;
   uint64_t prev_range_sync_nanos = 0;
   uint64_t prev_prepare_write_nanos = 0;
+  const uint64_t gc_begin_ts = env_->NowMicros();
   if (measure_io_stats_) {
     prev_perf_level = GetPerfLevel();
     SetPerfLevel(PerfLevel::kEnableTime);
+    prev_read_bytes = IOSTATS(bytes_read);
+    prev_write_bytes = IOSTATS(bytes_written);
     prev_write_nanos = IOSTATS(write_nanos);
     prev_fsync_nanos = IOSTATS(fsync_nanos);
     prev_range_sync_nanos = IOSTATS(range_sync_nanos);
@@ -2101,16 +2105,18 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   IterKey iter_key;
   ParsedInternalKey ikey;
   struct {
-    uint64_t input = 0;
-    uint64_t garbage_type = 0;
-    uint64_t get_not_found = 0;
-    uint64_t file_number_mismatch = 0;
+    uint64_t input = 0, garbage_type = 0, get_not_found = 0;
+    uint64_t file_number_mismatch = 0, lookup_micros = 0;
+    uint64_t live = 0, dead = 0, live_runs = 0, dead_runs = 0;
+    uint64_t max_live_run = 0, curr_run = 0;
+    bool has_run = false, run_live = false;
   } counter;
   std::vector<std::pair<uint64_t, FileMetaData*>> blob_meta_cache;
   assert(!sub_compact->compaction->inputs()->empty());
   blob_meta_cache.reserve(sub_compact->compaction->inputs()->front().size());
   while (status.ok() && !cfd->IsDropped() && input->Valid()) {
     ++counter.input;
+    bool is_live = false;
     Slice curr_key = input->key();
     uint64_t curr_file_number = uint64_t(-1);
     if (!ParseInternalKey(curr_key, &ikey)) {
@@ -2148,8 +2154,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       ValueType type = kTypeDeletion;
       SequenceNumber seq = kMaxSequenceNumber;
       LazyBuffer value;
+      const uint64_t lookup_begin_ts = env_->NowMicros();
       input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
                             &seq, &value, *blob_meta);
+      counter.lookup_micros += env_->NowMicros() - lookup_begin_ts;
       if (s.IsNotFound()) {
         ++counter.get_not_found;
         break;
@@ -2187,7 +2195,19 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       sub_compact->current_blob_output()->meta.UpdateBoundaries(curr_key,
                                                                 ikey.sequence);
       sub_compact->num_output_records++;
+      is_live = true;
     } while (false);
+    if (!counter.has_run || counter.run_live != is_live) {
+      if (counter.has_run && counter.run_live) {
+        counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
+      }
+      counter.has_run = true;
+      counter.run_live = is_live;
+      counter.curr_run = 0;
+      is_live ? ++counter.live_runs : ++counter.dead_runs;
+    }
+    ++counter.curr_run;
+    is_live ? ++counter.live : ++counter.dead;
 
     if (counter.input > 1 && comp.Compare(curr_key, last_key) == 0 &&
         (last_file_number & curr_file_number) != uint64_t(-1)) {
@@ -2224,22 +2244,36 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     status = s;
   }
   if (status.ok()) {
+    if (counter.has_run && counter.run_live) {
+      counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
+    }
+    const uint64_t gc_read_bytes =
+        measure_io_stats_ ? IOSTATS(bytes_read) - prev_read_bytes : 0;
+    const uint64_t gc_write_bytes =
+        measure_io_stats_ ? IOSTATS(bytes_written) - prev_write_bytes : 0;
     auto& meta = sub_compact->blob_outputs.front().meta;
     auto& inputs = *sub_compact->compaction->inputs();
     assert(inputs.size() == 1 && inputs.front().level == -1);
     auto& files = inputs.front().files;
     ROCKS_LOG_INFO(
         db_options_.info_log,
-        "[%s] [JOB %d] Table #%" PRIu64 " GC: %" PRIu64
-        " inputs from %zd files. %" PRIu64
-        " clear, %.2f%% estimation: [ %" PRIu64 " garbage type, %" PRIu64
-        " get not found, %" PRIu64
-        " file number mismatch ], inheritance tree: %zd -> %zd",
+        "[%s] [JOB %d] Table #%" PRIu64 " GC summary: in=%" PRIu64
+        ", files=%zd, clear=%" PRIu64 ", est=%.2f%%, dead=[type=%" PRIu64
+        ", not_found=%" PRIu64 ", mismatch=%" PRIu64 "]"
+        ", layout=[live=%" PRIu64 ", dead=%" PRIu64
+        ", live_runs=%" PRIu64 ", dead_runs=%" PRIu64
+        ", max_live_run=%" PRIu64 "]"
+        ", lookup_micros=%" PRIu64 ", run_micros=%" PRIu64
+        ", read_bytes=%" PRIu64 ", write_bytes=%" PRIu64
+        ", inheritance=%zd->%zd",
         cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
         files.size(), counter.input - meta.prop.num_entries,
         sub_compact->compaction->num_antiquation() * 100. / counter.input,
         counter.garbage_type, counter.get_not_found,
-        counter.file_number_mismatch,
+        counter.file_number_mismatch, counter.live, counter.dead,
+        counter.live_runs, counter.dead_runs, counter.max_live_run,
+        counter.lookup_micros, env_->NowMicros() - gc_begin_ts,
+        gc_read_bytes, gc_write_bytes,
         meta.prop.inheritance.size() + inheritance_tree_pruge_count,
         meta.prop.inheritance.size());
     if ((std::find_if(files.begin(), files.end(),
