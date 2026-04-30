@@ -1539,6 +1539,7 @@ void VersionStorageInfo::UpdateAccumulatedStats(FileMetaData* file_meta) {
     blob_num_entries_ += file_meta->prop.num_entries;
     blob_num_deletions_ += file_meta->prop.num_deletions;
     blob_num_antiquation_ += file_meta->num_antiquation;
+    blob_num_antiquation_bytes_ += file_meta->num_antiquation_bytes;
   }
 }
 
@@ -1847,20 +1848,34 @@ void VersionStorageInfo::ComputeCompactionScore(
   }
 
   // Calculate total_garbage_ratio_ as criterion for NeedsGarbageCollection().
+  // precise_gc:
+  //   false (entry-based): total_antiquation_entries / total_blob_entries
+  //   true  (byte-based) : total_antiquation_bytes   / total_blob_file_size
+  // Note on byte denominator: `blob_bytes` uses `fd.GetFileSize()`, which
+  // includes block/footer overhead on top of the raw value bytes. The ratio is
+  // therefore a conservative (slightly low) estimate of true garbage density,
+  // which is acceptable for triggering decisions.
   uint64_t num_antiquation = 0;
+  uint64_t num_antiquation_bytes = 0;
   uint64_t num_entries = 0;
+  uint64_t blob_bytes = 0;
   bool marked = false;
   for (auto& f : LevelFiles(-1)) {
     if (!f->is_gc_permitted()) {
       continue;
     }
-    // if a file being_compacted, gc_status must be kGarbageCollectionCandidate
     marked |= f->marked_for_compaction;
     num_antiquation += f->num_antiquation;
+    num_antiquation_bytes += f->num_antiquation_bytes;
     num_entries += f->prop.num_entries;
+    blob_bytes += f->fd.GetFileSize();
   }
   blob_marked_for_compaction_ = marked;
-  total_garbage_ratio_ = num_antiquation / std::max<double>(1, num_entries);
+  total_garbage_ratio_ = mutable_cf_options.precise_gc
+                             ? num_antiquation_bytes /
+                                   std::max<double>(1, blob_bytes)
+                             : num_antiquation /
+                                   std::max<double>(1, num_entries);
 
   is_pick_compaction_fail = false;
   ComputeFilesMarkedForCompaction();

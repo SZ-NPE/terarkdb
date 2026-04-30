@@ -75,10 +75,23 @@ struct GarbageFileInfo {
   FileMetaData* f;
   double score;
   uint64_t estimate_size;
-  GarbageFileInfo(FileMetaData* _f) : f(_f), score(0.0), estimate_size(0) {
+
+  // precise_gc: compute per-file garbage score.
+  //   precise==true  -> byte-based: antiquation_bytes / file_size
+  //   precise==false -> entry-based: num_antiquation / num_entries
+  static double ComputeScore(const FileMetaData* f, bool precise) {
+    if (f == nullptr) return 0.0;
+    if (precise) {
+      return std::min(1.0, f->num_antiquation_bytes /
+                               std::max<double>(1, f->fd.file_size));
+    }
+    return std::min(1.0, f->num_antiquation /
+                             std::max<double>(1, f->prop.num_entries));
+  }
+
+  GarbageFileInfo(FileMetaData* _f, bool precise_gc = false)
+      : f(_f), score(ComputeScore(_f, precise_gc)), estimate_size(0) {
     if (f == nullptr) return;
-    score = std::min(
-        1.0, f->num_antiquation / std::max<double>(1, f->prop.num_entries));
     estimate_size = static_cast<uint64_t>(f->fd.file_size * (1 - score));
   }
 };
@@ -876,7 +889,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
          : score < 0.7 ? 3 : score < 0.9 ? 4 : 5;
   };
   // Find largest score blob
-  GarbageFileInfo dirtiest_blob{nullptr};
+  GarbageFileInfo dirtiest_blob{nullptr, mutable_cf_options.precise_gc};
   for (; idx < hidden_files.size() && !hidden_files[idx]->is_gc_forbidden();
        ++idx) {
     ++scanned_blobs;
@@ -885,7 +898,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
       continue;
     }
     ++permitted_blobs;
-    GarbageFileInfo info{f};
+    GarbageFileInfo info{f, mutable_cf_options.precise_gc};
     ++garbage_ratio_buckets[bucket_idx(info.score)];
     // candidate_cmp is less comparator
     if (dirtiest_blob.f == nullptr || candidate_cmp(dirtiest_blob, info)) {
@@ -949,7 +962,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   }
   auto push_candidate = [&](FileMetaData* f) {
     if (f->is_gc_permitted() && !f->being_compacted) {
-      GarbageFileInfo gc_blob(f);
+      GarbageFileInfo gc_blob(f, mutable_cf_options.precise_gc);
       if (gc_blob.estimate_size <= fragment_size ||
           gc_blob.score >= mutable_cf_options.blob_gc_ratio ||
           gc_blob.f->marked_for_compaction) {

@@ -126,6 +126,7 @@ struct VersionBuilderContextImpl : VersionBuilder::Context {
     int level;
     FileMetaData* f;
     double entry_depended;
+    double bytes_depended;
   };
   struct InheritanceItem {
     size_t depended : 1;
@@ -255,7 +256,8 @@ class VersionBuilder::Rep {
     auto& dependence_map_ = context_->dependence_map;
     uint64_t file_number = f->fd.GetNumber();
     auto ib = dependence_map_.emplace(
-        file_number, DependenceItem{file_number, 0, 0, false, level, f, 0});
+        file_number,
+        DependenceItem{file_number, 0, 0, false, level, f, 0, 0});
     f->Ref();
     if (ib.second) {
       PutInheritance(&ib.first->second, ib.first.pos());
@@ -288,8 +290,23 @@ class VersionBuilder::Rep {
     return nullptr;
   }
 
+  // precise_gc: resolve the per-dependence byte cost charged to `item`.
+  // Prefer the byte_count persisted in SST/Manifest; otherwise fall back to an
+  // averaged estimate based on (entry_count, source file size, num_entries).
+  // Keeping this in one place avoids drift between the recursive paths below.
+  static double ResolveDepBytes(const Dependence& dep,
+                                const DependenceItem* item) {
+    if (dep.byte_count > 0) {
+      return static_cast<double>(dep.byte_count);
+    }
+    uint64_t num_entries = std::max<uint64_t>(1, item->f->prop.num_entries);
+    return static_cast<double>(dep.entry_count) *
+           static_cast<double>(item->f->fd.GetFileSize()) /
+           static_cast<double>(num_entries);
+  }
+
   void SetDependence(FileMetaData* f, bool is_map, bool is_estimation,
-                     double ratio, bool finish) {
+                     double entry_ratio, double bytes_ratio, bool finish) {
     auto& dependence_map = context_->dependence_map;
     auto& inheritance_counter = context_->inheritance_counter;
     auto dependence_version = context_->dependence_version;
@@ -307,17 +324,25 @@ class VersionBuilder::Rep {
         find->second.depended = true;
         item->is_estimation |= is_estimation;
         assert(is_map || dependence.entry_count > 0);
-        item->entry_depended += dependence.entry_count * ratio;
+        item->entry_depended += dependence.entry_count * entry_ratio;
+        double dep_bytes = ResolveDepBytes(dependence, item);
+        item->bytes_depended += dep_bytes * bytes_ratio;
       }
       item->dependence_version = dependence_version;
       if (is_map) {
         item->gc_forbidden_version = dependence_version;
         if (!item->f->prop.dependence.empty()) {
+          uint64_t num_entries =
+              std::max<uint64_t>(1, item->f->prop.num_entries);
+          uint64_t file_size =
+              std::max<uint64_t>(1, item->f->fd.GetFileSize());
+          double child_entry_ratio =
+              entry_ratio * dependence.entry_count / num_entries;
+          double dep_bytes = ResolveDepBytes(dependence, item);
+          double child_bytes_ratio = bytes_ratio * dep_bytes / file_size;
           SetDependence(item->f, item->f->prop.is_map_sst(),
                         is_estimation || item->f->prop.is_map_sst(),
-                        ratio * dependence.entry_count /
-                            std::max<uint64_t>(1, item->f->prop.num_entries),
-                        finish);
+                        child_entry_ratio, child_bytes_ratio, finish);
         }
       }
     }
@@ -342,7 +367,7 @@ class VersionBuilder::Rep {
         item.gc_forbidden_version = dependence_version;
         if (!item.f->prop.dependence.empty()) {
           SetDependence(item.f, item.f->prop.is_map_sst(),
-                        item.f->prop.is_map_sst(), 1, finish);
+                        item.f->prop.is_map_sst(), 1, 1, finish);
         }
       }
     }
@@ -379,6 +404,12 @@ class VersionBuilder::Rep {
           uint64_t entry_depended = std::max<uint64_t>(1, item.entry_depended);
           entry_depended = std::min(item.f->prop.num_entries, entry_depended);
           uint64_t num_antiquation = item.f->prop.num_entries - entry_depended;
+          uint64_t bytes_depended =
+              std::max<uint64_t>(1, item.bytes_depended);
+          bytes_depended =
+              std::min(item.f->fd.GetFileSize(), bytes_depended);
+          uint64_t num_antiquation_bytes =
+              item.f->fd.GetFileSize() - bytes_depended;
           switch (item.f->gc_status) {
             case FileMetaData::kGarbageCollectionForbidden:
               if (item.gc_forbidden_version == dependence_version) {
@@ -412,6 +443,7 @@ class VersionBuilder::Rep {
               break;
           }
           item.f->num_antiquation = num_antiquation;
+          item.f->num_antiquation_bytes = num_antiquation_bytes;
         }
         ++it;
       } else {
@@ -615,6 +647,7 @@ class VersionBuilder::Rep {
       for (auto& pair : context_->dependence_map) {
         pair.second.is_estimation = false;
         pair.second.entry_depended = 0;
+        pair.second.bytes_depended = 0;
       }
       for (auto& pair : context_->inheritance_counter) {
         pair.second.depended = 0;

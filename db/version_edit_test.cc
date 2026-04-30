@@ -20,8 +20,20 @@ TablePropertyCache GetPropCache(
     uint8_t purpose, std::initializer_list<uint64_t> dependence = {},
     std::initializer_list<uint64_t> inheritance = {}) {
   std::vector<Dependence> dep;
-  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1});
+  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, 0});
   return TablePropertyCache{0, 0, 1, 1, 0, purpose, 0, 0, dep, inheritance};
+}
+
+// precise_gc: build a TablePropertyCache with explicit per-dependence
+// (entry_count, byte_count) pairs so tests can cover the new field.
+TablePropertyCache GetPropCacheWithBytes(
+    uint8_t purpose,
+    std::initializer_list<std::tuple<uint64_t, uint64_t, uint64_t>> dep_list) {
+  std::vector<Dependence> dep;
+  for (auto& t : dep_list) {
+    dep.emplace_back(Dependence{std::get<0>(t), std::get<1>(t), std::get<2>(t)});
+  }
+  return TablePropertyCache{0, 0, 1, 1, 0, purpose, 0, 0, dep, {}};
 }
 }  // namespace
 
@@ -216,6 +228,68 @@ TEST_F(VersionEditTest, AtomicGroupTest) {
   VersionEdit edit;
   edit.MarkAtomicGroup(1);
   TestEncodeDecode(edit);
+}
+
+// precise_gc: verify per-dependence byte_count roundtrips through manifest
+// encode/decode and is preserved per-file.
+TEST_F(VersionEditTest, DependenceByteCountRoundTrip) {
+  static const uint64_t kBig = 1ull << 50;
+  VersionEdit edit;
+  edit.AddFile(
+      3, 300, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
+      InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500, kBig + 600,
+      false,
+      GetPropCacheWithBytes(
+          1, {std::make_tuple(10U, 5U, 4096U),
+              std::make_tuple(11U, 3U, 2048U)}));
+  // A second file referencing the same blob (10U) with different byte_count
+  // ensures per-file independence after decode.
+  edit.AddFile(
+      3, 301, 0, 100, InternalKey("bar", kBig + 501, kTypeValue),
+      InternalKey("baz", kBig + 601, kTypeDeletion), kBig + 501, kBig + 601,
+      false,
+      GetPropCacheWithBytes(1, {std::make_tuple(10U, 1U, 1024U)}));
+
+  std::string encoded;
+  edit.EncodeTo(&encoded);
+  VersionEdit parsed;
+  ASSERT_OK(parsed.DecodeFrom(encoded));
+
+  auto& new_files = parsed.GetNewFiles();
+  ASSERT_EQ(2U, new_files.size());
+  auto& dep0 = new_files[0].second.prop.dependence;
+  ASSERT_EQ(2U, dep0.size());
+  ASSERT_EQ(10U, dep0[0].file_number);
+  ASSERT_EQ(5U, dep0[0].entry_count);
+  ASSERT_EQ(4096U, dep0[0].byte_count);
+  ASSERT_EQ(11U, dep0[1].file_number);
+  ASSERT_EQ(3U, dep0[1].entry_count);
+  ASSERT_EQ(2048U, dep0[1].byte_count);
+
+  auto& dep1 = new_files[1].second.prop.dependence;
+  ASSERT_EQ(1U, dep1.size());
+  ASSERT_EQ(10U, dep1[0].file_number);
+  ASSERT_EQ(1U, dep1[0].entry_count);
+  ASSERT_EQ(1024U, dep1[0].byte_count);
+}
+
+// precise_gc: verify that a pre-byte_count manifest (byte_count==0) decodes
+// cleanly without errors; VersionBuilder will fall back to averaged estimate
+// for such files.
+TEST_F(VersionEditTest, DependenceByteCountDefaultsToZero) {
+  static const uint64_t kBig = 1ull << 50;
+  VersionEdit edit;
+  edit.AddFile(3, 300, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
+               InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500,
+               kBig + 600, false, GetPropCache(1, {7U, 8U}, {}));
+  std::string encoded;
+  edit.EncodeTo(&encoded);
+  VersionEdit parsed;
+  ASSERT_OK(parsed.DecodeFrom(encoded));
+  auto& dep = parsed.GetNewFiles()[0].second.prop.dependence;
+  ASSERT_EQ(2U, dep.size());
+  ASSERT_EQ(0U, dep[0].byte_count);
+  ASSERT_EQ(0U, dep[1].byte_count);
 }
 
 }  // namespace TERARKDB_NAMESPACE

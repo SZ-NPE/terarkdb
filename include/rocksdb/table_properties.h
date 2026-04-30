@@ -67,6 +67,7 @@ struct TablePropertiesNames {
   static const std::string kReadAmp;
   static const std::string kDependence;
   static const std::string kDependenceEntryCount;
+  static const std::string kDependenceByteCount;
   static const std::string kInheritanceChain;
   static const std::string kInheritanceTree;
   static const std::string kEarliestTimeBeginCompact;

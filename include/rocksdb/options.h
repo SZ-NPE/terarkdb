@@ -316,6 +316,9 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // valid [0 , 0.5]
   double blob_gc_ratio = 0.05;
 
+  // Use byte-precise garbage ratio when metadata is available.
+  bool precise_gc = false;
+
   // Blob file size
   // Default : same as bottommost level sst file size
   uint64_t target_blob_file_size = 0;

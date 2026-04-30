@@ -200,6 +200,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  blob_large_key_ratio);
   ROCKS_LOG_INFO(log, "                            blob_gc_ratio: %f",
                  blob_gc_ratio);
+  ROCKS_LOG_INFO(log, "                               precise_gc: %d",
+                 precise_gc);
   ROCKS_LOG_INFO(log, "                    target_blob_file_size: %" PRIu64,
                  target_blob_file_size);
   ROCKS_LOG_INFO(log, "                blob_file_defragment_size: %" PRIu64,
@@ -295,6 +297,7 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       blob_size(options.blob_size),
       blob_large_key_ratio(options.blob_large_key_ratio),
       blob_gc_ratio(options.blob_gc_ratio),
+      precise_gc(options.precise_gc),
       target_blob_file_size(options.target_blob_file_size),
       blob_file_defragment_size(options.blob_file_defragment_size),
       max_dependence_blob_overlap(options.max_dependence_blob_overlap),

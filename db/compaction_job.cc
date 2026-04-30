@@ -1620,6 +1620,12 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       MaxBlobSize(*mutable_cf_options, cfd->ioptions()->num_levels,
                   cfd->ioptions()->compaction_style);
 
+  // precise_gc: accumulate the raw value bytes actually written into each
+  // newly-created blob file during this compaction. Entries that merely carry
+  // an index to an existing blob (i.e. value is already in kTypeValueIndex
+  // form when it enters the compaction iterator) are NOT recorded here; their
+  // byte cost is already reflected in the source blob's existing metadata.
+  std::unordered_map<uint64_t, uint64_t> new_blob_bytes_per_fn;
   auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
     Status s;
     TableBuilder* blob_builder = sub_compact->blob_builder.get();
@@ -1634,11 +1640,21 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       blob_builder = sub_compact->blob_builder.get();
       blob_meta = &sub_compact->current_blob_output()->meta;
     }
+    uint64_t raw_value_bytes = 0;
+    if (s.ok()) {
+      // Fetch before Add so we can observe the real value length without
+      // paying an extra I/O; Add() itself fetches internally.
+      s = value.fetch();
+      if (s.ok()) {
+        raw_value_bytes = value.slice().size();
+      }
+    }
     if (s.ok()) {
       s = blob_builder->Add(key, value);
     }
     if (s.ok()) {
       blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
+      new_blob_bytes_per_fn[blob_meta->fd.GetNumber()] += raw_value_bytes;
       s = SeparateHelper::TransToSeparate(
           key, value, blob_meta->fd.GetNumber(), Slice(),
           GetInternalKeyType(key) == kTypeMerge, false,
@@ -1919,7 +1935,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       CompactionIterationStats range_del_out_stats;
       status = FinishCompactionOutputFile(input_status, sub_compact,
                                           &range_del_agg, &range_del_out_stats,
-                                          dependence, next_key);
+                                          dependence, new_blob_bytes_per_fn,
+                                          next_key);
       dependence.clear();
       RecordDroppedKeys(range_del_out_stats,
                         &sub_compact->compaction_job_stats);
@@ -1988,7 +2005,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (sub_compact->builder != nullptr) {
     CompactionIterationStats range_del_out_stats;
     Status s = FinishCompactionOutputFile(status, sub_compact, &range_del_agg,
-                                          &range_del_out_stats, dependence);
+                                          &range_del_out_stats, dependence,
+                                          new_blob_bytes_per_fn);
     dependence.clear();
     if (status.ok()) {
       status = s;
@@ -2355,6 +2373,7 @@ Status CompactionJob::FinishCompactionOutputFile(
     CompactionRangeDelAggregator* range_del_agg,
     CompactionIterationStats* range_del_out_stats,
     const std::unordered_map<uint64_t, uint64_t>& dependence,
+    const std::unordered_map<uint64_t, uint64_t>& new_blob_bytes_per_fn,
     const Slice* next_table_min_key /* = nullptr */) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_SYNC_FILE);
@@ -2471,7 +2490,19 @@ Status CompactionJob::FinishCompactionOutputFile(
                                       : 0;
     meta->prop.num_entries = sub_compact->builder->NumEntries();
     for (auto& pair : dependence) {
-      meta->prop.dependence.emplace_back(Dependence{pair.first, pair.second});
+      // precise_gc: byte_count is populated for blob files that were created
+      // during this very compaction (we observed raw value sizes while writing
+      // them out in `trans_to_separate`). For blob files being merely
+      // re-referenced via value-index carrying entries, byte_count stays 0,
+      // and VersionBuilder's fallback will estimate it by averaging over the
+      // source blob file.
+      uint64_t byte_count = 0;
+      auto bit = new_blob_bytes_per_fn.find(pair.first);
+      if (bit != new_blob_bytes_per_fn.end()) {
+        byte_count = bit->second;
+      }
+      meta->prop.dependence.emplace_back(
+          Dependence{pair.first, pair.second, byte_count});
     }
     std::sort(meta->prop.dependence.begin(), meta->prop.dependence.end(),
               TERARK_CMP(file_number, <));

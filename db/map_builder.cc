@@ -1684,7 +1684,10 @@ Status MapBuilder::WriteOutputFile(
   auto& dependence = file_meta->prop.dependence;
   dependence.reserve(dependence_build.size());
   for (auto& pair : dependence_build) {
-    dependence.emplace_back(Dependence{pair.first, pair.second});
+    // precise_gc: MapSST only records dependence relations and never creates
+    // new blob files, so byte_count stays 0 (VersionBuilder falls back to an
+    // averaged estimate from the source blob).
+    dependence.emplace_back(Dependence{pair.first, pair.second, 0});
   }
   std::sort(dependence.begin(), dependence.end(), TERARK_CMP(file_number, <));
 
