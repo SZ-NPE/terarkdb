@@ -37,6 +37,7 @@
 #include "util/filename.h"
 #include "util/stop_watch.h"
 #include "util/sync_point.h"
+#include "util/blob_chunk_bitmap.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -168,11 +169,15 @@ Status BuildTable(
     struct BuilderSeparateHelper : public SeparateHelper {
       std::vector<FileMetaData>* output = nullptr;
       std::vector<TableProperties>* prop = nullptr;
-      BlobOutput blobs[2]; // 0 for cold, 1 for hot
+      BlobOutput blobs[3];  // warm, ephemeral, stable
       std::unique_ptr<ValueExtractor> value_meta_extractor;
       Status (*trans_to_separate_callback)(void* args, const Slice& key,
                                            LazyBuffer& value) = nullptr;
       void* trans_to_separate_callback_args = nullptr;
+      // per-SST chunk-reference collector. Disabled-by-default
+      // constructor so that when the CF option is off this is a zero-cost
+      // no-op on the flush hot path.
+      FlushChunkBitmapCollector chunk_bitmap_collector{false, 0};
 
       Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                              const Slice& meta, bool is_merge,
@@ -203,6 +208,23 @@ Status BuildTable(
       separate_helper.value_meta_extractor =
           ioptions.value_meta_extractor_factory->CreateValueExtractor(context);
     }
+    // initialize chunk-reference collector from CF options.
+    // Safe even when the feature is off: collector becomes a no-op.
+    separate_helper.chunk_bitmap_collector =
+        FlushChunkBitmapCollector(mutable_cf_options.enable_blob_validity_bitmap,
+                                  mutable_cf_options.blob_gc_chunk_size);
+
+    auto flush_route_hint = [](HotnessTracker::FlushRoute route) {
+      switch (route) {
+        case HotnessTracker::FlushRoute::kWarm:
+          return Env::WLTH_MEDIUM;
+        case HotnessTracker::FlushRoute::kEphemeral:
+          return Env::WLTH_SHORT;
+        case HotnessTracker::FlushRoute::kStable:
+          return Env::WLTH_EXTREME;
+      }
+      return Env::WLTH_MEDIUM;
+    };
 
     auto finish_output_blob_sst = [&](int hot_idx) {
       Status status;
@@ -246,11 +268,12 @@ Status BuildTable(
       ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(column_family_id);
       auto hotness_tracker = cfd ? cfd->hotness_tracker() : nullptr;
       Slice user_key = ExtractUserKey(key);
-      bool is_hot = false;
+      auto route = HotnessTracker::FlushRoute::kWarm;
       if (hotness_tracker) {
-        is_hot = hotness_tracker->IsHot(user_key, HotnessTracker::Hash(user_key));
+        route = hotness_tracker->ClassifyForFlush(
+            user_key, HotnessTracker::Hash(user_key));
       }
-      int hot_idx = is_hot ? 1 : 0;
+      int hot_idx = static_cast<int>(route);
       auto& bstate = separate_helper.blobs[hot_idx];
 
       TableBuilder* blob_builder = bstate.builder.get();
@@ -293,7 +316,7 @@ Status BuildTable(
           return status;
         }
         blob_file->SetIOPriority(io_priority);
-        blob_file->SetWriteLifeTimeHint(hot_idx == 1 ? Env::WLTH_SHORT : Env::WLTH_EXTREME);
+        blob_file->SetWriteLifeTimeHint(flush_route_hint(route));
 
         bstate.file_writer.reset(
             new WritableFileWriter(std::move(blob_file), bstate.fname, env_options,
@@ -306,10 +329,20 @@ Status BuildTable(
             true));
         blob_builder = bstate.builder.get();
       }
+      // Observe the chunk this value will live in *before* Add,
+      // because the builder's FileSize reflects the end of the previous
+      // value at this point, which is a well-defined lower bound of the
+      // new value's offset. This matches the invariant used on the GC
+      // side (chunk_id_of(offset) = offset / chunk_size) and keeps the
+      // observation order deterministic w.r.t. the iterator.
+      const uint64_t observed_offset =
+          blob_builder != nullptr ? blob_builder->FileSize() : 0;
       if (status.ok()) {
         status = blob_builder->Add(key, value);
       }
       if (status.ok()) {
+        separate_helper.chunk_bitmap_collector.Observe(
+            blob_meta->fd.GetNumber(), observed_offset);
         blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
         status = SeparateHelper::TransToSeparate(
             key, value, blob_meta->fd.GetNumber(), Slice(),
@@ -321,9 +354,9 @@ Status BuildTable(
 
     separate_helper.output = meta_vec;
     separate_helper.prop = table_properties_vec;
-    separate_helper.output->reserve(separate_helper.output->size() + 2);
+    separate_helper.output->reserve(separate_helper.output->size() + 3);
     if (separate_helper.prop != nullptr) {
-      separate_helper.prop->reserve(separate_helper.prop->size() + 2);
+      separate_helper.prop->reserve(separate_helper.prop->size() + 3);
     }
     BlobConfig blob_config = mutable_cf_options.get_blob_config();
     if (ioptions.table_factory->IsBuilderNeedSecondPass()) {
@@ -417,7 +450,7 @@ Status BuildTable(
     if (s.ok()) {
       s = c_iter.status();
     }
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
       if (separate_helper.blobs[i].builder) {
         if (!s.ok() || empty) {
           separate_helper.blobs[i].builder->Abandon();
@@ -440,6 +473,13 @@ Status BuildTable(
         sst_meta()->prop.dependence.emplace_back(Dependence{
             blob.fd.GetNumber(), blob.prop.num_entries, blob.fd.GetFileSize()});
       }
+      // freeze the per-dependence chunk reference bitmaps.
+      // When the CF option is off the collector is a no-op and this
+      // call clears the target vector to empty, which is the explicit
+      // "bitmap unavailable" sentinel expected by later phases.
+      separate_helper.chunk_bitmap_collector.Materialize(
+          sst_meta()->prop.dependence,
+          &sst_meta()->prop.dependence_chunk_bitmaps);
       auto shrinked_snapshots = sst_meta()->ShrinkSnapshot(snapshots);
       s = builder->Finish(&sst_meta()->prop, &shrinked_snapshots);
 

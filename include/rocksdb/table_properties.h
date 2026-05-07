@@ -68,6 +68,12 @@ struct TablePropertiesNames {
   static const std::string kDependence;
   static const std::string kDependenceEntryCount;
   static const std::string kDependenceByteCount;
+  // When present, the value is a length-prefixed concatenation of N
+  // serialized BlobChunkBitmap blobs, strictly aligned by index to the
+  // dependence vector. When absent (old SSTs produced before Phase 5),
+  // readers treat the whole SST as "bitmap unavailable" and fall back
+  // to the legacy GC lookup path.
+  static const std::string kDependenceChunkBitmaps;
   static const std::string kInheritanceChain;
   static const std::string kInheritanceTree;
   static const std::string kEarliestTimeBeginCompact;
@@ -254,6 +260,17 @@ struct TablePropertiesBase {
 
   // Make these sst hidden
   std::vector<Dependence> dependence;
+
+  // When non-empty, size() must equal dependence.size() and
+  // element i corresponds to dependence[i]. Each element is the raw
+  // byte payload produced by BlobChunkBitmap::Serialize(); an empty
+  // string means "the SST references this blob but no per-chunk
+  // bitmap is available" (e.g. legacy value-index entries encountered
+  // during compaction). An overall empty vector means "bitmap
+  // unavailable for this SST", which forces legacy GC fallback on
+  // the reader side. The field is copy-friendly (POD strings) so it
+  // can live in a public header without pulling internal headers.
+  std::vector<std::string> dependence_chunk_bitmaps;
 
   // Inheritance tree
   std::vector<uint64_t> inheritance_tree;

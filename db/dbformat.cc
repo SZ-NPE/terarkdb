@@ -227,6 +227,125 @@ Status SeparateHelper::TransToSeparate(
   }
 }
 
+// Out-of-class definitions for the static constexpr members declared in
+// dbformat.h. Required under C++14 for ODR-use (e.g. passing them by
+// reference to ASSERT_EQ in tests). Harmless under C++17+ where they
+// are implicitly inline.
+constexpr uint64_t SeparateHelper::kNoChunkId;
+constexpr uint8_t SeparateHelper::kChunkIdTrailerMagic;
+
+void SeparateHelper::EncodeChunkIdTrailer(std::string* dst, uint64_t chunk_id) {
+  assert(dst != nullptr);
+  assert(dst->size() >= sizeof(uint64_t));
+  PutVarint64(dst, chunk_id);
+  dst->push_back(static_cast<char>(kChunkIdTrailerMagic));
+}
+
+// Attempt to locate a chunk-id trailer at the tail of slice. On
+// success, returns true and writes the decoded chunk_id to *chunk_id
+// and the varint-encoding length (in bytes, excluding the magic) to
+// *varint_len. On failure (no trailer / malformed / would eat into
+// the file_number head), returns false and leaves outputs unspecified.
+static bool ParseChunkIdTrailer(const Slice& slice, uint64_t* chunk_id,
+                                size_t* varint_len) {
+  // Minimum payload: 8B file_number + 1B varint + 1B magic.
+  if (slice.size() < sizeof(uint64_t) + 2) {
+    return false;
+  }
+  const uint8_t last =
+      static_cast<uint8_t>(slice.data()[slice.size() - 1]);
+  if (last != SeparateHelper::kChunkIdTrailerMagic) {
+    return false;
+  }
+
+  // Scan backwards from the byte just before magic to find the start
+  // of the varint64. A varint64 terminator is a byte whose top bit is
+  // 0, and any "continuation" byte has top bit 1. The start of the
+  // varint is the byte immediately after the previous terminator
+  // (or the first non-head byte, whichever is earlier).
+  //
+  // Upper bound on varint64 length is 10 bytes.
+  const char* data = slice.data();
+  const size_t n = slice.size();
+  const size_t head = sizeof(uint64_t);  // inclusive lower bound
+  const size_t max_varint_bytes = 10;
+  // last - 1 is the final varint byte; its top bit must be 0.
+  if (n < head + 2) {
+    return false;
+  }
+  const size_t last_varint_idx = n - 2;
+  if ((static_cast<uint8_t>(data[last_varint_idx]) & 0x80) != 0) {
+    // Last varint byte must be a terminator (top bit 0).
+    return false;
+  }
+
+  // Scan backwards to find either (a) another terminator (meaning the
+  // varint starts just after it), or (b) hit the file_number boundary.
+  size_t start = last_varint_idx;
+  while (start > head) {
+    size_t prev = start - 1;
+    if ((static_cast<uint8_t>(data[prev]) & 0x80) == 0) {
+      // data[prev] is a terminator of something *before* our varint.
+      break;
+    }
+    // data[prev] is a continuation byte of our varint.
+    --start;
+    if (last_varint_idx - start + 1 > max_varint_bytes) {
+      // Would exceed max varint64 length.
+      return false;
+    }
+  }
+  // Do not eat into the file_number head.
+  if (start < head) {
+    return false;
+  }
+
+  const size_t varint_bytes = last_varint_idx - start + 1;
+  uint64_t decoded = 0;
+  const char* ptr = GetVarint64Ptr(data + start, data + last_varint_idx + 1,
+                                   &decoded);
+  if (ptr == nullptr || ptr != data + last_varint_idx + 1) {
+    return false;
+  }
+
+  // Reject sentinel as a chunk id to keep kNoChunkId unambiguous.
+  if (decoded == SeparateHelper::kNoChunkId) {
+    return false;
+  }
+
+  *chunk_id = decoded;
+  *varint_len = varint_bytes;
+  return true;
+}
+
+bool SeparateHelper::HasChunkId(const Slice& slice) {
+  uint64_t unused_chunk_id = 0;
+  size_t unused_len = 0;
+  return ParseChunkIdTrailer(slice, &unused_chunk_id, &unused_len);
+}
+
+uint64_t SeparateHelper::DecodeChunkId(const Slice& slice) {
+  uint64_t chunk_id = 0;
+  size_t unused_len = 0;
+  if (!ParseChunkIdTrailer(slice, &chunk_id, &unused_len)) {
+    return kNoChunkId;
+  }
+  return chunk_id;
+}
+
+Slice SeparateHelper::DecodeValueMetaStripChunk(const Slice& slice) {
+  assert(slice.size() >= sizeof(uint64_t));
+  uint64_t unused_chunk_id = 0;
+  size_t varint_len = 0;
+  if (ParseChunkIdTrailer(slice, &unused_chunk_id, &varint_len)) {
+    const size_t trailer_bytes = varint_len + 1;  // varint + magic
+    return Slice(slice.data() + sizeof(uint64_t),
+                 slice.size() - sizeof(uint64_t) - trailer_bytes);
+  }
+  return Slice(slice.data() + sizeof(uint64_t),
+               slice.size() - sizeof(uint64_t));
+}
+
 Slice ArenaPinSlice(const Slice& slice, Arena* arena) {
   char* buf = static_cast<char*>(arena->Allocate(slice.size() + 1));
   memcpy(buf, slice.data(), slice.size());

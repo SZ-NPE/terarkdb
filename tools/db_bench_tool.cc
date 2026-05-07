@@ -986,6 +986,12 @@ DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
 DEFINE_bool(precise_gc, false,
             "Enable byte-precise garbage ratio calculation for blob GC");
 
+DEFINE_bool(enable_blob_validity_bitmap, false,
+            "Enable chunk-level validity bitmap for blob GC fast path");
+
+DEFINE_uint64(blob_gc_chunk_size, 64 * 1024,
+              "Chunk size in bytes for blob validity bitmap");
+
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
 DEFINE_uint64(blob_file_defragment_size, 0, "Blob file defragment threshold");
@@ -3584,6 +3590,8 @@ class Benchmark {
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;
+    options.enable_blob_validity_bitmap = FLAGS_enable_blob_validity_bitmap;
+    options.blob_gc_chunk_size = FLAGS_blob_gc_chunk_size;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;

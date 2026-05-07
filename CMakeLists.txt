@@ -736,6 +736,7 @@ set(SOURCES
         util/trace_replay.cc
         util/transaction_test_util.cc
         util/xxhash.cc
+        util/blob_chunk_bitmap.cc
         utilities/backupable/backupable_db.cc
         utilities/checkpoint/checkpoint_impl.cc
         utilities/col_buf_decoder.cc
@@ -1024,6 +1025,7 @@ if(WITH_TESTS)
         db/db_wal_test.cc
         db/db_write_test.cc
         db/dbformat_test.cc
+        db/blob_validity_bitmap_test.cc
         db/deletefile_test.cc
         db/error_handler_test.cc
         db/obsolete_files_test.cc
@@ -1086,6 +1088,7 @@ if(WITH_TESTS)
         util/arena_test.cc
         util/auto_roll_logger_test.cc
         util/autovector_test.cc
+        util/blob_chunk_bitmap_test.cc
         util/bloom_test.cc
         util/coding_test.cc
         util/crc32c_test.cc

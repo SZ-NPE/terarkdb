@@ -144,6 +144,11 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_WHOLE_FILE_DELETE, "rocksdb.num.gc.whole_file_delete"},
     {GC_WHOLE_FILE_DELETE_BYTES, "rocksdb.bytes.gc.whole_file_delete"},
     {GC_REWRITE_BLOB_BYTES, "rocksdb.bytes.gc.rewrite_blob"},
+    {GC_BITMAP_FAST_PATH_COUNT, "rocksdb.num.gc.bitmap_fast_path"},
+    {GC_BITMAP_FALLBACK_COUNT, "rocksdb.num.gc.bitmap_fallback"},
+    {GC_SKIPPED_DEAD_CHUNK_BYTES, "rocksdb.bytes.gc.skipped_dead_chunk"},
+    {GC_READ_LIVE_CHUNK_BYTES, "rocksdb.bytes.gc.read_live_chunk"},
+    {GC_LOOKUP_AVOIDED_COUNT, "rocksdb.num.gc.lookup_avoided"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

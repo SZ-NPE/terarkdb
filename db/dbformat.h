@@ -788,6 +788,40 @@ class SeparateHelper {
  public:
   virtual ~SeparateHelper() = default;
 
+  // ---------------------------------------------------------------
+  // Value-index encoding
+  //
+  // Legacy layout (backward compatible):
+  //   [ file_number(8B, LE) ] [ meta(M bytes, optional) ]
+  //
+  // chunk-aware layout (opt-in, append-only trailer):
+  //   [ file_number(8B, LE) ] [ meta(M bytes, optional) ]
+  //   [ chunk_id(varint64) ]  [ kChunkIdTrailerMagic(1B) ]
+  //
+  // Contract:
+  //  - EncodeFileNumber / DecodeFileNumber / DecodeValueMeta behave
+  //    identically for both layouts (they operate on the head only).
+  //  - HasChunkId / DecodeChunkId are the only readers that must know
+  //    about the new layout. Any slice that does not match the new
+  //    layout is transparently treated as legacy.
+  //  - Writers only emit the trailer when the feature switch is on;
+  //    readers that are unaware of the trailer will see a safe legacy
+  //    view through DecodeValueMeta, because the trailer bytes are
+  //    appended after the original meta and the old callers never
+  //    inspect the tail (they parse meta by a user-owned length).
+  // ---------------------------------------------------------------
+
+  // Sentinel value for DecodeChunkId on slices that do not carry a
+  // chunk-id trailer. Callers in the GC path treat this as
+  // "bitmap unavailable" and fall back to the legacy scan/lookup path.
+  static constexpr uint64_t kNoChunkId = static_cast<uint64_t>(-1);
+
+  // Magic byte appended at the very tail of a chunk-aware value index.
+  // Chosen as an UTF-8 invalid leading byte to minimize accidental
+  // collision with extractor-produced meta tails. Format correctness
+  // is still finally arbitrated at the SST-property / manifest layer.
+  static constexpr uint8_t kChunkIdTrailerMagic = 0xC1;
+
   static Slice EncodeFileNumber(uint64_t& file_number) {
     if (!port::kLittleEndian) {
       file_number = EndianTransform(file_number, sizeof file_number);
@@ -808,6 +842,34 @@ class SeparateHelper {
     return Slice(slice.data() + sizeof(uint64_t),
                  slice.size() - sizeof(uint64_t));
   }
+
+  // Append a chunk-id trailer to an already-encoded value-index slice.
+  // Caller provides the current encoded head in *dst (which must start
+  // with file_number and optional meta). On return, *dst is extended
+  // with [ varint64(chunk_id) || kChunkIdTrailerMagic ].
+  static void EncodeChunkIdTrailer(std::string* dst, uint64_t chunk_id);
+
+  // Returns true iff slice carries a well-formed chunk-id trailer.
+  // A well-formed trailer means:
+  //   - slice.size() >= sizeof(uint64_t) + 2 (at least file_number +
+  //     one varint byte + magic)
+  //   - the last byte equals kChunkIdTrailerMagic
+  //   - the bytes preceding the magic decode as a valid varint64 whose
+  //     encoding length plus the magic byte lies strictly inside the
+  //     meta region (i.e. does not eat into the file_number head).
+  // Does NOT mutate slice.
+  static bool HasChunkId(const Slice& slice);
+
+  // Returns the decoded chunk_id, or kNoChunkId if slice does not
+  // carry a chunk-id trailer. A kNoChunkId return value means the
+  // caller must treat this index as "bitmap unavailable" and fall
+  // back to the legacy GC path.
+  static uint64_t DecodeChunkId(const Slice& slice);
+
+  // Helper for readers that want meta without the trailer. Returns the
+  // meta region with trailer bytes removed when present; otherwise
+  // returns DecodeValueMeta(slice) unchanged.
+  static Slice DecodeValueMetaStripChunk(const Slice& slice);
 
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                 uint64_t file_number, const Slice& meta,

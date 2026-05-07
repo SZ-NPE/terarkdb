@@ -729,6 +729,18 @@ Status TerarkZipTableBuilder::Finish(
     properties_.purpose = prop->purpose;
     properties_.read_amp = prop->read_amp;
     properties_.dependence = prop->dependence;
+    // Phase 5: mirror the chunk bitmap vector into serializable form.
+    if (!prop->dependence_chunk_bitmaps.empty() &&
+        prop->dependence_chunk_bitmaps.size() == prop->dependence.size()) {
+      properties_.dependence_chunk_bitmaps.clear();
+      properties_.dependence_chunk_bitmaps.reserve(
+          prop->dependence_chunk_bitmaps.size());
+      for (const auto& bm : prop->dependence_chunk_bitmaps) {
+        std::string s;
+        bm.Serialize(&s);
+        properties_.dependence_chunk_bitmaps.emplace_back(std::move(s));
+      }
+    }
   }
   if (snapshots != nullptr) {
     properties_.snapshots = *snapshots;

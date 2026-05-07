@@ -328,6 +328,21 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Use byte-precise garbage ratio when metadata is available.
   bool precise_gc = false;
 
+  // Enable chunk-level validity bitmap materialization for Blob GC.
+  // When true, flush/compaction output SSTs maintain a per-dependence
+  // chunk bitmap so that Blob GC can use a bitmap fast path and skip
+  // dead chunks without per-key lookup. When false, the system fully
+  // degrades to the legacy GetKey()-based GC path.
+  // Default: false
+  bool enable_blob_validity_bitmap = false;
+
+  // Chunk size (in bytes) used to granularize blob file content for
+  // chunk-level validity tracking. Only meaningful when
+  // enable_blob_validity_bitmap is true.
+  // valid : power-of-two in [4KB, 4MB] recommended
+  // Default : 64KB
+  uint64_t blob_gc_chunk_size = 64 * 1024;
+
   // Blob file size
   // Default : same as bottommost level sst file size
   uint64_t target_blob_file_size = 0;

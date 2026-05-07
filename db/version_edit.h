@@ -20,6 +20,7 @@
 #include "rocksdb/terark_namespace.h"
 #include "util/arena.h"
 #include "util/autovector.h"
+#include "util/blob_chunk_bitmap.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -96,6 +97,21 @@ struct TablePropertyCache {
   float read_amp = 1;                  // expt read amp from sst
   std::vector<Dependence> dependence;  // make these sst hidden
   std::vector<uint64_t> inheritance;   // inheritance set
+  // Invariants when non-empty:
+  //   dependence_chunk_bitmaps.size() == dependence.size()
+  //   dependence_chunk_bitmaps[i] corresponds to dependence[i]
+  // Left empty when:
+  //   - CF option enable_blob_validity_bitmap is off, OR
+  //   - blob_gc_chunk_size is 0, OR
+  //   - the producer (flush/compaction) had no separated values to
+  //     record (e.g. legacy SSTs and map SSTs).
+  // An empty vector is the explicit "bitmap unavailable" signal; GC
+  // must fall back to the legacy lookup path on such SSTs.
+  // Phase 5 persists this vector both in the SST property block and in
+  // the manifest (appended to the kPropertyCache field). When an older
+  // manifest is opened, this vector decodes as empty and the GC falls
+  // back to the legacy lookup path automatically.
+  std::vector<BlobChunkBitmap> dependence_chunk_bitmaps;
   uint64_t earliest_time_begin_compact = port::kMaxUint64;
   uint64_t latest_time_end_compact = port::kMaxUint64;
 

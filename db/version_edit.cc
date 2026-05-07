@@ -233,6 +233,31 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
                           f.prop.raw_value_size);
       PutVarint64(&encode_property_cache, f.prop.earliest_time_begin_compact);
       PutVarint64(&encode_property_cache, f.prop.latest_time_end_compact);
+      // persist per-dependence chunk bitmaps in manifest so
+      // that DB reopen can restore the live-chunk view without
+      // rereading every SST. The payload is append-only and self
+      // delimiting, so older manifests that predate this field remain
+      // decodable (the decoder simply sees `field.empty()` at this
+      // point and leaves `dependence_chunk_bitmaps` empty, which is
+      // the "bitmap unavailable" sentinel for GC fallback).
+      // Only emit when the producer actually has a well-formed,
+      // aligned bitmap vector. Writing an empty 0-count payload here
+      // would be indistinguishable from absence, so we just skip the
+      // whole block in that case.
+      if (!f.prop.dependence_chunk_bitmaps.empty() &&
+          f.prop.dependence_chunk_bitmaps.size() ==
+              f.prop.dependence.size()) {
+        PutVarint64(
+            &encode_property_cache,
+            static_cast<uint64_t>(f.prop.dependence_chunk_bitmaps.size()));
+        for (const auto& bm : f.prop.dependence_chunk_bitmaps) {
+          std::string serialized;
+          bm.Serialize(&serialized);
+          PutVarint64(&encode_property_cache,
+                      static_cast<uint64_t>(serialized.size()));
+          encode_property_cache.append(serialized);
+        }
+      }
       PutLengthPrefixedSlice(dst, encode_property_cache);
     }
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
@@ -420,6 +445,32 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &f.prop.earliest_time_begin_compact) ||
                   !GetVarint64(&field, &f.prop.latest_time_end_compact)) {
                 return error_msg;
+              }
+            }
+            if (!field.empty()) {
+              // append-only chunk-bitmap payload. Older
+              // manifests will have `field.empty()` here and we leave
+              // `dependence_chunk_bitmaps` empty, which signals
+              // "bitmap unavailable" to the GC fallback.
+              uint64_t n_bitmaps = 0;
+              if (!GetVarint64(&field, &n_bitmaps)) {
+                return error_msg;
+              }
+              f.prop.dependence_chunk_bitmaps.clear();
+              f.prop.dependence_chunk_bitmaps.resize(n_bitmaps);
+              for (uint64_t i = 0; i < n_bitmaps; ++i) {
+                uint64_t blen = 0;
+                if (!GetVarint64(&field, &blen) || field.size() < blen) {
+                  return error_msg;
+                }
+                if (blen > 0) {
+                  Slice bm_slice(field.data(), blen);
+                  if (!f.prop.dependence_chunk_bitmaps[i].Deserialize(
+                          &bm_slice)) {
+                    return error_msg;
+                  }
+                }
+                field.remove_prefix(blen);
               }
             }
             if (f.prop.num_entries > 0 || f.prop.raw_key_size > 0 ||

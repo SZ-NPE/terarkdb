@@ -4935,6 +4935,144 @@ void VersionStorageInfo::CalculateBlobInfo() {
   invalid_file_cnt_ = invalid_file_set.size();
 }
 
+// Algorithm:
+//   1. Reset the previous map (idempotent).
+//   2. Pre-seed an entry for every blob file present in dependence_map_,
+//      so that an SST that references a blob without ever populating
+//      a per-row chunk bitmap (e.g. legacy index entries decoded as
+//      empty bitmaps) still ends up tagged as `bitmap_available =
+//      false` rather than missing.
+//   3. Walk every level (0..num_levels-1) plus level -1, and for each
+//      SST `f` whose `prop.dependence_chunk_bitmaps.size()` matches
+//      `prop.dependence.size()`, fold each per-row bitmap into the
+//      corresponding blob's `live_chunk_bitmap` via OrWith. An empty
+//      per-row bitmap is the explicit "bitmap unavailable" sentinel
+//      defined by the Phase 4/5 contract; encountering it sticky-clears
+//      `bitmap_available` for that blob.
+//   4. For SSTs whose per-dependence bitmap vector is missing entirely
+//      (size mismatch), the SST is treated as legacy: every blob it
+//      references is sticky-marked unavailable.
+//   5. Once all SSTs have been visited, derive
+//      live_chunk_count / dead_chunk_count / live_chunk_bytes /
+//      dead_chunk_bytes / dead_chunk_ratio for blobs whose bitmap is
+//      still available. The denominator for "total chunks" is the
+//      tracked bitmap width when the blob file size is unknown; when
+//      a blob file size is available we recompute total chunks from
+//      ceil(file_size / chunk_size) so that dead chunks past the last
+//      SST-observed chunk are still accounted for.
+//
+// `chunk_size == 0` means the CF option `blob_gc_chunk_size` is
+// effectively disabled; we then sticky-mark every blob unavailable
+// without performing any aggregation work.
+void VersionStorageInfo::AggregateBlobLiveChunkBitmaps(uint64_t chunk_size) {
+  blob_live_chunk_info_.clear();
+
+  // Step 2: pre-seed an entry for every known dependence so that
+  // reverse-lookups never miss a blob present in the LSM but never
+  // referenced by a chunk-aware SST.
+  for (auto& kv : dependence_map_) {
+    blob_live_chunk_info_[kv.first];  // default-constructed
+  }
+
+  // Disabled regime: chunk_size == 0 means the feature is off. Mark
+  // every blob unavailable so callers cleanly fall back to legacy GC.
+  if (chunk_size == 0) {
+    for (auto& kv : blob_live_chunk_info_) {
+      kv.second.bitmap_available = false;
+    }
+    return;
+  }
+
+  auto fold_one_sst = [&](FileMetaData* f) {
+    if (f == nullptr) return;
+    const auto& deps = f->prop.dependence;
+    if (deps.empty()) return;
+    const auto& bms = f->prop.dependence_chunk_bitmaps;
+    const bool has_bitmaps = (bms.size() == deps.size());
+    for (size_t i = 0; i < deps.size(); ++i) {
+      const uint64_t fn = deps[i].file_number;
+      auto& info = blob_live_chunk_info_[fn];  // default-create on demand
+      if (!info.bitmap_available) {
+        // Already sticky-cleared: nothing to merge anymore.
+        continue;
+      }
+      if (!has_bitmaps) {
+        // SST has no per-row bitmap vector at all: legacy regime.
+        info.bitmap_available = false;
+        info.live_chunk_bitmap.Clear();
+        continue;
+      }
+      const BlobChunkBitmap& bm = bms[i];
+      if (bm.empty()) {
+        // Explicit "bitmap unavailable" sentinel for this dependence.
+        info.bitmap_available = false;
+        info.live_chunk_bitmap.Clear();
+        continue;
+      }
+      info.live_chunk_bitmap.OrWith(bm);
+    }
+  };
+
+  // Step 3: walk every level, including level -1 (dependence-only files)
+  // which the version exposes as a "hidden" level via files_[-1].
+  for (int level = -1; level < num_levels_; ++level) {
+    for (auto* f : files_[level]) {
+      fold_one_sst(f);
+    }
+  }
+
+  // Step 5: derive statistics for blobs whose bitmap is still available.
+  for (auto& kv : blob_live_chunk_info_) {
+    auto& info = kv.second;
+    if (!info.bitmap_available) {
+      info.live_chunk_count = 0;
+      info.dead_chunk_count = 0;
+      info.live_chunk_bytes = 0;
+      info.dead_chunk_bytes = 0;
+      info.dead_chunk_ratio = 0.0;
+      continue;
+    }
+
+    const uint64_t live_bits = info.live_chunk_bitmap.CountSetBits();
+    uint64_t total_chunks = info.live_chunk_bitmap.num_bits();
+
+    // Prefer the blob file's actual size to compute total chunks so
+    // that dead chunks past the last SST-observed reference (e.g. a
+    // tail of garbage bytes) are accounted for.
+    auto blob_it = dependence_map_.find(kv.first);
+    if (blob_it != dependence_map_.end() && blob_it->second != nullptr) {
+      const uint64_t fsize = blob_it->second->fd.GetFileSize();
+      if (fsize > 0) {
+        const uint64_t derived_total = (fsize + chunk_size - 1) / chunk_size;
+        if (derived_total > total_chunks) {
+          total_chunks = derived_total;
+        }
+        info.live_chunk_bytes =
+            std::min<uint64_t>(live_bits * chunk_size, fsize);
+        info.dead_chunk_bytes = fsize - info.live_chunk_bytes;
+      } else {
+        info.live_chunk_bytes = live_bits * chunk_size;
+        info.dead_chunk_bytes =
+            (total_chunks > live_bits)
+                ? (total_chunks - live_bits) * chunk_size
+                : 0;
+      }
+    } else {
+      info.live_chunk_bytes = live_bits * chunk_size;
+      info.dead_chunk_bytes =
+          (total_chunks > live_bits) ? (total_chunks - live_bits) * chunk_size
+                                     : 0;
+    }
+
+    info.live_chunk_count = live_bits;
+    info.dead_chunk_count =
+        (total_chunks > live_bits) ? (total_chunks - live_bits) : 0;
+    const uint64_t denom = info.live_chunk_bytes + info.dead_chunk_bytes;
+    info.dead_chunk_ratio =
+        denom == 0 ? 0.0 : static_cast<double>(info.dead_chunk_bytes) / denom;
+  }
+}
+
 void VersionStorageInfo::LogLSMState(EventLoggerStream& stream) {
   stream << "lsm_state";
   stream.StartArray();

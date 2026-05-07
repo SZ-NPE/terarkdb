@@ -129,6 +129,33 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
     }
     Add(TablePropertiesNames::kDependenceByteCount, val);
   }
+  // Phase 5: persist per-dependence chunk bitmaps when they are
+  // available and correctly aligned with `dependence`. The payload is
+  // self-delimiting so that readers that have never heard of this
+  // property can safely ignore it (it will land in
+  // user_collected_properties). Only emit when the producer actually
+  // has bitmaps, otherwise older readers and the "bitmap unavailable"
+  // regime would see an unexpected empty key.
+  if (!props.dependence.empty() &&
+      props.dependence_chunk_bitmaps.size() == props.dependence.size()) {
+    bool any_non_empty = false;
+    for (const auto& b : props.dependence_chunk_bitmaps) {
+      if (!b.empty()) {
+        any_non_empty = true;
+        break;
+      }
+    }
+    if (any_non_empty) {
+      std::string payload;
+      PutVarint64(&payload,
+                  static_cast<uint64_t>(props.dependence_chunk_bitmaps.size()));
+      for (const auto& b : props.dependence_chunk_bitmaps) {
+        PutVarint64(&payload, static_cast<uint64_t>(b.size()));
+        payload.append(b);
+      }
+      Add(TablePropertiesNames::kDependenceChunkBitmaps, payload);
+    }
+  }
   if (!props.inheritance_tree.empty()) {
     Add(TablePropertiesNames::kInheritanceTree, props.inheritance_tree);
   }
@@ -431,6 +458,33 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       for (size_t i = 0; i < val.size(); ++i) {
         new_table_properties->dependence[i].byte_count = val[i];
       }
+    } else if (key == TablePropertiesNames::kDependenceChunkBitmaps) {
+      // Phase 5: decode per-dependence chunk bitmaps. Legacy SSTs
+      // that predate Phase 5 will not carry this key, in which case
+      // `dependence_chunk_bitmaps` stays empty (the explicit
+      // "bitmap unavailable" sentinel consumed by the GC fallback).
+      uint64_t n_bitmaps = 0;
+      if (!GetVarint64(&raw_val, &n_bitmaps)) {
+        log_error();
+        continue;
+      }
+      std::vector<std::string> parsed;
+      parsed.reserve(n_bitmaps);
+      bool ok = true;
+      for (uint64_t i = 0; i < n_bitmaps; ++i) {
+        uint64_t blen = 0;
+        if (!GetVarint64(&raw_val, &blen) || raw_val.size() < blen) {
+          ok = false;
+          break;
+        }
+        parsed.emplace_back(raw_val.data(), blen);
+        raw_val.remove_prefix(blen);
+      }
+      if (!ok) {
+        log_error();
+        continue;
+      }
+      new_table_properties->dependence_chunk_bitmaps = std::move(parsed);
     } else if (key == TablePropertiesNames::kInheritanceChain) {
       std::vector<uint64_t> val;
       GetUint64Vector(key, &raw_val, val);

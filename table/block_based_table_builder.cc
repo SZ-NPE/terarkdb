@@ -890,6 +890,22 @@ Status BlockBasedTableBuilder::Finish(
     r->props.max_read_amp = prop->max_read_amp;
     r->props.read_amp = prop->read_amp;
     r->props.dependence = prop->dependence;
+    // Phase 5: carry chunk bitmaps from TablePropertyCache (internal
+    // runtime form) into TableProperties (serializable form) so that
+    // the property block can persist them. Preserve the
+    // "bitmap unavailable" regime by leaving the vector empty when
+    // the producer did not populate it.
+    if (!prop->dependence_chunk_bitmaps.empty() &&
+        prop->dependence_chunk_bitmaps.size() == prop->dependence.size()) {
+      r->props.dependence_chunk_bitmaps.clear();
+      r->props.dependence_chunk_bitmaps.reserve(
+          prop->dependence_chunk_bitmaps.size());
+      for (const auto& bm : prop->dependence_chunk_bitmaps) {
+        std::string s;
+        bm.Serialize(&s);
+        r->props.dependence_chunk_bitmaps.emplace_back(std::move(s));
+      }
+    }
   }
   if (snapshots != nullptr) {
     r->props.snapshots = *snapshots;

@@ -265,6 +265,29 @@ enum Tickers : uint32_t {
   GC_WHOLE_FILE_DELETE_BYTES,
   GC_REWRITE_BLOB_BYTES,
 
+  // GC_BITMAP_FAST_PATH_COUNT    - # records skipped by the aggregated
+  //                                live-chunk bitmap (entirely-dead blob
+  //                                short-circuit), never issued a GetKey().
+  // GC_BITMAP_FALLBACK_COUNT     - # blobs GC processed under legacy /
+  //                                bitmap-unavailable regime (one tick
+  //                                per distinct blob handled, matching
+  //                                `counter.bitmap_fallback_blobs`).
+  // GC_SKIPPED_DEAD_CHUNK_BYTES  - bytes of record payload (value_size)
+  //                                skipped thanks to the fast-path gate.
+  // GC_READ_LIVE_CHUNK_BYTES     - bytes of record payload GC actually
+  //                                walked (the classic per-record path,
+  //                                regardless of live/dead verdict).
+  // GC_LOOKUP_AVOIDED_COUNT      - # point-lookups (`GetKey()`) that were
+  //                                skipped by the bitmap fast path. Today
+  //                                equals GC_BITMAP_FAST_PATH_COUNT, but
+  //                                kept as a distinct ticker so future
+  //                                per-chunk fast paths can contribute.
+  GC_BITMAP_FAST_PATH_COUNT,
+  GC_BITMAP_FALLBACK_COUNT,
+  GC_SKIPPED_DEAD_CHUNK_BYTES,
+  GC_READ_LIVE_CHUNK_BYTES,
+  GC_LOOKUP_AVOIDED_COUNT,
+
   TICKER_ENUM_MAX
 };
 
