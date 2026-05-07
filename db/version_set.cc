@@ -1526,6 +1526,88 @@ void Version::PrepareApply(const MutableCFOptions& mutable_cf_options) {
   storage_info_.GenerateLevelFilesBrief();
   storage_info_.GenerateLevel0NonOverlapping();
   storage_info_.GenerateBottommostFiles();
+
+  // Phase 6 wiring: fold every SST's per-dependence chunk bitmap into
+  // a per-blob live-chunk view on the freshly-built VersionStorageInfo.
+  //
+  // This is the single automatic trigger for
+  // AggregateBlobLiveChunkBitmaps(). Every path that installs a new
+  // Version (LogAndApply via VersionSet::AppendVersion, and recovery
+  // via VersionSet::Recover) funnels through PrepareApply(), so
+  // attaching the call here guarantees that:
+  //   - any Version reachable as `cfd->current()` in the running DB,
+  //   - and any Version reconstructed from the MANIFEST after restart,
+  // carries an up-to-date `blob_live_chunk_info_` map before it is
+  // ever observed by the GC fast path in ProcessGarbageCollection().
+  //
+  // The aggregation is gated by the CF-level switch
+  // `enable_blob_validity_bitmap` AND a non-zero
+  // `blob_gc_chunk_size`. When either is off we intentionally skip the
+  // aggregation: consumers on GC side already treat an empty
+  // `blob_live_chunk_info_` as "bitmap unavailable" (GC falls back to
+  // the legacy GetKey()-based path). We still tick a dedicated counter
+  // so ops can distinguish "feature off" from "feature on but never
+  // fired".
+  Statistics* stats = cfd_->ioptions()->statistics;
+  const bool feature_on = mutable_cf_options.enable_blob_validity_bitmap &&
+                          mutable_cf_options.blob_gc_chunk_size > 0;
+  if (!feature_on) {
+    if (stats != nullptr) {
+      RecordTick(stats, BLOB_CHUNK_AGGREGATE_SKIPPED_DISABLED);
+    }
+    // Explicitly drop any stale view that might have been inherited
+    // from a prior Version under a different option regime. The view
+    // is stored on the current VersionStorageInfo only, but clearing
+    // keeps the "feature off -> no view" invariant crisp.
+    storage_info_.ClearBlobLiveChunkInfo();
+    return;
+  }
+
+  storage_info_.AggregateBlobLiveChunkBitmaps(
+      mutable_cf_options.blob_gc_chunk_size);
+
+  if (stats != nullptr) {
+    RecordTick(stats, BLOB_CHUNK_AGGREGATE_RUNS);
+    const auto& map = storage_info_.blob_live_chunk_info();
+    RecordTick(stats, BLOB_CHUNK_AGGREGATE_BLOBS, map.size());
+    uint64_t unavailable = 0;
+    for (const auto& kv : map) {
+      if (!kv.second.bitmap_available) {
+        ++unavailable;
+      }
+    }
+    RecordTick(stats, BLOB_CHUNK_AGGREGATE_UNAVAILABLE_BLOBS, unavailable);
+  }
+
+  if (info_log_ != nullptr) {
+    const auto& map = storage_info_.blob_live_chunk_info();
+    uint64_t available_blobs = 0;
+    uint64_t unavailable_blobs = 0;
+    uint64_t entirely_dead_blobs = 0;
+    uint64_t live_chunk_bytes_sum = 0;
+    uint64_t dead_chunk_bytes_sum = 0;
+    for (const auto& kv : map) {
+      if (kv.second.bitmap_available) {
+        ++available_blobs;
+        if (kv.second.live_chunk_count == 0) {
+          ++entirely_dead_blobs;
+        }
+        live_chunk_bytes_sum += kv.second.live_chunk_bytes;
+        dead_chunk_bytes_sum += kv.second.dead_chunk_bytes;
+      } else {
+        ++unavailable_blobs;
+      }
+    }
+    ROCKS_LOG_INFO(
+        info_log_,
+        "[%s] Phase6 aggregate live-chunk view: chunk_size=%" PRIu64
+        ", blobs=%zu (available=%" PRIu64 ", unavailable=%" PRIu64
+        ", entirely_dead=%" PRIu64 "), live_bytes=%" PRIu64
+        ", dead_bytes=%" PRIu64,
+        cfd_->GetName().c_str(), mutable_cf_options.blob_gc_chunk_size,
+        map.size(), available_blobs, unavailable_blobs, entirely_dead_blobs,
+        live_chunk_bytes_sum, dead_chunk_bytes_sum);
+  }
 }
 
 void VersionStorageInfo::UpdateAccumulatedStats(FileMetaData* file_meta) {

@@ -2259,6 +2259,12 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t bitmap_aware_blobs = 0;
     uint64_t bitmap_fallback_blobs = 0;
     uint64_t bitmap_entirely_dead_blobs = 0;
+    // Phase 6 wiring observability: how many of the fallback blobs
+    // were fallback because Phase 6 aggregation *never ran* for this
+    // Version (live_info == nullptr), versus because Phase 6 ran but
+    // sticky-cleared the blob. This answers the common ops question
+    // "is my chunk-aware GC actually on?" without any log parsing.
+    uint64_t bitmap_unaggregated_blobs = 0;
     // Phase 8: byte-level accounting for observability.
     //   bitmap_skipped_bytes : cumulative record size (key+value
     //                          reference) that was short-circuited
@@ -2326,9 +2332,18 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         }
       } else if (live_info != nullptr) {
         // bitmap was sticky-cleared -> legacy fallback for this blob.
+        // Phase 6 did run, but mixed-regime data forced it to mark
+        // this blob as unavailable. Count under the existing
+        // "sticky-cleared" ticker, not the new "unaggregated" one.
         ++counter.bitmap_fallback_blobs;
       } else {
+        // Phase 6 was never wired for this Version, so there is no
+        // live-view for this blob at all. This case is tracked under
+        // a dedicated ticker (`GC_BITMAP_UNAGGREGATED_FALLBACK`) so
+        // operators can distinguish "feature off / install path
+        // broken" from "feature on but degraded by legacy data".
         ++counter.bitmap_fallback_blobs;
+        ++counter.bitmap_unaggregated_blobs;
       }
       blob_meta_cache.emplace_back(
           BlobGcCacheEntry{blob_file_number, blob_meta, blob_entirely_dead});
@@ -2477,7 +2492,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         ", lookup_micros=%" PRIu64 ", run_micros=%" PRIu64
         ", read_bytes=%" PRIu64 ", write_bytes=%" PRIu64
         ", bitmap=[aware=%" PRIu64 ", fallback=%" PRIu64
-        ", entirely_dead=%" PRIu64 ", fast_path_skips=%" PRIu64
+        ", unaggregated=%" PRIu64 ", entirely_dead=%" PRIu64
+        ", fast_path_skips=%" PRIu64
         ", skipped_bytes=%" PRIu64 ", live_bytes=%" PRIu64 "]"
         ", inheritance=%zd->%zd",
         cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
@@ -2489,6 +2505,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         counter.lookup_micros, env_->NowMicros() - gc_begin_ts,
         gc_read_bytes, gc_write_bytes,
         counter.bitmap_aware_blobs, counter.bitmap_fallback_blobs,
+        counter.bitmap_unaggregated_blobs,
         counter.bitmap_entirely_dead_blobs, counter.bitmap_fast_path_skips,
         counter.bitmap_skipped_bytes, counter.bitmap_live_bytes,
         meta.prop.inheritance.size() + inheritance_tree_pruge_count,
@@ -2500,6 +2517,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
                counter.bitmap_fast_path_skips);
     RecordTick(db_options_.statistics.get(), GC_BITMAP_FALLBACK_COUNT,
                counter.bitmap_fallback_blobs);
+    RecordTick(db_options_.statistics.get(), GC_BITMAP_UNAGGREGATED_FALLBACK,
+               counter.bitmap_unaggregated_blobs);
     RecordTick(db_options_.statistics.get(), GC_SKIPPED_DEAD_CHUNK_BYTES,
                counter.bitmap_skipped_bytes);
     RecordTick(db_options_.statistics.get(), GC_READ_LIVE_CHUNK_BYTES,

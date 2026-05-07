@@ -149,6 +149,14 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_SKIPPED_DEAD_CHUNK_BYTES, "rocksdb.bytes.gc.skipped_dead_chunk"},
     {GC_READ_LIVE_CHUNK_BYTES, "rocksdb.bytes.gc.read_live_chunk"},
     {GC_LOOKUP_AVOIDED_COUNT, "rocksdb.num.gc.lookup_avoided"},
+    {BLOB_CHUNK_AGGREGATE_RUNS, "rocksdb.num.blob_chunk.aggregate_runs"},
+    {BLOB_CHUNK_AGGREGATE_BLOBS, "rocksdb.num.blob_chunk.aggregate_blobs"},
+    {BLOB_CHUNK_AGGREGATE_UNAVAILABLE_BLOBS,
+     "rocksdb.num.blob_chunk.aggregate_unavailable_blobs"},
+    {BLOB_CHUNK_AGGREGATE_SKIPPED_DISABLED,
+     "rocksdb.num.blob_chunk.aggregate_skipped_disabled"},
+    {GC_BITMAP_UNAGGREGATED_FALLBACK,
+     "rocksdb.num.gc.bitmap_unaggregated_fallback"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

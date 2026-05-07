@@ -288,6 +288,35 @@ enum Tickers : uint32_t {
   GC_READ_LIVE_CHUNK_BYTES,
   GC_LOOKUP_AVOIDED_COUNT,
 
+  // Phase 6 observability: per-Version live-chunk aggregation.
+  // BLOB_CHUNK_AGGREGATE_RUNS       - # times Version::PrepareApply()
+  //                                   actually invoked
+  //                                   AggregateBlobLiveChunkBitmaps().
+  // BLOB_CHUNK_AGGREGATE_BLOBS      - cumulative # of blobs whose live
+  //                                   view was produced (aware or not).
+  // BLOB_CHUNK_AGGREGATE_UNAVAILABLE_BLOBS
+  //                                 - cumulative # of blobs whose
+  //                                   `bitmap_available` was sticky-
+  //                                   cleared during aggregation (mixed
+  //                                   legacy SST / empty bitmap).
+  // BLOB_CHUNK_AGGREGATE_SKIPPED_DISABLED
+  //                                 - # PrepareApply() calls that
+  //                                   skipped aggregation because the
+  //                                   CF option is off
+  //                                   (enable_blob_validity_bitmap=false
+  //                                   or blob_gc_chunk_size==0).
+  // GC_BITMAP_UNAGGREGATED_FALLBACK - # distinct blobs GC had to
+  //                                   fall back on because the current
+  //                                   Version never produced a live
+  //                                   view (nullptr lookup). Useful to
+  //                                   distinguish "Phase 6 not wired"
+  //                                   from "sticky-cleared by legacy".
+  BLOB_CHUNK_AGGREGATE_RUNS,
+  BLOB_CHUNK_AGGREGATE_BLOBS,
+  BLOB_CHUNK_AGGREGATE_UNAVAILABLE_BLOBS,
+  BLOB_CHUNK_AGGREGATE_SKIPPED_DISABLED,
+  GC_BITMAP_UNAGGREGATED_FALLBACK,
+
   TICKER_ENUM_MAX
 };
 

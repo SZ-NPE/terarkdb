@@ -381,6 +381,14 @@ class VersionStorageInfo {
   // option change).
   void AggregateBlobLiveChunkBitmaps(uint64_t chunk_size);
 
+  // Phase 6 wiring helper: discard any previously-aggregated
+  // blob_live_chunk_info_ without running the aggregation pass.
+  // Used by Version::PrepareApply() when the CF feature toggle
+  // (enable_blob_validity_bitmap/blob_gc_chunk_size) is off, so that
+  // GC consumers consistently observe "bitmap unavailable" instead of
+  // a stale view produced under a previous option regime.
+  void ClearBlobLiveChunkInfo() { blob_live_chunk_info_.clear(); }
+
   const BlobLiveChunkMap& blob_live_chunk_info() const {
     return blob_live_chunk_info_;
   }
