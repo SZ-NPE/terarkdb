@@ -227,6 +227,72 @@ Status SeparateHelper::TransToSeparate(
   }
 }
 
+Status SeparateHelper::TransToSeparate(
+    const Slice& internal_key, LazyBuffer& value, uint64_t file_number,
+    const Slice& meta, bool is_merge, bool is_index,
+    const ValueExtractor* value_meta_extractor, uint64_t chunk_id) {
+  // Fast path: caller has no chunk_id to stamp. Delegate to the
+  // legacy overload so behavior is bit-for-bit identical to pre-
+  // chunk-aware code. This is the path exercised whenever the CF
+  // option `enable_blob_validity_bitmap` is off.
+  if (chunk_id == kNoChunkId) {
+    return TransToSeparate(internal_key, value, file_number, meta, is_merge,
+                           is_index, value_meta_extractor);
+  }
+
+  assert(file_number != uint64_t(-1));
+  // Build the encoded value-index into a temporary buffer so that we
+  // can append the chunk-id trailer before handing the final bytes
+  // back to LazyBuffer::reset(). The buffer layout is:
+  //   [ file_number(8B, LE) ]
+  //   [ meta(M bytes, optional) ]
+  //   [ varint64(chunk_id) ]
+  //   [ kChunkIdTrailerMagic(1B) ]
+  //
+  // `is_merge` callers never carry meta (see the legacy overload),
+  // so we mirror the exact meta-presence policy used there.
+  std::string buf;
+  buf.reserve(sizeof(uint64_t) + meta.size() + 11);
+
+  // file_number head.
+  uint64_t fn = file_number;
+  Slice file_number_slice = EncodeFileNumber(fn);
+  buf.append(file_number_slice.data(), file_number_slice.size());
+
+  if (value_meta_extractor == nullptr || is_merge) {
+    // No meta region. Append trailer directly after file_number.
+    EncodeChunkIdTrailer(&buf, chunk_id);
+    value.reset(Slice(buf), true, file_number);
+    // reset() with copy=true internally copies the bytes, so `buf`
+    // can safely go out of scope after this call.
+    return Status::OK();
+  }
+
+  if (is_index) {
+    // Caller already supplies meta as a raw Slice.
+    buf.append(meta.data(), meta.size());
+    EncodeChunkIdTrailer(&buf, chunk_id);
+    value.reset(Slice(buf), true, file_number);
+    return Status::OK();
+  }
+
+  // Need to materialize meta via the extractor.
+  auto s = value.fetch();
+  if (!s.ok()) {
+    return s;
+  }
+  std::string value_meta;
+  s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
+                                    value.slice(), &value_meta);
+  if (!s.ok()) {
+    return s;
+  }
+  buf.append(value_meta.data(), value_meta.size());
+  EncodeChunkIdTrailer(&buf, chunk_id);
+  value.reset(Slice(buf), true, file_number);
+  return Status::OK();
+}
+
 // Out-of-class definitions for the static constexpr members declared in
 // dbformat.h. Required under C++14 for ODR-use (e.g. passing them by
 // reference to ASSERT_EQ in tests). Harmless under C++17+ where they

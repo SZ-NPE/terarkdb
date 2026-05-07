@@ -32,6 +32,7 @@
 #include "rocksdb/terark_namespace.h"
 #include "table/format.h"
 #include "table/internal_iterator.h"
+#include "table/block_based_table_factory.h"
 #include "util/c_style_callback.h"
 #include "util/file_reader_writer.h"
 #include "util/filename.h"
@@ -210,9 +211,32 @@ Status BuildTable(
     }
     // initialize chunk-reference collector from CF options.
     // Safe even when the feature is off: collector becomes a no-op.
-    separate_helper.chunk_bitmap_collector =
-        FlushChunkBitmapCollector(mutable_cf_options.enable_blob_validity_bitmap,
-                                  mutable_cf_options.blob_gc_chunk_size);
+    //
+    // BlockBasedTable-only gate: the chunk-aware value-index format
+    // and its SST-property/manifest plumbing are currently validated
+    // against the default BlockBasedTable builder/reader only. When
+    // the CF is configured to use a different table factory (e.g.
+    // TerarkZipTable), we force-disable the collector so that the
+    // legacy GC path is always used. This keeps the feature boundary
+    // matching the documented POC scope in paper/feature.md.
+    const bool is_block_based_table =
+        ioptions.table_factory != nullptr &&
+        ioptions.table_factory->Name() == BlockBasedTableFactory::kName;
+    const bool chunk_bitmap_enabled =
+        mutable_cf_options.enable_blob_validity_bitmap && is_block_based_table;
+    if (mutable_cf_options.enable_blob_validity_bitmap &&
+        !is_block_based_table) {
+      ROCKS_LOG_INFO(
+          ioptions.info_log,
+          "[Flush] enable_blob_validity_bitmap is set but table_factory is "
+          "'%s' (not BlockBasedTable); chunk-aware value-index is disabled "
+          "for this CF.",
+          ioptions.table_factory != nullptr
+              ? ioptions.table_factory->Name()
+              : "<null>");
+    }
+    separate_helper.chunk_bitmap_collector = FlushChunkBitmapCollector(
+        chunk_bitmap_enabled, mutable_cf_options.blob_gc_chunk_size);
 
     auto flush_route_hint = [](HotnessTracker::FlushRoute route) {
       switch (route) {
@@ -344,10 +368,19 @@ Status BuildTable(
         separate_helper.chunk_bitmap_collector.Observe(
             blob_meta->fd.GetNumber(), observed_offset);
         blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
+        // When the chunk-aware value-index is enabled for this CF,
+        // stamp the resolved chunk_id onto the outgoing index value
+        // so that downstream compaction/GC readers can decode it
+        // without having to re-derive the blob offset.
+        const uint64_t chunk_id_for_trailer =
+            separate_helper.chunk_bitmap_collector.enabled()
+                ? ChunkIdOfOffset(observed_offset,
+                                  mutable_cf_options.blob_gc_chunk_size)
+                : SeparateHelper::kNoChunkId;
         status = SeparateHelper::TransToSeparate(
             key, value, blob_meta->fd.GetNumber(), Slice(),
             GetInternalKeyType(key) == kTypeMerge, false,
-            separate_helper.value_meta_extractor.get());
+            separate_helper.value_meta_extractor.get(), chunk_id_for_trailer);
       }
       return status;
     };

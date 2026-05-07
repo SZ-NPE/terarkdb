@@ -876,6 +876,18 @@ class SeparateHelper {
                                 bool is_merge, bool is_index,
                                 const ValueExtractor* value_meta_extractor);
 
+  // Overload that additionally appends a chunk-id trailer to the
+  // encoded value-index when `chunk_id != kNoChunkId`. When
+  // `chunk_id == kNoChunkId`, behavior is bit-for-bit identical to
+  // the legacy overload above. This is the single entry point used
+  // by flush/compaction writers once the chunk-aware value-index
+  // format is enabled.
+  static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
+                                uint64_t file_number, const Slice& meta,
+                                bool is_merge, bool is_index,
+                                const ValueExtractor* value_meta_extractor,
+                                uint64_t chunk_id);
+
   virtual Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                  const Slice& meta, bool is_merge,
                                  bool is_index) {

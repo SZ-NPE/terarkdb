@@ -473,6 +473,79 @@ TEST_F(FormatTest, ValueIndexDecode_RejectMalformedChunkEncoding) {
   }
 }
 
+// Test 5: The chunk-aware TransToSeparate() overload actually emits a
+// well-formed chunk-id trailer on the outgoing value-index, while
+// staying bit-for-bit identical to the legacy overload when the
+// caller passes kNoChunkId. This directly covers the writer side of
+// Issue 1 (flush/compaction failing to stamp chunk_id onto the index
+// value).
+TEST_F(FormatTest, TransToSeparate_StampsChunkIdTrailer) {
+  const uint64_t file_number = 123ULL;
+
+  // Legacy behavior: chunk_id == kNoChunkId must produce a slice
+  // indistinguishable from the legacy overload's output (no trailer).
+  {
+    LazyBuffer value;
+    Status s = SeparateHelper::TransToSeparate(
+        "ik", value, file_number, Slice(), /*is_merge=*/true,
+        /*is_index=*/false, /*value_meta_extractor=*/nullptr,
+        SeparateHelper::kNoChunkId);
+    ASSERT_TRUE(s.ok());
+    ASSERT_TRUE(value.fetch().ok());
+    ASSERT_EQ(file_number,
+              SeparateHelper::DecodeFileNumber(value.slice()));
+    ASSERT_FALSE(SeparateHelper::HasChunkId(value.slice()));
+    ASSERT_EQ(SeparateHelper::kNoChunkId,
+              SeparateHelper::DecodeChunkId(value.slice()));
+  }
+
+  // Chunk-aware behavior on the "merge / no meta" path.
+  {
+    LazyBuffer value;
+    Status s = SeparateHelper::TransToSeparate(
+        "ik", value, file_number, Slice(), /*is_merge=*/true,
+        /*is_index=*/false, /*value_meta_extractor=*/nullptr,
+        /*chunk_id=*/7ULL);
+    ASSERT_TRUE(s.ok());
+    ASSERT_TRUE(value.fetch().ok());
+    ASSERT_EQ(file_number,
+              SeparateHelper::DecodeFileNumber(value.slice()));
+    ASSERT_TRUE(SeparateHelper::HasChunkId(value.slice()));
+    ASSERT_EQ(7ULL, SeparateHelper::DecodeChunkId(value.slice()));
+    // Meta is empty and the trailer is stripped cleanly.
+    ASSERT_EQ(0u,
+              SeparateHelper::DecodeValueMetaStripChunk(value.slice()).size());
+  }
+
+  // Chunk-aware behavior on the "caller-supplied meta" path. The
+  // stripped meta view must exactly equal the caller-supplied meta.
+  // We pass a non-null sentinel for value_meta_extractor so that the
+  // implementation skips the (value_meta_extractor == nullptr)
+  // shortcut and enters the is_index branch, which copies the
+  // caller-supplied meta verbatim without ever dereferencing the
+  // extractor pointer.
+  {
+    LazyBuffer value;
+    const std::string meta_str = "ext-meta";
+    const ValueExtractor* sentinel =
+        reinterpret_cast<const ValueExtractor*>(uintptr_t{0x1});
+    Status s = SeparateHelper::TransToSeparate(
+        "ik", value, file_number, Slice(meta_str),
+        /*is_merge=*/false, /*is_index=*/true,
+        /*value_meta_extractor=*/sentinel,
+        /*chunk_id=*/128ULL /* 2-byte varint boundary */);
+    ASSERT_TRUE(s.ok());
+    ASSERT_TRUE(value.fetch().ok());
+    ASSERT_EQ(file_number,
+              SeparateHelper::DecodeFileNumber(value.slice()));
+    ASSERT_TRUE(SeparateHelper::HasChunkId(value.slice()));
+    ASSERT_EQ(128ULL, SeparateHelper::DecodeChunkId(value.slice()));
+    ASSERT_EQ(meta_str,
+              SeparateHelper::DecodeValueMetaStripChunk(value.slice())
+                  .ToString());
+  }
+}
+
 }  // namespace TERARKDB_NAMESPACE
 
 int main(int argc, char** argv) {

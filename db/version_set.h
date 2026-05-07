@@ -341,7 +341,7 @@ class VersionStorageInfo {
 
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
   const DependenceMap& dependence_map() const { return dependence_map_; }
-x
+
   // For every blob file currently referenced by the LSM, this struct
   // captures the union of chunk references coming from every SST in
   // the current version (`live_chunk_bitmap`) plus a few derived

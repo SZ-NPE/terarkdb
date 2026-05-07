@@ -1669,16 +1669,39 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         raw_value_bytes = value.slice().size();
       }
     }
+    // Snapshot the blob builder's pre-Add file size so that the chunk
+    // id we stamp onto the outgoing value-index matches the chunk the
+    // value will actually live in. Mirrors the flush path invariant.
+    const uint64_t observed_offset =
+        blob_builder != nullptr ? blob_builder->FileSize() : 0;
     if (s.ok()) {
       s = blob_builder->Add(key, value);
     }
     if (s.ok()) {
       blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
       new_blob_bytes_per_fn[blob_meta->fd.GetNumber()] += raw_value_bytes;
+      // Only stamp a chunk_id trailer when the feature is enabled for
+      // this CF *and* the configured table factory is BlockBasedTable
+      // (the only factory the chunk-aware value-index format has been
+      // validated against). Otherwise we emit a legacy value-index and
+      // downstream GC falls back to the whole-blob scan path.
+      const auto* iopt =
+          sub_compact->compaction->immutable_cf_options();
+      const bool is_block_based_table =
+          iopt != nullptr && iopt->table_factory != nullptr &&
+          iopt->table_factory->Name() == BlockBasedTableFactory::kName;
+      const bool chunk_aware =
+          mutable_cf_options->enable_blob_validity_bitmap &&
+          mutable_cf_options->blob_gc_chunk_size > 0 &&
+          is_block_based_table;
+      const uint64_t chunk_id_for_trailer =
+          chunk_aware ? ChunkIdOfOffset(observed_offset,
+                                        mutable_cf_options->blob_gc_chunk_size)
+                      : SeparateHelper::kNoChunkId;
       s = SeparateHelper::TransToSeparate(
           key, value, blob_meta->fd.GetNumber(), Slice(),
           GetInternalKeyType(key) == kTypeMerge, false,
-          separate_helper.value_meta_extractor.get());
+          separate_helper.value_meta_extractor.get(), chunk_id_for_trailer);
     }
     return s;
   };
@@ -1809,8 +1832,32 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   // written into the *current* output SST. The collector is reset
   // (by assignment) every time FinishCompactionOutputFile produces
   // a new output SST (alongside dependence.clear()).
+  //
+  // BlockBasedTable-only gate: matches the flush-side policy. When
+  // the CF uses a non-BlockBasedTable factory we force-disable the
+  // collector so that all compaction output SSTs in that CF stay on
+  // the legacy "bitmap unavailable" regime.
+  const auto* compaction_iopt =
+      sub_compact->compaction->immutable_cf_options();
+  const bool compaction_is_block_based_table =
+      compaction_iopt != nullptr && compaction_iopt->table_factory != nullptr &&
+      compaction_iopt->table_factory->Name() == BlockBasedTableFactory::kName;
+  const bool compaction_chunk_bitmap_enabled =
+      mutable_cf_options->enable_blob_validity_bitmap &&
+      compaction_is_block_based_table;
+  if (mutable_cf_options->enable_blob_validity_bitmap &&
+      !compaction_is_block_based_table) {
+    ROCKS_LOG_INFO(
+        db_options_.info_log,
+        "[Compaction] enable_blob_validity_bitmap is set but table_factory is "
+        "'%s' (not BlockBasedTable); chunk-aware value-index is disabled for "
+        "this CF.",
+        compaction_iopt != nullptr && compaction_iopt->table_factory != nullptr
+            ? compaction_iopt->table_factory->Name()
+            : "<null>");
+  }
   CompactionChunkBitmapCollector chunk_bitmap_collector(
-      mutable_cf_options->enable_blob_validity_bitmap,
+      compaction_chunk_bitmap_enabled,
       mutable_cf_options->blob_gc_chunk_size);
 
   size_t yield_count = 0;
@@ -2001,7 +2048,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       // collector's feature-switch/chunk-size state but drops all
       // accumulated observations and unavailable marks.
       chunk_bitmap_collector = CompactionChunkBitmapCollector(
-          mutable_cf_options->enable_blob_validity_bitmap,
+          compaction_chunk_bitmap_enabled,
           mutable_cf_options->blob_gc_chunk_size);
       RecordDroppedKeys(range_del_out_stats,
                         &sub_compact->compaction_job_stats);
