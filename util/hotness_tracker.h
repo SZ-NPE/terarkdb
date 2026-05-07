@@ -11,6 +11,12 @@ namespace TERARKDB_NAMESPACE {
 
 class HotnessTracker {
  public:
+  enum class FlushRoute {
+    kWarm = 0,
+    kEphemeral = 1,
+    kStable = 2,
+  };
+
   HotnessTracker(size_t window_cache_capacity, size_t hot_cache_capacity,
                  int num_shard_bits = 6) {
     window_cache_ = NewFIFOCache(window_cache_capacity, num_shard_bits, false, 0.0);
@@ -34,12 +40,20 @@ class HotnessTracker {
   }
 
   bool IsHot(const Slice& key, uint32_t hash) const {
-    Cache::Handle* handle = hot_cache_->Lookup(key, hash, false /* record_hit */);
-    if (handle != nullptr) {
-      hot_cache_->Release(handle);
-      return true;
+    return CacheContains(hot_cache_, key, hash);
+  }
+
+  FlushRoute ClassifyForFlush(const Slice& key, uint32_t hash) const {
+    if (!CacheContains(hot_cache_, key, hash)) {
+      return FlushRoute::kWarm;
     }
-    return false;
+    // Keys that are still in the observation window remain in the
+    // high-overwrite route. Only keys that were previously promoted and have
+    // since aged out of the window can enter the stable route.
+    if (CacheContains(window_cache_, key, hash)) {
+      return FlushRoute::kEphemeral;
+    }
+    return FlushRoute::kStable;
   }
 
   static void NoopDeleter(const Slice& /*key*/, void* /*value*/) {
@@ -76,6 +90,16 @@ class HotnessTracker {
   }
 
  private:
+  static bool CacheContains(const std::shared_ptr<Cache>& cache, const Slice& key,
+                            uint32_t hash) {
+    Cache::Handle* handle = cache->Lookup(key, hash, false /* record_hit */);
+    if (handle == nullptr) {
+      return false;
+    }
+    cache->Release(handle);
+    return true;
+  }
+
   std::shared_ptr<Cache> window_cache_;
   std::shared_ptr<Cache> hot_cache_;
 };
