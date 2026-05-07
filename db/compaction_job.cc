@@ -2243,8 +2243,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     bool has_run = false, run_live = false;
     // bitmap fast-path counters.
     //   bitmap_fast_path_skips   : GetKey() calls avoided because the
-    //                              entire blob was provably dead under
-    //                              the aggregated live-chunk bitmap.
+    //                              GC record was provably dead under
+    //                              the aggregated live-chunk bitmap
+    //                              (either the entire blob was dead,
+    //                              or the record's chunk was dead).
     //   bitmap_aware_blobs       : distinct blobs whose aggregated
     //                              view was available (kLive or kDead
     //                              regime, i.e. not kUnknown).
@@ -2366,6 +2368,24 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         counter.bitmap_skipped_bytes +=
             curr_key.size() + input->value().size();
         break;
+      }
+      // Per-record chunk-aware fast path: when the blob-level view is
+      // available and the value-index carries a chunk_id trailer, a
+      // dead chunk lets us skip the expensive GetKey() lookup for just
+      // this record. Live / unknown chunks still fall back to the
+      // legacy point lookup for correctness.
+      const uint64_t chunk_id =
+          SeparateHelper::DecodeChunkId(input->value().slice());
+      if (chunk_id != SeparateHelper::kNoChunkId) {
+        const auto chunk_liveness =
+            vstorage->IsChunkLive(blob_file_number, chunk_id);
+        if (chunk_liveness == VersionStorageInfo::BlobChunkLiveness::kDead) {
+          ++counter.bitmap_fast_path_skips;
+          ++counter.get_not_found;
+          counter.bitmap_skipped_bytes +=
+              curr_key.size() + input->value().size();
+          break;
+        }
       }
       // record bytes that will flow through the legacy
       // per-record path so observers can compute the fast-path

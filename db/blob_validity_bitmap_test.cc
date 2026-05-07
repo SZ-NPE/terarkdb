@@ -834,17 +834,17 @@ struct SimulatedGcCounters {
   std::vector<BlobRecord> kept_records;
 };
 
-// Replays the Phase 7 fast-path gate and the Phase 8 ticker emit
-// site over a synthetic record stream. Per-blob IsBlobEntirelyDead
-// is consulted exactly once (cached) -- this matches
-// compaction_job.cc's `blob_meta_cache`.
+// Replays the Phase 7/8 GC gate over a synthetic record stream.
+// Per-blob IsBlobEntirelyDead is consulted exactly once (cached) --
+// this matches compaction_job.cc's `blob_meta_cache`.
 //
 // For a record where the blob is entirely dead, the simulator
 // short-circuits and increments fast-path counters. For all other
-// records it walks the "legacy GetKey()" path, consults the
-// per-record ground_truth_live flag (our stand-in for
-// `input_version->GetKey()`), accumulates live bytes, and either
-// keeps or drops the record.
+// records, a dead chunk_id (when available) also short-circuits and
+// increments the same fast-path counters. Only live / unknown chunks
+// walk the "legacy GetKey()" path, consult the per-record
+// ground_truth_live flag (our stand-in for `input_version->GetKey()`),
+// accumulate live bytes, and either keep or drop the record.
 //
 // Returns the accumulated counters plus the ordered list of kept
 // records, so the caller can assert both the ticker contract AND
@@ -891,6 +891,15 @@ SimulatedGcCounters SimulateGc(const VersionStorageInfo& vstorage,
       // Record is considered dead and dropped.
       continue;
     }
+    if (!entirely_dead &&
+        r.chunk_id != SeparateHelper::kNoChunkId &&
+        vstorage.IsChunkLive(r.blob_file_number, r.chunk_id) ==
+            VersionStorageInfo::BlobChunkLiveness::kDead) {
+      ++c.bitmap_fast_path_skips;
+      c.bitmap_skipped_bytes += r.byte_overhead;
+      continue;
+    }
+
     // Legacy path: consult ground truth (stand-in for
     // input_version->GetKey() liveness verdict) and accumulate bytes.
     c.bitmap_live_bytes += r.byte_overhead;
@@ -1052,8 +1061,9 @@ TEST_F(BlobValidityBitmapPhase10Test,
   //     chunks. ground-truth live iff chunk ∈ {0, 3, 5}. Even though
   //     the Phase 7 gate here cannot short-circuit the *whole* blob
   //     (because some chunks are live), it still correctly answers
-  //     per-chunk; the simulator falls back to GetKey() and our
-  //     ground-truth drives the kept set.
+  //     per-chunk; dead chunks are short-circuited while live chunks
+  //     still fall back to GetKey() and our ground-truth drives the
+  //     kept set.
   std::vector<BlobRecord> records;
   for (uint64_t cid = 0; cid < kNumChunks; ++cid) {
     bool live = (cid == 0 || cid == 3 || cid == 5);
@@ -1071,19 +1081,21 @@ TEST_F(BlobValidityBitmapPhase10Test,
   EmitPhase10Tickers(stats.get(), c);
 
   // This blob has live chunks, so the whole-blob fast path does NOT
-  // fire; every record goes through the per-record legacy path.
+  // fire. However, records in dead chunks are now short-circuited by
+  // the per-record chunk-aware branch.
   EXPECT_EQ(1U, c.bitmap_aware_blobs);
   EXPECT_EQ(0U, c.bitmap_fallback_blobs);
   EXPECT_EQ(0U, c.bitmap_entirely_dead_blobs);
-  EXPECT_EQ(0U, c.bitmap_fast_path_skips);
-  EXPECT_EQ(0U, c.bitmap_skipped_bytes);
-  // live_bytes = sum of overheads of all records since none skipped.
-  uint64_t expected_live_bytes = 0;
-  for (const auto& r : records) expected_live_bytes += r.byte_overhead;
+  EXPECT_EQ(6U, c.bitmap_fast_path_skips);
+  EXPECT_EQ(5U * 128U + 1U * 200U, c.bitmap_skipped_bytes);
+  uint64_t expected_live_bytes = 3U * 128U + 3U * 200U;
   EXPECT_EQ(expected_live_bytes, c.bitmap_live_bytes);
 
   // Tickers reflect the same.
-  EXPECT_EQ(0U, stats->getTickerCount(GC_BITMAP_FAST_PATH_COUNT));
+  EXPECT_EQ(6U, stats->getTickerCount(GC_BITMAP_FAST_PATH_COUNT));
+  EXPECT_EQ(6U, stats->getTickerCount(GC_LOOKUP_AVOIDED_COUNT));
+  EXPECT_EQ(5U * 128U + 1U * 200U,
+            stats->getTickerCount(GC_SKIPPED_DEAD_CHUNK_BYTES));
   EXPECT_EQ(expected_live_bytes,
             stats->getTickerCount(GC_READ_LIVE_CHUNK_BYTES));
 
@@ -1159,7 +1171,8 @@ TEST_F(BlobValidityBitmapPhase10Test,
   // Drive GC over 200 records against the dead blob (all dead in
   // ground truth) plus 20 records against the live blob (live iff
   // chunk ∈ {2, 4, 7}). The dead blob should be skipped wholesale;
-  // the live blob should fall back to the legacy path.
+  // the live blob should additionally short-circuit records in dead
+  // chunks before reaching GetKey().
   std::vector<BlobRecord> records;
   for (uint64_t i = 0; i < 200; ++i) {
     records.push_back(BlobRecord{kBlobDead, i % kChunksPerBlob,
@@ -1177,22 +1190,23 @@ TEST_F(BlobValidityBitmapPhase10Test,
   EmitPhase10Tickers(stats.get(), result);
 
   // Hard invariants on ticker values:
-  EXPECT_EQ(200U, result.bitmap_fast_path_skips)
-      << "every record in the entirely-dead blob must be fast-path-skipped";
-  EXPECT_EQ(200U * 64U, result.bitmap_skipped_bytes);
+  EXPECT_EQ(213U, result.bitmap_fast_path_skips)
+      << "the dead blob plus dead chunks in the live blob must avoid "
+         "GetKey()";
+  EXPECT_EQ(213U * 64U, result.bitmap_skipped_bytes);
   EXPECT_EQ(2U, result.bitmap_aware_blobs);
   EXPECT_EQ(1U, result.bitmap_entirely_dead_blobs);
   EXPECT_EQ(0U, result.bitmap_fallback_blobs);
-  // Live-blob records went through the GetKey() path, all 20 of them.
-  EXPECT_EQ(20U * 64U, result.bitmap_live_bytes);
+  // Only records from live chunks {2,4,7} must hit GetKey().
+  EXPECT_EQ(7U * 64U, result.bitmap_live_bytes);
 
-  EXPECT_EQ(200U, stats->getTickerCount(GC_BITMAP_FAST_PATH_COUNT));
-  EXPECT_EQ(200U, stats->getTickerCount(GC_LOOKUP_AVOIDED_COUNT))
+  EXPECT_EQ(213U, stats->getTickerCount(GC_BITMAP_FAST_PATH_COUNT));
+  EXPECT_EQ(213U, stats->getTickerCount(GC_LOOKUP_AVOIDED_COUNT))
       << "GC_LOOKUP_AVOIDED_COUNT must mirror fast-path skips -- that "
          "IS the business value this feature claims";
-  EXPECT_EQ(200U * 64U,
+  EXPECT_EQ(213U * 64U,
             stats->getTickerCount(GC_SKIPPED_DEAD_CHUNK_BYTES));
-  EXPECT_EQ(20U * 64U,
+  EXPECT_EQ(7U * 64U,
             stats->getTickerCount(GC_READ_LIVE_CHUNK_BYTES));
 
   // User-visible correctness: nothing live dropped.
@@ -1342,10 +1356,10 @@ TEST_F(BlobValidityBitmapPhase10Test, EndToEnd_LegacyBlobFallsBackSafely) {
   EmitPhase10Tickers(stats.get(), c);
 
   // Legacy blob NEVER enters fast path; new blob has live chunks so
-  // it also does not fast-path the whole blob. Every record walks
-  // the legacy path.
-  EXPECT_EQ(0U, c.bitmap_fast_path_skips);
-  EXPECT_EQ(0U, c.bitmap_skipped_bytes);
+  // it does not fast-path the whole blob, but records in dead chunks
+  // still bypass GetKey() via the new per-record branch.
+  EXPECT_EQ(5U, c.bitmap_fast_path_skips);
+  EXPECT_EQ(5U * 96U, c.bitmap_skipped_bytes);
   EXPECT_EQ(1U, c.bitmap_aware_blobs);     // kBlobNew
   EXPECT_EQ(1U, c.bitmap_fallback_blobs);  // kBlobLegacy
   EXPECT_EQ(0U, c.bitmap_entirely_dead_blobs);
@@ -1353,10 +1367,11 @@ TEST_F(BlobValidityBitmapPhase10Test, EndToEnd_LegacyBlobFallsBackSafely) {
   EXPECT_EQ(1U, stats->getTickerCount(GC_BITMAP_FALLBACK_COUNT))
       << "exactly one legacy blob must surface in the fallback "
          "ticker";
-  EXPECT_EQ(0U, stats->getTickerCount(GC_BITMAP_FAST_PATH_COUNT))
-      << "fast path must NOT fire when a legacy SST references the "
-         "blob -- this is the safety contract";
-  EXPECT_EQ((30U + 10U) * 96U,
+  EXPECT_EQ(5U, stats->getTickerCount(GC_BITMAP_FAST_PATH_COUNT))
+      << "the legacy blob still falls back safely, while dead chunks "
+         "in the new blob should avoid GetKey()";
+  EXPECT_EQ(5U, stats->getTickerCount(GC_LOOKUP_AVOIDED_COUNT));
+  EXPECT_EQ((30U + 5U) * 96U,
             stats->getTickerCount(GC_READ_LIVE_CHUNK_BYTES));
 
   // User-visible correctness: every live record kept, every dead
