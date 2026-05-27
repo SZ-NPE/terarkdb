@@ -710,9 +710,26 @@ CompactionJob::CompactionJob(
       bottommost_level_(false),
       paranoid_file_checks_(paranoid_file_checks),
       measure_io_stats_(measure_io_stats),
-      write_hint_(Env::WLTH_NOT_SET) {
+      write_hint_(Env::WLTH_NOT_SET),
+      gc_t_trigger_(0),
+      gc_t_select_(0),
+      gc_t_scan_(0),
+      gc_t_lookup_(0),
+      gc_t_write_(0),
+      gc_t_meta_(0),
+      is_gc_job_(compaction->compaction_type() == kGarbageCollection) {
   assert(log_buffer_ != nullptr);
   const auto* cfd = compact_->compaction->column_family_data();
+  gc_cf_name_ = cfd->GetName();
+  // Snapshot blob file numbers for later dump (compact_ gets freed by Install)
+  const auto& gc_inputs = compact_->compaction->inputs();
+  if (!gc_inputs->empty()) {
+    for (size_t i = 0; i < gc_inputs->front().files.size(); ++i) {
+      if (i > 0) gc_blob_files_ += ",";
+      gc_blob_files_ +=
+          std::to_string(gc_inputs->front().files[i]->fd.GetNumber());
+    }
+  }
   ThreadStatusUtil::SetColumnFamily(cfd, cfd->ioptions()->env,
                                     db_options_.enable_thread_tracking);
   ThreadStatusUtil::SetThreadOperation(ThreadStatus::OP_COMPACTION);
@@ -722,6 +739,33 @@ CompactionJob::CompactionJob(
 CompactionJob::~CompactionJob() {
   assert(compact_ == nullptr);
   ThreadStatusUtil::ResetThreadStatus();
+}
+
+void CompactionJob::SetGcTriggerSelectTime(uint64_t trigger_nanos,
+                                            uint64_t select_nanos) {
+  gc_t_trigger_ = trigger_nanos;
+  gc_t_select_ = select_nanos;
+}
+
+void CompactionJob::AddGcMetaTime(uint64_t meta_nanos) {
+  gc_t_meta_ += meta_nanos;
+}
+
+void CompactionJob::DumpGcBreakdown() const {
+  if (!is_gc_job_) {
+    return;
+  }
+  ROCKS_LOG_INFO(db_options_.info_log,
+                 "[%s] [JOB %d] [BLOB_GC_BREAKDOWN] blob_files:[%s]"
+                 ", trigger:%" PRIu64
+                 ", select:%" PRIu64
+                 ", scan:%" PRIu64
+                 ", lookup:%" PRIu64
+                 ", write:%" PRIu64
+                 ", meta:%" PRIu64,
+                 gc_cf_name_.c_str(), job_id_, gc_blob_files_.c_str(),
+                 gc_t_trigger_, gc_t_select_, gc_t_scan_, gc_t_lookup_,
+                 gc_t_write_, gc_t_meta_);
 }
 
 void CompactionJob::ReportStartedCompaction(Compaction* compaction) {
@@ -2201,7 +2245,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact->start == nullptr);
   assert(sub_compact->end == nullptr);
 
+  uint64_t s3 = env_->NowNanos();
   input->SeekToFirst();
+  gc_t_scan_ += (env_->NowNanos() - s3);
 
   Arena arena;
   std::unordered_map<Slice, uint64_t, SliceHasher> conflict_map;
@@ -2397,8 +2443,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       SequenceNumber seq = kMaxSequenceNumber;
       LazyBuffer value;
       const uint64_t lookup_begin_ts = env_->NowMicros();
+      const uint64_t s4 = env_->NowNanos();
       input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
                             &seq, &value, *blob_meta);
+      gc_t_lookup_ += (env_->NowNanos() - s4);
       counter.lookup_micros += env_->NowMicros() - lookup_begin_ts;
       if (s.IsNotFound()) {
         ++counter.get_not_found;
@@ -2430,7 +2478,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
 
       assert(sub_compact->blob_builder != nullptr);
       assert(sub_compact->current_blob_output() != nullptr);
+      const uint64_t s5 = env_->NowNanos();
       status = sub_compact->blob_builder->Add(curr_key, value);
+      gc_t_write_ += (env_->NowNanos() - s5);
       if (!status.ok()) {
         break;
       }
@@ -2463,7 +2513,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     last_key.assign(curr_key.data(), curr_key.size());
     last_file_number = curr_file_number;
 
+    uint64_t s3 = env_->NowNanos();
     input->Next();
+    gc_t_scan_ += (env_->NowNanos() - s3);
   }
 
   if (status.ok() &&
@@ -2481,7 +2533,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         *sub_compact->compaction->inputs(), dependence_map, input_version,
         &inheritance_tree, &inheritance_tree_pruge_count);
   }
+  const uint64_t s6 = env_->NowNanos();
   Status s = FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
+  gc_t_meta_ += (env_->NowNanos() - s6);
   if (status.ok()) {
     status = s;
   }

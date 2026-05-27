@@ -2930,6 +2930,9 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
   std::unique_ptr<Compaction> c;
   CompactionJobStats garbage_collection_job_stats;
   Status status;
+  // Blob GC time accumulators (scope lifted for passing to CompactionJob)
+  uint64_t gc_t_trigger = 0;
+  uint64_t gc_t_select = 0;
   if (!error_handler_.IsBGWorkStopped()) {
     if (shutting_down_.load(std::memory_order_acquire)) {
       status = Status::ShutdownInProgress();
@@ -2971,13 +2974,19 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
     // be used throughout the garbage collection procedure to make sure
     // consistency. It will eventually be installed into SuperVersion
     auto* mutable_cf_options = cfd->GetLatestMutableCFOptions();
+    // Stage 1: trigger decision overhead (from queue pop to pre-pick)
+    const uint64_t gc_trigger_start = env_->NowNanos();
     if (!mutable_cf_options->disable_auto_compactions && !cfd->IsDropped()) {
       // NOTE: try to avoid unnecessary copy of MutableCFOptions if
       // garbage collection is not necessary. Need to make sure mutex is held
       // until we make a copy in the following code
       TEST_SYNC_POINT(
           "DBImpl::BackgroundGarbageCollection():BeforePickGarbageCollection");
+      // Stage 2: select target blob files
+      const uint64_t gc_t_select_start = env_->NowNanos();
+      gc_t_trigger = gc_t_select_start - gc_trigger_start;
       c.reset(cfd->PickGarbageCollection(*mutable_cf_options, log_buffer));
+      gc_t_select = env_->NowNanos() - gc_t_select_start;
       TEST_SYNC_POINT(
           "DBImpl::BackgroundGarbageCollection():AfterPickGarbageCollection");
 
@@ -3044,6 +3053,7 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
         c->mutable_cf_options()->report_bg_io_stats, dbname_,
         &garbage_collection_job_stats);
     garbage_collection_job.Prepare(0 /* sub_compaction_slots */);
+    garbage_collection_job.SetGcTriggerSelectTime(gc_t_trigger, gc_t_select);
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             garbage_collection_job_stats, job_context->job_id);
 
@@ -3057,7 +3067,11 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
     TEST_SYNC_POINT("DBImpl::BackgroundGarbageCollection:NonTrivial:AfterRun");
     mutex_.Lock();
     const uint64_t gc_run_end_ts = env_->NowMicros();
+    // Stage 6 (part 2): install version edit, manifest update, fsync
+    const uint64_t gc_meta_start = env_->NowNanos();
     status = garbage_collection_job.Install(*c->mutable_cf_options());
+    garbage_collection_job.AddGcMetaTime(env_->NowNanos() - gc_meta_start);
+    garbage_collection_job.DumpGcBreakdown();
     ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "[%s] [JOB %d] GarbageCollection end: status=%s, run_micros=%" PRIu64,
                    c->column_family_data()->GetName().c_str(),

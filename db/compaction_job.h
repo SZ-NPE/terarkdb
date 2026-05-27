@@ -101,6 +101,12 @@ class CompactionJob {
 
   SeparationType separation_type() const;
 
+  // Blob GC time breakdown setters (nanoseconds)
+  void SetGcTriggerSelectTime(uint64_t trigger_nanos,
+                               uint64_t select_nanos);
+  void AddGcMetaTime(uint64_t meta_nanos);
+  void DumpGcBreakdown() const;
+
   struct ProcessArg {
     CompactionJob* job;
     int task_id;
@@ -202,6 +208,19 @@ class CompactionJob {
   // Stores the approx size of keys covered in the range of each subcompaction
   std::vector<uint64_t> sizes_;
   Env::WriteLifeTimeHint write_hint_;
+
+  // Blob GC time breakdown accumulators (nanoseconds)
+  uint64_t gc_t_trigger_;
+  uint64_t gc_t_select_;
+  uint64_t gc_t_scan_;
+  uint64_t gc_t_lookup_;
+  uint64_t gc_t_write_;
+  uint64_t gc_t_meta_;
+
+  // Snapshot data for DumpGcBreakdown, cached before compact_ is freed
+  bool is_gc_job_;
+  std::string gc_cf_name_;
+  std::string gc_blob_files_;
 };
 
 }  // namespace TERARKDB_NAMESPACE
