@@ -9,6 +9,8 @@
 
 #include "db/compaction_job.h"
 
+#include "rocksdb/table.h"
+
 #include "table/iterator_wrapper.h"
 
 #ifndef __STDC_FORMAT_MACROS
@@ -717,7 +719,17 @@ CompactionJob::CompactionJob(
       gc_t_lookup_(0),
       gc_t_write_(0),
       gc_t_meta_(0),
-      is_gc_job_(compaction->compaction_type() == kGarbageCollection) {
+      is_gc_job_(compaction->compaction_type() == kGarbageCollection),
+      gc_vsst_read_bytes_(0),
+      gc_ksst_read_bytes_(0),
+      gc_invalid_read_bytes_(0),
+      gc_relocation_write_bytes_(0),
+      gc_block_total_(0),
+      gc_block_invalid_0_25_(0),
+      gc_block_invalid_25_50_(0),
+      gc_block_invalid_50_75_(0),
+      gc_block_invalid_75_100_(0),
+      gc_block_invalid_100_(0) {
   assert(log_buffer_ != nullptr);
   const auto* cfd = compact_->compaction->column_family_data();
   gc_cf_name_ = cfd->GetName();
@@ -762,10 +774,38 @@ void CompactionJob::DumpGcBreakdown() const {
                  ", scan:%" PRIu64
                  ", lookup:%" PRIu64
                  ", write:%" PRIu64
-                 ", meta:%" PRIu64,
+                 ", meta:%" PRIu64
+                 ", vsst_read:%" PRIu64
+                 ", ksst_read:%" PRIu64
+                 ", invalid_read:%" PRIu64
+                 ", relocation_write:%" PRIu64,
                  gc_cf_name_.c_str(), job_id_, gc_blob_files_.c_str(),
                  gc_t_trigger_, gc_t_select_, gc_t_scan_, gc_t_lookup_,
-                 gc_t_write_, gc_t_meta_);
+                 gc_t_write_, gc_t_meta_,
+                 gc_vsst_read_bytes_, gc_ksst_read_bytes_,
+                 gc_invalid_read_bytes_, gc_relocation_write_bytes_);
+}
+
+void CompactionJob::DumpGcBlockDist() const {
+  if (!is_gc_job_ || gc_block_total_ == 0) {
+    return;
+  }
+  double skippable_pct =
+      static_cast<double>(gc_block_invalid_100_) / gc_block_total_ * 100.0;
+  ROCKS_LOG_INFO(db_options_.info_log,
+                 "[%s] [JOB %d] [BLOB_GC_BLOCK_DIST] blob_files:[%s]"
+                 ", block_total:%" PRIu64
+                 ", invalid_0_25:%" PRIu64
+                 ", invalid_25_50:%" PRIu64
+                 ", invalid_50_75:%" PRIu64
+                 ", invalid_75_100:%" PRIu64
+                 ", invalid_100:%" PRIu64
+                 ", skippable_ratio:%.1f%%",
+                 gc_cf_name_.c_str(), job_id_, gc_blob_files_.c_str(),
+                 gc_block_total_,
+                 gc_block_invalid_0_25_, gc_block_invalid_25_50_,
+                 gc_block_invalid_50_75_, gc_block_invalid_75_100_,
+                 gc_block_invalid_100_, skippable_pct);
 }
 
 void CompactionJob::ReportStartedCompaction(Compaction* compaction) {
@@ -2339,10 +2379,48 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   // IsBlobEntirelyDead() always returns false and this loop behaves
   // exactly like the legacy pre-Phase-7 path.
   const VersionStorageInfo* vstorage = input_version->storage_info();
+
+  // --- block-level invalidity distribution tracking setup ---
+  size_t gc_block_size = 4096;  // default BlockBasedTable block size
+  {
+    auto* table_factory = cfd->ioptions()->table_factory;
+    if (table_factory != nullptr) {
+      void* raw_opts = table_factory->GetOptions();
+      if (raw_opts != nullptr) {
+        gc_block_size =
+            static_cast<BlockBasedTableOptions*>(raw_opts)->block_size;
+      }
+    }
+  }
+  struct PerBlobBlockTracker {
+    uint64_t block_bytes = 0;
+    uint64_t block_dead_bytes = 0;
+  };
+  std::unordered_map<uint64_t, PerBlobBlockTracker> block_trackers;
+  auto finalize_block = [this](uint64_t block_bytes, uint64_t dead_bytes) {
+    if (block_bytes == 0) return;
+    ++gc_block_total_;
+    double dead_ratio = static_cast<double>(dead_bytes) / block_bytes;
+    if (dead_ratio >= 1.0) {
+      ++gc_block_invalid_100_;
+    } else if (dead_ratio >= 0.75) {
+      ++gc_block_invalid_75_100_;
+    } else if (dead_ratio >= 0.50) {
+      ++gc_block_invalid_50_75_;
+    } else if (dead_ratio >= 0.25) {
+      ++gc_block_invalid_25_50_;
+    } else {
+      ++gc_block_invalid_0_25_;
+    }
+  };
+
   while (status.ok() && !cfd->IsDropped() && input->Valid()) {
     ++counter.input;
     bool is_live = false;
     Slice curr_key = input->key();
+    // --- bandwidth tracking: record bytes read from blob (vSST) ---
+    const size_t record_bytes = curr_key.size() + input->value().size();
+    gc_vsst_read_bytes_ += record_bytes;
     uint64_t curr_file_number = uint64_t(-1);
     if (!ParseInternalKey(curr_key, &ikey)) {
       status =
@@ -2400,6 +2478,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     do {
       if (ikey.type != kTypeValue && ikey.type != kTypeMerge) {
         ++counter.garbage_type;
+        gc_invalid_read_bytes_ += record_bytes;
         break;
       }
       // fast path: if the aggregated bitmap says every chunk
@@ -2413,6 +2492,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         // parsing logs.
         counter.bitmap_skipped_bytes +=
             curr_key.size() + input->value().size();
+        gc_invalid_read_bytes_ += record_bytes;
         break;
       }
       // Per-record chunk-aware fast path: when the blob-level view is
@@ -2430,6 +2510,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
           ++counter.get_not_found;
           counter.bitmap_skipped_bytes +=
               curr_key.size() + input->value().size();
+          gc_invalid_read_bytes_ += record_bytes;
           break;
         }
       }
@@ -2444,12 +2525,15 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       LazyBuffer value;
       const uint64_t lookup_begin_ts = env_->NowMicros();
       const uint64_t s4 = env_->NowNanos();
+      const uint64_t ksst_io_before = IOSTATS(bytes_read);
       input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
                             &seq, &value, *blob_meta);
       gc_t_lookup_ += (env_->NowNanos() - s4);
+      gc_ksst_read_bytes_ += (IOSTATS(bytes_read) - ksst_io_before);
       counter.lookup_micros += env_->NowMicros() - lookup_begin_ts;
       if (s.IsNotFound()) {
         ++counter.get_not_found;
+        gc_invalid_read_bytes_ += record_bytes;
         break;
       } else if (!s.ok()) {
         status = std::move(s);
@@ -2457,6 +2541,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       } else if (seq != ikey.sequence ||
                  (type != kTypeValueIndex && type != kTypeMergeIndex)) {
         ++counter.get_not_found;
+        gc_invalid_read_bytes_ += record_bytes;
         break;
       }
       status = value.fetch();
@@ -2472,6 +2557,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       value = input->value();
       if (find->second->fd.GetNumber() != value.file_number()) {
         ++counter.file_number_mismatch;
+        gc_invalid_read_bytes_ += record_bytes;
         break;
       }
       curr_file_number = value.file_number();
@@ -2487,6 +2573,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       sub_compact->current_blob_output()->meta.UpdateBoundaries(curr_key,
                                                                 ikey.sequence);
       sub_compact->num_output_records++;
+      gc_relocation_write_bytes_ += record_bytes;
       is_live = true;
     } while (false);
     if (!counter.has_run || counter.run_live != is_live) {
@@ -2500,6 +2587,20 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     }
     ++counter.curr_run;
     is_live ? ++counter.live : ++counter.dead;
+
+    // --- block-level invalidity tracking ---
+    {
+      auto& tracker = block_trackers[blob_file_number];
+      tracker.block_bytes += record_bytes;
+      if (!is_live) {
+        tracker.block_dead_bytes += record_bytes;
+      }
+      if (tracker.block_bytes >= gc_block_size) {
+        finalize_block(tracker.block_bytes, tracker.block_dead_bytes);
+        tracker.block_bytes = 0;
+        tracker.block_dead_bytes = 0;
+      }
+    }
 
     if (counter.input > 1 && comp.Compare(curr_key, last_key) == 0 &&
         (last_file_number & curr_file_number) != uint64_t(-1)) {
@@ -2525,6 +2626,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   }
   if (status.ok()) {
     status = input->status();
+  }
+  // --- finalize remaining block trackers ---
+  for (auto& entry : block_trackers) {
+    finalize_block(entry.second.block_bytes, entry.second.block_dead_bytes);
   }
   std::vector<uint64_t> inheritance_tree;
   size_t inheritance_tree_pruge_count = 0;

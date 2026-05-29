@@ -3072,6 +3072,7 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
     status = garbage_collection_job.Install(*c->mutable_cf_options());
     garbage_collection_job.AddGcMetaTime(env_->NowNanos() - gc_meta_start);
     garbage_collection_job.DumpGcBreakdown();
+    garbage_collection_job.DumpGcBlockDist();
     ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "[%s] [JOB %d] GarbageCollection end: status=%s, run_micros=%" PRIu64,
                    c->column_family_data()->GetName().c_str(),

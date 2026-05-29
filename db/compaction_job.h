@@ -106,6 +106,7 @@ class CompactionJob {
                                uint64_t select_nanos);
   void AddGcMetaTime(uint64_t meta_nanos);
   void DumpGcBreakdown() const;
+  void DumpGcBlockDist() const;
 
   struct ProcessArg {
     CompactionJob* job;
@@ -221,6 +222,20 @@ class CompactionJob {
   bool is_gc_job_;
   std::string gc_cf_name_;
   std::string gc_blob_files_;
+
+  // Blob GC bandwidth breakdown (bytes)
+  uint64_t gc_vsst_read_bytes_;
+  uint64_t gc_ksst_read_bytes_;
+  uint64_t gc_invalid_read_bytes_;
+  uint64_t gc_relocation_write_bytes_;
+
+  // Blob GC block-level invalidity distribution
+  uint64_t gc_block_total_;
+  uint64_t gc_block_invalid_0_25_;
+  uint64_t gc_block_invalid_25_50_;
+  uint64_t gc_block_invalid_50_75_;
+  uint64_t gc_block_invalid_75_100_;
+  uint64_t gc_block_invalid_100_;
 };
 
 }  // namespace TERARKDB_NAMESPACE
