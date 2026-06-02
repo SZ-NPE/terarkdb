@@ -16,6 +16,7 @@ import re
 import argparse
 import os
 from collections import defaultdict
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -119,7 +120,7 @@ RE_BLOCKDIST = re.compile(
 )
 
 
-def parse_log(log_path: str, cf_filter: str | None = None):
+def parse_log(log_path: str, cf_filter: Optional[str] = None):
     """Parse TerarkDB INFO_LOG and extract GC instrumentation records.
 
     Returns
@@ -219,35 +220,35 @@ def _save(fig, out_dir: str, name: str, fmt: str = "png"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Figure 1 — GC Bandwidth Composition
+#  Figure 1a — GC Bandwidth Composition (Pie Chart)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def plot_bandwidth_breakdown(breakdowns, out_dir: str):
-    """Stacked-bar + pie chart: how much I/O is wasted by reading dead KV data."""
+def plot_bandwidth_pie(breakdowns, out_dir: str):
+    """Pie chart: cumulative I/O distribution across all GC jobs."""
     if not breakdowns:
         print("  [skip] no BREAKDOWN records")
         return
 
     labels = {
         "vsst_read":        "Live reads (vSST)",
-        "ksst_read":        "Index lookups (kSST)",
+        "ksst_read":        "GC lookups",
         "invalid_read":     "Wasted reads (dead KV)",
         "relocation_write": "Relocation writes",
     }
 
-    # ---- aggregate ----
+    # Aggregate data
     totals = defaultdict(float)
     for r in breakdowns:
         for k in labels:
             totals[k] += _bytes_to_mb(r[k])
     keys = list(labels.keys())
 
-    fig, (ax_pie, ax_bar) = plt.subplots(1, 2, figsize=(7.0, 2.8))
+    fig, ax = plt.subplots(figsize=(4.5, 3.5))
 
-    # -- pie --
     values = [totals[k] for k in keys]
     colors = [PALETTE[k] for k in keys]
-    wedges, texts, autotexts = ax_pie.pie(
+    
+    wedges, texts, autotexts = ax.pie(
         values,
         labels=[labels[k] for k in keys],
         colors=colors,
@@ -255,47 +256,113 @@ def plot_bandwidth_breakdown(breakdowns, out_dir: str):
         startangle=140,
         pctdistance=0.6,
         wedgeprops={"edgecolor": "white", "linewidth": 0.8},
-        textprops={"fontsize": 7},
+        textprops={"fontsize": 8},
     )
+    
     for t in autotexts:
-        t.set_fontsize(6.5)
-    ax_pie.set_title("(a) Cumulative I/O share", fontsize=9, fontweight="bold", pad=8)
+        t.set_fontsize(7)
+        t.set_fontweight("bold")
+    
+    ax.set_title("Cumulative I/O Distribution", fontsize=11, fontweight="bold", pad=15)
 
-    # -- stacked bars --
-    n = len(breakdowns)
-    x = np.arange(n)
-    width = max(0.4, min(0.8, 20.0 / max(n, 1)))
-
-    bottom = np.zeros(n)
-    order = ("vsst_read", "invalid_read", "ksst_read", "relocation_write")
-    for k in order:
-        vals = np.array([_bytes_to_mb(r[k]) for r in breakdowns])
-        ax_bar.bar(x, vals, width, bottom=bottom,
-                   color=PALETTE[k], label=labels[k], alpha=0.92,
-                   edgecolor="white", linewidth=0.3)
-        bottom += vals
-
-    ax_bar.set_xlabel("GC job index" if n <= 30 else "GC job index (sampled)")
-    ax_bar.set_ylabel("I/O volume (MB)")
-    ax_bar.set_title("(b) Per-job I/O composition", fontsize=9, fontweight="bold", pad=8)
-    ax_bar.legend(fontsize=6.5, ncol=2, loc="upper right",
-                  columnspacing=0.5, handlelength=1.0)
-    ax_bar.yaxis.set_major_locator(mticker.MaxNLocator(5))
-    if n > 30:
-        step = max(1, n // 12)
-        ax_bar.set_xticks(x[::step])
-        ax_bar.set_xticklabels([str(i) for i in x[::step]])
-
-    # -- annotation --
+    # Add annotation
     total_all = sum(values)
     waste_read = totals["invalid_read"] + totals["ksst_read"]
     waste_ratio = waste_read / (total_all + 1e-9) * 100
-    fig.text(0.5, -0.02,
-             f"Overall wasted read ratio (dead KV + kSST lookups) = {waste_ratio:.1f}%",
-             ha="center", fontsize=8, color=PALETTE["invalid_read"], fontweight="bold")
+    fig.text(0.5, -0.08,
+             f"Wasted read ratio = {waste_ratio:.1f}%",
+             ha="center", fontsize=9, color=PALETTE["invalid_read"], fontweight="bold")
 
     fig.tight_layout()
-    _save(fig, out_dir, "fig1_bandwidth_breakdown.png")
+    _save(fig, out_dir, "fig1a_bandwidth_pie.png")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Figure 1b — GC Bandwidth Composition (Stacked Bars)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_bandwidth_stacked_bars(breakdowns, out_dir: str):
+    """Stacked-bar chart: per-job I/O composition."""
+    if not breakdowns:
+        print("  [skip] no BREAKDOWN records")
+        return
+
+    labels = {
+        "vsst_read":        "Live reads (vSST)",
+        "ksst_read":        "GC lookups",
+        "invalid_read":     "Wasted reads (dead KV)",
+        "relocation_write": "Relocation writes",
+    }
+
+    # Sample data if too many jobs for clear visualization
+    n = len(breakdowns)
+    MAX_BARS = 50
+    if n > MAX_BARS:
+        sample_indices = np.linspace(0, n - 1, MAX_BARS, dtype=int)
+        sampled_breakdowns = [breakdowns[i] for i in sample_indices]
+        display_n = MAX_BARS
+        xlabel = f"GC job id (sampled {MAX_BARS}/{n})"
+    else:
+        sampled_breakdowns = breakdowns
+        display_n = n
+        xlabel = "GC job id"
+    
+    fig, ax = plt.subplots(figsize=(6.0, 2.8))
+    
+    x = np.arange(display_n)
+    width = max(0.5, min(0.85, 25.0 / max(display_n, 1)))
+
+    bottom = np.zeros(display_n)
+    order = ("vsst_read", "invalid_read", "ksst_read", "relocation_write")
+    for k in order:
+        vals = np.array([_bytes_to_mb(r[k]) for r in sampled_breakdowns])
+        ax.bar(x, vals, width, bottom=bottom,
+               color=PALETTE[k], label=labels[k], alpha=0.95,
+               edgecolor="white", linewidth=0.4)
+        bottom += vals
+
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel("I/O volume (MB)", fontsize=9)
+    ax.set_title("Per-job I/O Composition", fontsize=11, fontweight="bold", pad=10)
+    
+    # Optimize legend for publication style - place outside the plot
+    ax.legend(fontsize=7, ncol=1, loc="center left",
+              bbox_to_anchor=(1.02, 0.5),
+              columnspacing=0.8, handlelength=1.2, framealpha=0.95,
+              edgecolor="#cccccc", fancybox=False)
+    
+    # Optimize y-axis
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(5))
+    ax.yaxis.set_tick_params(labelsize=8)
+    
+    # Optimize x-axis labels for clarity
+    if display_n > 30:
+        # Show fewer but clearer labels
+        num_labels = min(10, display_n // 5)
+        label_step = max(1, display_n // num_labels)
+        label_indices = list(range(0, display_n, label_step))
+        
+        ax.set_xticks([x[i] for i in label_indices])
+        
+        if n > MAX_BARS:
+            # Format large numbers with K suffix
+            def format_job_idx(idx):
+                original_idx = sample_indices[idx]
+                if original_idx >= 1000:
+                    return f"{original_idx//1000}K"
+                return str(original_idx)
+            ax.set_xticklabels([format_job_idx(i) for i in label_indices], fontsize=8)
+        else:
+            ax.set_xticklabels([str(i) for i in label_indices], fontsize=8)
+    else:
+        ax.set_xticklabels([str(sample_indices[i]) if n > MAX_BARS else str(i) for i in x], fontsize=8)
+    
+    # Add subtle grid for better readability
+    ax.grid(True, axis='y', alpha=0.3, linewidth=0.5)
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    _save(fig, out_dir, "fig1b_bandwidth_stacked_bars.png")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -406,13 +473,26 @@ def plot_phase_time(breakdowns, out_dir: str):
 
     # -- per-job lines --
     n = len(breakdowns)
-    x = np.arange(n)
+    
+    # Sample data if too many jobs for clear visualization
+    MAX_POINTS = 100
+    if n > MAX_POINTS:
+        sample_indices = np.linspace(0, n - 1, MAX_POINTS, dtype=int)
+        sampled_breakdowns = [breakdowns[i] for i in sample_indices]
+        display_n = MAX_POINTS
+        xlabel = f"GC job id (sampled {MAX_POINTS}/{n})"
+    else:
+        sampled_breakdowns = breakdowns
+        display_n = n
+        xlabel = "GC job id"
+    
+    x = np.arange(display_n)
     for p in phases:
-        vals = [_ns_to_ms(r[p]) for r in breakdowns]
+        vals = [_ns_to_ms(r[p]) for r in sampled_breakdowns]
         ax_line.plot(x, vals, label=labels[p], color=PALETTE[p],
                      linewidth=0.9, alpha=0.82)
 
-    ax_line.set_xlabel("GC job index")
+    ax_line.set_xlabel(xlabel)
     ax_line.set_ylabel("Latency (ms)")
     ax_line.set_title("(b) Per-job phase latency", fontsize=9, fontweight="bold", pad=8)
     ax_line.legend(fontsize=6, ncol=2, columnspacing=0.5, handlelength=1.0)
@@ -435,13 +515,26 @@ def plot_bandwidth_over_time(breakdowns, out_dir: str):
     ts = [_us_to_sec(r["ts_us"]) for r in breakdowns]
     use_index = all(t == 0 for t in ts)
 
-    if use_index:
-        xs = list(range(len(breakdowns)))
-        xlabel = "GC job index"
+    # Sample data if too many jobs for clear visualization
+    MAX_POINTS = 150
+    n = len(breakdowns)
+    if n > MAX_POINTS:
+        sample_indices = np.linspace(0, n - 1, MAX_POINTS, dtype=int)
+        sampled_breakdowns = [breakdowns[i] for i in sample_indices]
+        sampled_ts = [ts[i] for i in sample_indices]
+        xlabel_suffix = f" (sampled {MAX_POINTS}/{n})"
     else:
-        t0 = ts[0]
-        xs = [t - t0 for t in ts]
-        xlabel = "Elapsed time (s)"
+        sampled_breakdowns = breakdowns
+        sampled_ts = ts
+        xlabel_suffix = ""
+
+    if use_index:
+        xs = list(range(len(sampled_breakdowns)))
+        xlabel = "GC job id" + xlabel_suffix
+    else:
+        t0 = sampled_ts[0]
+        xs = [t - t0 for t in sampled_ts]
+        xlabel = "Elapsed time (s)" + xlabel_suffix
 
     fig, ax = plt.subplots(figsize=(5.8, 2.6))
 
@@ -452,7 +545,7 @@ def plot_bandwidth_over_time(breakdowns, out_dir: str):
         "relocation_write": "Relocation writes",
     }
     for k, label in labels.items():
-        vals = [_bytes_to_mb(r[k]) for r in breakdowns]
+        vals = [_bytes_to_mb(r[k]) for r in sampled_breakdowns]
         ax.plot(xs, vals, label=label, color=PALETTE[k],
                 linewidth=1.0, marker=".", markersize=3, alpha=0.85)
 
@@ -529,7 +622,7 @@ def plot_skippability_by_job(blockdists, out_dir: str):
     ax.axhline(mean_s, color="#333333", linestyle="--", linewidth=0.9,
                label=f"Mean = {mean_s:.1f}%")
 
-    ax.set_xlabel("GC job index")
+    ax.set_xlabel("GC job id")
     ax.set_ylabel("Skippable block ratio (%)")
     ax.set_ylim(0, 105)
     ax.legend(fontsize=7)
@@ -593,40 +686,68 @@ def print_summary(breakdowns, blockdists):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    import sys
+    
     parser = argparse.ArgumentParser(
-        description="TerarkDB Blob GC Log Visualizer — SIGMOD-style publication charts"
+        description="TerarkDB Blob GC Log Visualizer — Publication-Ready for SIGMOD-style Papers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
     )
-    parser.add_argument("--log", required=True,
-                        help="Path to TerarkDB INFO_LOG file")
-    parser.add_argument("--cf",  default=None,
-                        help="Filter by column family name (default: all)")
-    parser.add_argument("--out", default="./gc_output",
-                        help="Output directory for figures (default: ./gc_output)")
+    parser.add_argument("--log", required=True, help="Path to INFO_LOG file")
+    parser.add_argument("--cf", default=None, help="Column family filter (default: all)")
+    parser.add_argument("--out", default="./output", help="Output directory for figures")
+    
     args = parser.parse_args()
-
+    
+    # Create output directory
     os.makedirs(args.out, exist_ok=True)
-
-    print(f"\nParsing log: {args.log}")
-    breakdowns, blockdists = parse_log(args.log, cf_filter=args.cf)
-    print(f"  BLOB_GC_BREAKDOWN  records: {len(breakdowns)}")
-    print(f"  BLOB_GC_BLOCK_DIST records: {len(blockdists)}")
-
+    
+    # Parse log file
+    print(f"Parsing log file: {args.log}")
+    if args.cf:
+        print(f"Filtering by column family: {args.cf}")
+    
+    try:
+        breakdowns, blockdists = parse_log(args.log, args.cf)
+    except FileNotFoundError:
+        print(f"Error: Log file not found: {args.log}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error parsing log file: {e}")
+        sys.exit(1)
+    
+    print(f"Found {len(breakdowns)} BREAKDOWN records, {len(blockdists)} BLOCK_DIST records")
+    
     if not breakdowns and not blockdists:
-        print("No GC instrumentation records found. "
-              "Check the log path or CF filter.")
-        return
-
+        print("Error: No GC instrumentation records found in log file")
+        print("Possible reasons:")
+        print("  - GC instrumentation is disabled in TerarkDB")
+        print("  - Column family filter doesn't match any records")
+        print("  - Log file is from a different version of TerarkDB")
+        sys.exit(1)
+    
+    # Print summary statistics
     print_summary(breakdowns, blockdists)
+    
+    # Generate figures
+    print("\nGenerating figures...")
+    plot_bandwidth_pie(breakdowns, args.out)
+    plot_bandwidth_stacked_bars(breakdowns, args.out)
+    plot_block_dist(blockdists, args.out)
+    plot_phase_time(breakdowns, args.out)
+    plot_bandwidth_over_time(breakdowns, args.out)
+    plot_duration_dist(breakdowns, args.out)
+    
+    print(f"\n✓ All figures saved to: {args.out}/")
+    print("  - fig1a_bandwidth_pie.{png,pdf}")
+    print("  - fig1b_bandwidth_stacked_bars.{png,pdf}")
+    print("  - fig2_block_distribution.{png,pdf}")
+    print("  - fig3_phase_latency.{png,pdf}")
+    print("  - fig4_bandwidth_timeline.{png,pdf}")
+    print("  - fig5_duration_distribution.{png,pdf}")
 
-    print("Generating figures...")
-    plot_bandwidth_breakdown(breakdowns, args.out)   # Fig 1
-    plot_block_dist(blockdists,          args.out)   # Fig 2
-    plot_phase_time(breakdowns,          args.out)   # Fig 3
-    plot_bandwidth_over_time(breakdowns, args.out)   # Fig 4
-    plot_duration_dist(breakdowns,       args.out)   # Fig 5
-    plot_skippability_by_job(blockdists, args.out)   # Fig 6 (bonus)
-
-    print(f"\nDone — figures saved to: {args.out}/\n")
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
