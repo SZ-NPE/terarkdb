@@ -3,7 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#include "util/blob_chunk_bitmap.h"
+#include "util/blob_block_bitmap.h"
 
 #include <algorithm>
 #include <cstring>
@@ -37,8 +37,8 @@ inline uint8_t PopcountByte(uint8_t v) {
 
 }  // namespace
 
-void BlobChunkBitmap::EnsureCapacity(uint64_t chunk_id) {
-  uint64_t required_bits = chunk_id + 1;
+void BlobBlockBitmap::EnsureCapacity(uint64_t block_id) {
+  uint64_t required_bits = block_id + 1;
   if (required_bits <= num_bits_) {
     return;
   }
@@ -49,21 +49,21 @@ void BlobChunkBitmap::EnsureCapacity(uint64_t chunk_id) {
   num_bits_ = required_bits;
 }
 
-void BlobChunkBitmap::Set(uint64_t chunk_id) {
-  EnsureCapacity(chunk_id);
-  bits_[static_cast<size_t>(chunk_id >> 3)] |=
-      static_cast<uint8_t>(1u << (chunk_id & 7));
+void BlobBlockBitmap::Set(uint64_t block_id) {
+  EnsureCapacity(block_id);
+  bits_[static_cast<size_t>(block_id >> 3)] |=
+      static_cast<uint8_t>(1u << (block_id & 7));
 }
 
-bool BlobChunkBitmap::Test(uint64_t chunk_id) const {
-  if (chunk_id >= num_bits_) {
+bool BlobBlockBitmap::Test(uint64_t block_id) const {
+  if (block_id >= num_bits_) {
     return false;
   }
-  return (bits_[static_cast<size_t>(chunk_id >> 3)] &
-          static_cast<uint8_t>(1u << (chunk_id & 7))) != 0;
+  return (bits_[static_cast<size_t>(block_id >> 3)] &
+          static_cast<uint8_t>(1u << (block_id & 7))) != 0;
 }
 
-void BlobChunkBitmap::OrWith(const BlobChunkBitmap& other) {
+void BlobBlockBitmap::OrWith(const BlobBlockBitmap& other) {
   if (other.num_bits_ == 0) {
     return;
   }
@@ -80,7 +80,7 @@ void BlobChunkBitmap::OrWith(const BlobChunkBitmap& other) {
   }
 }
 
-uint64_t BlobChunkBitmap::CountSetBits() const {
+uint64_t BlobBlockBitmap::CountSetBits() const {
   uint64_t total = 0;
   const size_t n = BytesForBits(num_bits_);
   const size_t limit = std::min(n, bits_.size());
@@ -92,14 +92,13 @@ uint64_t BlobChunkBitmap::CountSetBits() const {
   const uint64_t tail = num_bits_ & 7;
   if (tail != 0 && limit > 0) {
     const uint8_t last = bits_[limit - 1];
-    const uint8_t mask =
-        static_cast<uint8_t>((1u << tail) - 1);
+    const uint8_t mask = static_cast<uint8_t>((1u << tail) - 1);
     total -= PopcountByte(static_cast<uint8_t>(last & ~mask));
   }
   return total;
 }
 
-void BlobChunkBitmap::Serialize(std::string* dst) const {
+void BlobBlockBitmap::Serialize(std::string* dst) const {
   PutVarint64(dst, num_bits_);
   const size_t n = BytesForBits(num_bits_);
   if (n == 0) {
@@ -112,7 +111,7 @@ void BlobChunkBitmap::Serialize(std::string* dst) const {
   }
 }
 
-bool BlobChunkBitmap::Deserialize(Slice* input) {
+bool BlobBlockBitmap::Deserialize(Slice* input) {
   if (input == nullptr) {
     return false;
   }
@@ -128,6 +127,47 @@ bool BlobChunkBitmap::Deserialize(Slice* input) {
                reinterpret_cast<const uint8_t*>(input->data()) + n);
   num_bits_ = num_bits;
   input->remove_prefix(n);
+  return true;
+}
+
+namespace {
+// flags bit layout for DependenceBlockBitmap.
+constexpr uint8_t kDepRowAvailableBit = 0x1;
+}  // namespace
+
+void DependenceBlockBitmap::Serialize(std::string* dst) const {
+  uint8_t flags = 0;
+  if (available) {
+    flags |= kDepRowAvailableBit;
+  }
+  dst->push_back(static_cast<char>(flags));
+  PutFixed64(dst, layout_id);
+  bitmap.Serialize(dst);
+}
+
+bool DependenceBlockBitmap::Deserialize(Slice* input) {
+  // Default to the safe unavailable state; on any error the row stays
+  // unavailable so GC falls back.
+  available = false;
+  layout_id = kNoBlockLayoutId;
+  bitmap.Clear();
+
+  if (input == nullptr || input->size() < 1 + sizeof(uint64_t)) {
+    return false;
+  }
+  const uint8_t flags = static_cast<uint8_t>((*input)[0]);
+  input->remove_prefix(1);
+  uint64_t decoded_layout = 0;
+  if (!GetFixed64(input, &decoded_layout)) {
+    return false;
+  }
+  BlobBlockBitmap decoded_bitmap;
+  if (!decoded_bitmap.Deserialize(input)) {
+    return false;
+  }
+  available = (flags & kDepRowAvailableBit) != 0;
+  layout_id = decoded_layout;
+  bitmap = std::move(decoded_bitmap);
   return true;
 }
 

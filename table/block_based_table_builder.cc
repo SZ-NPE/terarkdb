@@ -429,6 +429,11 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
 
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
+  // The entry was just appended to the currently in-progress data
+  // block. Flushed (sealed) blocks have already incremented
+  // r->props.num_data_blocks, so the in-progress block's 0-based
+  // ordinal equals the current num_data_blocks value.
+  last_added_data_block_id_ = r->props.num_data_blocks;
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
@@ -890,20 +895,21 @@ Status BlockBasedTableBuilder::Finish(
     r->props.max_read_amp = prop->max_read_amp;
     r->props.read_amp = prop->read_amp;
     r->props.dependence = prop->dependence;
-    // Phase 5: carry chunk bitmaps from TablePropertyCache (internal
-    // runtime form) into TableProperties (serializable form) so that
-    // the property block can persist them. Preserve the
-    // "bitmap unavailable" regime by leaving the vector empty when
-    // the producer did not populate it.
-    if (!prop->dependence_chunk_bitmaps.empty() &&
-        prop->dependence_chunk_bitmaps.size() == prop->dependence.size()) {
-      r->props.dependence_chunk_bitmaps.clear();
-      r->props.dependence_chunk_bitmaps.reserve(
-          prop->dependence_chunk_bitmaps.size());
-      for (const auto& bm : prop->dependence_chunk_bitmaps) {
+    // Carry block bitmaps from TablePropertyCache (internal runtime
+    // form) into TableProperties (serializable form) so that the
+    // property block can persist them. Each row is a layout-aware
+    // DependenceBlockBitmap serialized to an opaque byte string.
+    // Preserve the "bitmap unavailable" regime by leaving the vector
+    // empty when the producer did not populate it.
+    if (!prop->dependence_block_bitmaps.empty() &&
+        prop->dependence_block_bitmaps.size() == prop->dependence.size()) {
+      r->props.dependence_block_bitmaps.clear();
+      r->props.dependence_block_bitmaps.reserve(
+          prop->dependence_block_bitmaps.size());
+      for (const auto& row : prop->dependence_block_bitmaps) {
         std::string s;
-        bm.Serialize(&s);
-        r->props.dependence_chunk_bitmaps.emplace_back(std::move(s));
+        row.Serialize(&s);
+        r->props.dependence_block_bitmaps.emplace_back(std::move(s));
       }
     }
   }

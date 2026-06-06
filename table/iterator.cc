@@ -142,14 +142,14 @@ LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
   LazyBuffer v =
       separate_helper_->TransToCombined(user_key, pikey.sequence, value_index);
   if (meta != nullptr && value_index.valid()) {
-    // Use the chunk-aware stripping helper so that when the CF opts
-    // into the chunk-aware value-index format, the trailing
-    // [varint64(chunk_id) || magic] bytes are not leaked to the
-    // caller as if they were part of the user-extracted meta. For
+    // Use the block-aware stripping helper so that when the CF opts
+    // into the block-aware value-index format, the trailing
+    // [varint64(block_id) || version || magic] bytes are not leaked to
+    // the caller as if they were part of the user-extracted meta. For
     // legacy value-indices this behaves identically to
     // DecodeValueMeta().
     auto meta_slice =
-        SeparateHelper::DecodeValueMetaStripChunk(value_index.slice());
+        SeparateHelper::DecodeValueMetaStripBlockId(value_index.slice());
     meta->assign(meta_slice.data(), meta_slice.size());
   }
   return v;

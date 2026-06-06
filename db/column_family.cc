@@ -408,6 +408,24 @@ void SuperVersionUnrefHandle(void* ptr) {
   // SuperVersionUnrefHandle is called with locked ThreadLocalPtr mutex.
   assert(!was_last_ref);
 }
+
+HotnessTracker::Options MakeHotnessTrackerOptions(
+    const ColumnFamilyOptions& cf_options) {
+  HotnessTracker::Options options;
+  options.window_capacity = cf_options.hotness_window_capacity;
+  options.enable_write_window = cf_options.hotness_enable_write_window;
+  options.enable_compaction_feedback =
+      cf_options.hotness_enable_compaction_feedback;
+  options.sketch_width = cf_options.hotness_sketch_width;
+  options.sketch_depth = cf_options.hotness_sketch_depth;
+  options.write_repeat_weight = cf_options.hotness_write_repeat_weight;
+  options.compaction_feedback_weight =
+      cf_options.hotness_compaction_feedback_weight;
+  options.threshold = cf_options.hotness_threshold;
+  options.decay_interval = cf_options.hotness_decay_interval;
+  options.half_life_writes = cf_options.hotness_half_life_writes;
+  return options;
+}
 }  // anonymous namespace
 
 ColumnFamilyData::ColumnFamilyData(
@@ -449,8 +467,7 @@ ColumnFamilyData::ColumnFamilyData(
       last_memtable_id_(0),
       hotness_tracker_(cf_options.enable_hotness_tracker
                            ? std::make_shared<HotnessTracker>(
-                                 cf_options.hotness_window_capacity,
-                                 cf_options.hotness_hot_capacity)
+                                 MakeHotnessTrackerOptions(cf_options))
                            : nullptr) {
   Ref();
 

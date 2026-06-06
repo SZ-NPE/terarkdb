@@ -265,57 +265,47 @@ enum Tickers : uint32_t {
   GC_WHOLE_FILE_DELETE_BYTES,
   GC_REWRITE_BLOB_BYTES,
 
-  // GC_BITMAP_FAST_PATH_COUNT    - # records skipped by the aggregated
-  //                                live-chunk bitmap (entirely-dead blob
-  //                                short-circuit), never issued a GetKey().
-  // GC_BITMAP_FALLBACK_COUNT     - # blobs GC processed under legacy /
-  //                                bitmap-unavailable regime (one tick
-  //                                per distinct blob handled, matching
-  //                                `counter.bitmap_fallback_blobs`).
-  // GC_SKIPPED_DEAD_CHUNK_BYTES  - bytes of record payload (value_size)
-  //                                skipped thanks to the fast-path gate.
-  // GC_READ_LIVE_CHUNK_BYTES     - bytes of record payload GC actually
-  //                                walked (the classic per-record path,
-  //                                regardless of live/dead verdict).
-  // GC_LOOKUP_AVOIDED_COUNT      - # point-lookups (`GetKey()`) that were
-  //                                skipped by the bitmap fast path. Today
-  //                                equals GC_BITMAP_FAST_PATH_COUNT, but
-  //                                kept as a distinct ticker so future
-  //                                per-chunk fast paths can contribute.
-  GC_BITMAP_FAST_PATH_COUNT,
-  GC_BITMAP_FALLBACK_COUNT,
-  GC_SKIPPED_DEAD_CHUNK_BYTES,
-  GC_READ_LIVE_CHUNK_BYTES,
-  GC_LOOKUP_AVOIDED_COUNT,
+  // GC_BLOCK_BITMAP_FAST_PATH_SKIPS  - # records skipped by the
+  //                                    aggregated live-block bitmap fast
+  //                                    path (block dead), never issued a
+  //                                    GetKey().
+  // GC_BLOCK_BITMAP_FALLBACK_GETKEY  - # records GC processed under
+  //                                    legacy / bitmap-unavailable /
+  //                                    block-id-unavailable regime
+  //                                    (i.e. had to issue a GetKey()).
+  // GC_BLOCK_BITMAP_SKIPPED_RECORDS  - # records skipped thanks to a
+  //                                    dead-block verdict (same event as
+  //                                    FAST_PATH_SKIPS, kept distinct for
+  //                                    forward compatibility).
+  // GC_BLOCK_BITMAP_SKIPPED_BYTES    - bytes of record payload skipped
+  //                                    thanks to the fast-path gate.
+  // GC_BLOCK_BITMAP_LIVE_BLOCKS      - # data blocks judged live by the
+  //                                    aggregated bitmap during GC.
+  // GC_BLOCK_BITMAP_DEAD_BLOCKS      - # data blocks judged dead by the
+  //                                    aggregated bitmap during GC.
+  // GC_BLOCK_BITMAP_BLOCK_SKIP_BYTES - bytes of vSST data block reads
+  //                                    avoided by iterator-level physical
+  //                                    block skip (phase 2 / optional).
+  GC_BLOCK_BITMAP_FAST_PATH_SKIPS,
+  GC_BLOCK_BITMAP_FALLBACK_GETKEY,
+  GC_BLOCK_BITMAP_SKIPPED_RECORDS,
+  GC_BLOCK_BITMAP_SKIPPED_BYTES,
+  GC_BLOCK_BITMAP_LIVE_BLOCKS,
+  GC_BLOCK_BITMAP_DEAD_BLOCKS,
+  GC_BLOCK_BITMAP_BLOCK_SKIP_BYTES,
 
-  // Phase 6 observability: per-Version live-chunk aggregation.
-  // BLOB_CHUNK_AGGREGATE_RUNS       - # times Version::PrepareApply()
-  //                                   actually invoked
-  //                                   AggregateBlobLiveChunkBitmaps().
-  // BLOB_CHUNK_AGGREGATE_BLOBS      - cumulative # of blobs whose live
-  //                                   view was produced (aware or not).
-  // BLOB_CHUNK_AGGREGATE_UNAVAILABLE_BLOBS
-  //                                 - cumulative # of blobs whose
-  //                                   `bitmap_available` was sticky-
-  //                                   cleared during aggregation (mixed
-  //                                   legacy SST / empty bitmap).
-  // BLOB_CHUNK_AGGREGATE_SKIPPED_DISABLED
-  //                                 - # PrepareApply() calls that
-  //                                   skipped aggregation because the
-  //                                   CF option is off
-  //                                   (enable_blob_validity_bitmap=false
-  //                                   or blob_gc_chunk_size==0).
-  // GC_BITMAP_UNAGGREGATED_FALLBACK - # distinct blobs GC had to
-  //                                   fall back on because the current
-  //                                   Version never produced a live
-  //                                   view (nullptr lookup). Useful to
-  //                                   distinguish "Phase 6 not wired"
-  //                                   from "sticky-cleared by legacy".
-  BLOB_CHUNK_AGGREGATE_RUNS,
-  BLOB_CHUNK_AGGREGATE_BLOBS,
-  BLOB_CHUNK_AGGREGATE_UNAVAILABLE_BLOBS,
-  BLOB_CHUNK_AGGREGATE_SKIPPED_DISABLED,
-  GC_BITMAP_UNAGGREGATED_FALLBACK,
+  // Per-Version live-block aggregation observability.
+  // BLOB_BLOCK_BITMAP_AGGREGATE_RUNS    - # times Version::PrepareApply()
+  //                                       actually invoked
+  //                                       AggregateBlobLiveBlockBitmaps().
+  // BLOB_BLOCK_BITMAP_AGGREGATE_BLOBS   - cumulative # of blobs whose
+  //                                       live view was produced.
+  // BLOB_BLOCK_BITMAP_UNAVAILABLE_BLOBS - cumulative # of blobs whose
+  //                                       `bitmap_available` was sticky-
+  //                                       cleared during aggregation.
+  BLOB_BLOCK_BITMAP_AGGREGATE_RUNS,
+  BLOB_BLOCK_BITMAP_AGGREGATE_BLOBS,
+  BLOB_BLOCK_BITMAP_UNAVAILABLE_BLOBS,
 
   TICKER_ENUM_MAX
 };

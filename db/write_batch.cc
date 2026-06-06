@@ -1225,7 +1225,7 @@ class MemTableInserter : public WriteBatch::Handler {
       } else {
         auto cfd = cf_mems_->current();
         if (recovering_log_number_ == 0 && cfd && cfd->hotness_tracker()) {
-          cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
+          cfd->hotness_tracker()->RecordWrite(key);
         }
       }
     } else if (moptions->inplace_callback == nullptr) {
@@ -1233,7 +1233,7 @@ class MemTableInserter : public WriteBatch::Handler {
       mem->Update(sequence_, key, value);
       auto cfd = cf_mems_->current();
       if (cfd && cfd->hotness_tracker()) {
-        cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
+        cfd->hotness_tracker()->RecordWrite(key);
       }
     } else {
       assert(!concurrent_memtable_writes_);
@@ -1274,7 +1274,7 @@ class MemTableInserter : public WriteBatch::Handler {
           RecordTick(moptions->statistics, NUMBER_KEYS_WRITTEN);
           auto cfd = cf_mems_->current();
           if (cfd && cfd->hotness_tracker()) {
-            cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
+            cfd->hotness_tracker()->RecordWrite(key);
           }
         } else if (status == UpdateStatus::UPDATED) {
           // merged_value contains the final value.
@@ -1284,7 +1284,7 @@ class MemTableInserter : public WriteBatch::Handler {
           RecordTick(moptions->statistics, NUMBER_KEYS_WRITTEN);
           auto cfd = cf_mems_->current();
           if (cfd && cfd->hotness_tracker()) {
-            cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
+            cfd->hotness_tracker()->RecordWrite(key);
           }
         }
       }
@@ -1324,7 +1324,7 @@ class MemTableInserter : public WriteBatch::Handler {
     } else {
       auto cfd = cf_mems_->current();
       if (recovering_log_number_ == 0 && cfd && cfd->hotness_tracker()) {
-        cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
+        cfd->hotness_tracker()->RecordWrite(key);
       }
     }
     MaybeAdvanceSeq();
@@ -1550,7 +1550,7 @@ class MemTableInserter : public WriteBatch::Handler {
           } else {
             auto cfd = cf_mems_->current();
             if (recovering_log_number_ == 0 && cfd && cfd->hotness_tracker()) {
-              cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
+              cfd->hotness_tracker()->RecordWrite(key);
             }
           }
         } else {
@@ -1570,7 +1570,7 @@ class MemTableInserter : public WriteBatch::Handler {
       } else {
         auto cfd = cf_mems_->current();
         if (cfd && cfd->hotness_tracker()) {
-          cfd->hotness_tracker()->RecordHotness(key, HotnessTracker::Hash(key));
+          cfd->hotness_tracker()->RecordWrite(key);
         }
       }
     }

@@ -19,6 +19,7 @@
 #include "rocksdb/terark_namespace.h"
 #include "table/iterator_wrapper.h"
 #include "util/chash_set.h"
+#include "util/hotness_tracker.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -78,7 +79,8 @@ class CompactionIterator {
                      const CompactionFilter* compaction_filter = nullptr,
                      const std::atomic<bool>* shutting_down = nullptr,
                      const SequenceNumber preserve_deletes_seqnum = 0,
-                     const chash_set<uint64_t>* b = nullptr);
+                     const chash_set<uint64_t>* b = nullptr,
+                     HotnessTracker* hotness_tracker = nullptr);
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(InternalIterator* input, SeparateHelper* separate_helper,
@@ -94,7 +96,8 @@ class CompactionIterator {
                      const CompactionFilter* compaction_filter = nullptr,
                      const std::atomic<bool>* shutting_down = nullptr,
                      const SequenceNumber preserve_deletes_seqnum = 0,
-                     const chash_set<uint64_t>* b = nullptr);
+                     const chash_set<uint64_t>* b = nullptr,
+                     HotnessTracker* hotness_tracker = nullptr);
 
   ~CompactionIterator();
 
@@ -228,6 +231,11 @@ class CompactionIterator {
   size_t filter_sample_interval_ = 64;
   size_t filter_hit_count_ = 0;
   const chash_set<uint64_t>* rebuild_blob_set_;
+
+  // Optional hotness tracker. When set, compaction reports obsolete versions
+  // that it confirms are dead so that overwrite-heavy keys are routed to the
+  // hot vSST on the next flush. This never affects compaction output.
+  HotnessTracker* hotness_tracker_;
 
  public:
   bool IsShuttingDown() {

@@ -117,7 +117,8 @@ CompactionIterator::CompactionIterator(
     BlobConfig blob_config, const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
-    const chash_set<uint64_t>* need_rebuild_blobs)
+    const chash_set<uint64_t>* need_rebuild_blobs,
+    HotnessTracker* hotness_tracker)
     : CompactionIterator(
           input, separate_helper, end, cmp, merge_helper, last_sequence,
           snapshots, earliest_write_conflict_snapshot, snapshot_checker, env,
@@ -125,7 +126,7 @@ CompactionIterator::CompactionIterator(
           std::unique_ptr<CompactionProxy>(
               compaction ? new CompactionProxy(compaction) : nullptr),
           blob_config, compaction_filter, shutting_down,
-          preserve_deletes_seqnum, need_rebuild_blobs) {}
+          preserve_deletes_seqnum, need_rebuild_blobs, hotness_tracker) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, SeparateHelper* separate_helper, const Slice* end,
@@ -139,7 +140,8 @@ CompactionIterator::CompactionIterator(
     const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
-    const chash_set<uint64_t>* need_rebuild_blobs)
+    const chash_set<uint64_t>* need_rebuild_blobs,
+    HotnessTracker* hotness_tracker)
     : input_(input, separate_helper),
       end_(end),
       cmp_(cmp),
@@ -162,7 +164,8 @@ CompactionIterator::CompactionIterator(
       current_user_key_snapshot_(0),
       merge_out_iter_(merge_helper_),
       current_key_committed_(false),
-      rebuild_blob_set_(need_rebuild_blobs) {
+      rebuild_blob_set_(need_rebuild_blobs),
+      hotness_tracker_(hotness_tracker) {
   assert(compaction_filter_ == nullptr || compaction_ != nullptr);
   bottommost_level_ =
       compaction_ == nullptr ? false : compaction_->bottommost_level();
@@ -607,6 +610,13 @@ void CompactionIterator::NextFromInput() {
       // in this snapshot.
       assert(last_sequence >= current_user_key_sequence_);
       ++iter_stats_.num_record_drop_hidden;  // (A)
+      // This old version is confirmed dead: it is hidden by a newer version of
+      // the same user key. Report it as overwrite feedback so the hotness
+      // tracker can route this overwrite-heavy key to the hot vSST on the next
+      // flush. This is purely advisory and does not alter compaction output.
+      if (hotness_tracker_ != nullptr) {
+        hotness_tracker_->RecordCompactionFeedback(ikey_.user_key);
+      }
       value_.reset();
       input_->Next();
     } else if (compaction_ != nullptr && ikey_.type == kTypeDeletion &&

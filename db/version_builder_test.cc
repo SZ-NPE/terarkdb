@@ -10,7 +10,7 @@
 #include "db/version_edit.h"
 #include "db/version_set.h"
 #include "rocksdb/terark_namespace.h"
-#include "util/blob_chunk_bitmap.h"
+#include "util/blob_block_bitmap.h"
 #include "util/logging.h"
 #include "util/string_util.h"
 #include "util/testharness.h"
@@ -145,14 +145,15 @@ TablePropertyCache GetPropCacheWithBytes(
 }
 
 // build a TablePropertyCache that has both `dependence` and an
-// aligned `dependence_chunk_bitmaps` vector. Each entry is
-// (blob_file_number, set_chunk_ids). At least one chunk_id must be
-// supplied per row to keep the bitmap non-empty, because an empty
-// BlobChunkBitmap is the explicit "bitmap unavailable" sentinel that
-// AggregateBlobLiveChunkBitmaps treats as legacy. Tests wanting that
-// legacy regime should use GetPropCacheChunkBitmapLegacy() or
-// GetPropCacheChunkBitmapWithUnavailableRow() instead.
-TablePropertyCache GetPropCacheWithChunkBitmaps(
+// aligned `dependence_block_bitmaps` vector. Each entry is
+// (blob_file_number, set_block_ids). Every row is marked available with
+// its layout_id stamped to the referenced blob file number, which is
+// what the aggregator requires in order to trust the row (the blob's
+// current physical file number equals its own file number at level -1).
+// Tests wanting the legacy / unavailable regime should use
+// GetPropCacheBlockBitmapLegacy() or
+// GetPropCacheBlockBitmapWithUnavailableRow() instead.
+TablePropertyCache GetPropCacheWithBlockBitmaps(
     uint8_t purpose,
     std::initializer_list<
         std::pair<uint64_t, std::vector<uint64_t>>> dep_list) {
@@ -160,33 +161,56 @@ TablePropertyCache GetPropCacheWithChunkBitmaps(
   ret.purpose = purpose;
   for (auto& kv : dep_list) {
     ret.dependence.emplace_back(Dependence{kv.first, 1, 0});
-    BlobChunkBitmap bm;
-    assert(!kv.second.empty());
-    for (uint64_t cid : kv.second) bm.Set(cid);
-    ret.dependence_chunk_bitmaps.emplace_back(std::move(bm));
+    DependenceBlockBitmap row;
+    row.available = true;
+    row.layout_id = kv.first;
+    for (uint64_t bid : kv.second) row.bitmap.Set(bid);
+    ret.dependence_block_bitmaps.emplace_back(std::move(row));
   }
   return ret;
 }
 
-// Phase 6: build a TablePropertyCache with `dependence` populated but
-// `dependence_chunk_bitmaps` omitted. This is the legacy regime and
+// build a TablePropertyCache that references blobs with a block bitmap,
+// but stamps a caller-chosen layout_id on every row. This is used to
+// exercise the aggregator's layout_id guard: when the stamped layout_id
+// does not match the blob's current physical file number, the row must
+// be rejected and the blob's aggregated view becomes unavailable.
+TablePropertyCache GetPropCacheWithBlockBitmapsLayoutId(
+    uint8_t purpose, uint64_t layout_id,
+    std::initializer_list<
+        std::pair<uint64_t, std::vector<uint64_t>>> dep_list) {
+  TablePropertyCache ret;
+  ret.purpose = purpose;
+  for (auto& kv : dep_list) {
+    ret.dependence.emplace_back(Dependence{kv.first, 1, 0});
+    DependenceBlockBitmap row;
+    row.available = true;
+    row.layout_id = layout_id;
+    for (uint64_t bid : kv.second) row.bitmap.Set(bid);
+    ret.dependence_block_bitmaps.emplace_back(std::move(row));
+  }
+  return ret;
+}
+
+// build a TablePropertyCache with `dependence` populated but
+// `dependence_block_bitmaps` omitted. This is the legacy regime and
 // must cause every referenced blob to be marked bitmap_available=false.
-TablePropertyCache GetPropCacheChunkBitmapLegacy(
+TablePropertyCache GetPropCacheBlockBitmapLegacy(
     uint8_t purpose, std::initializer_list<uint64_t> dep_list) {
   TablePropertyCache ret;
   ret.purpose = purpose;
   for (auto fn : dep_list) {
     ret.dependence.emplace_back(Dependence{fn, 1, 0});
   }
-  // Intentionally leave dependence_chunk_bitmaps empty -> legacy.
+  // Intentionally leave dependence_block_bitmaps empty -> legacy.
   return ret;
 }
 
-// Phase 6: build a TablePropertyCache that has `dependence` AND a
+// build a TablePropertyCache that has `dependence` AND a
 // per-row vector where one specific row is the "bitmap unavailable"
-// sentinel (an empty BlobChunkBitmap). All other rows carry the
-// supplied set_chunk_ids.
-TablePropertyCache GetPropCacheChunkBitmapWithUnavailableRow(
+// row (available=false). All other rows carry the supplied
+// set_block_ids and a matching layout_id.
+TablePropertyCache GetPropCacheBlockBitmapWithUnavailableRow(
     uint8_t purpose,
     std::initializer_list<
         std::pair<uint64_t, std::vector<uint64_t>>> dep_list,
@@ -195,12 +219,17 @@ TablePropertyCache GetPropCacheChunkBitmapWithUnavailableRow(
   ret.purpose = purpose;
   for (auto& kv : dep_list) {
     ret.dependence.emplace_back(Dependence{kv.first, 1, 0});
-    BlobChunkBitmap bm;
+    DependenceBlockBitmap row;
     if (kv.first != unavailable_file_number) {
-      for (uint64_t cid : kv.second) bm.Set(cid);
+      row.available = true;
+      row.layout_id = kv.first;
+      for (uint64_t bid : kv.second) row.bitmap.Set(bid);
+    } else {
+      // Unavailable row: GC must fall back for this blob.
+      row.available = false;
+      row.layout_id = kNoBlockLayoutId;
     }
-    // For the unavailable row leave bm empty (sentinel).
-    ret.dependence_chunk_bitmaps.emplace_back(std::move(bm));
+    ret.dependence_block_bitmaps.emplace_back(std::move(row));
   }
   return ret;
 }
@@ -648,25 +677,25 @@ TEST_F(VersionBuilderTest, PreciseGcByteCountFallbackWhenZero) {
   UnrefFilesInVersion(&new_vstorage);
 }
 // a single SST referencing a single blob with a non-empty
-// chunk bitmap must produce a BlobLiveChunkInfo whose
-// live_chunk_bitmap exactly matches the SST's per-row bitmap, with
-// bitmap_available == true and live_chunk_count equal to the number
+// block bitmap must produce a BlobLiveBlockInfo whose
+// live_block_bitmap exactly matches the SST's per-row bitmap, with
+// bitmap_available == true and live_block_count equal to the number
 // of set bits.
-TEST_F(VersionBuilderTest, VersionBuilderAggregatesLiveChunkBitmap) {
-  constexpr uint64_t kChunkSize = 4096;
+TEST_F(VersionBuilderTest, VersionBuilderAggregatesLiveBlockBitmap) {
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1000U;
 
-  // Blob B at hidden level -1 with file_size = 4 chunks worth of bytes.
-  Add(-1, kBlobFn, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  // Blob B at hidden level -1 with file_size = 4 block units worth of bytes.
+  Add(-1, kBlobFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
   VersionEdit version_edit;
-  // SST S references blob B and reports chunks {0, 2} live.
+  // SST S references blob B and reports blocks {0, 2} live.
   version_edit.AddFile(
       2, 2000U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 2}}}));
+      GetPropCacheWithBlockBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 2}}}));
 
   EnvOptions env_options;
   VersionBuilder version_builder(env_options, nullptr, &vstorage_);
@@ -675,42 +704,173 @@ TEST_F(VersionBuilderTest, VersionBuilderAggregatesLiveChunkBitmap) {
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
 
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  const auto* info = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
   ASSERT_NE(nullptr, info);
   ASSERT_TRUE(info->bitmap_available);
-  EXPECT_TRUE(info->live_chunk_bitmap.Test(0));
-  EXPECT_FALSE(info->live_chunk_bitmap.Test(1));
-  EXPECT_TRUE(info->live_chunk_bitmap.Test(2));
-  EXPECT_EQ(2U, info->live_chunk_count);
-  EXPECT_EQ(2U, info->dead_chunk_count);  // total=4 (from file_size)
+  EXPECT_TRUE(info->live_block_bitmap.Test(0));
+  EXPECT_FALSE(info->live_block_bitmap.Test(1));
+  EXPECT_TRUE(info->live_block_bitmap.Test(2));
+  EXPECT_EQ(2U, info->live_block_count);
+  // total_block_count derives from the observed bitmap width (num_bits):
+  // highest set block id is 2 -> 3 tracked blocks.
+  EXPECT_EQ(3U, info->total_block_count);
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
-// Phase 6: when multiple SSTs in the same version reference the same
-// blob with different chunk bitmaps, the aggregated live bitmap must
-// be the union (OR) of all per-SST bitmaps.
-TEST_F(VersionBuilderTest, VersionBuilderOrsBitmapsFromMultipleSsts) {
-  constexpr uint64_t kChunkSize = 4096;
-  constexpr uint64_t kBlobFn = 1100U;
+// When a row's layout_id matches the blob's current physical file
+// number, the aggregated view is available. This is the positive
+// counterpart to the layout-mismatch test below; it pins down that a
+// freshly stamped (layout_id == fd.GetNumber()) row is trusted.
+TEST_F(VersionBuilderTest, VersionBuilderTrustsMatchingLayoutId) {
+  constexpr uint64_t kBlockUnit = 4096;
+  constexpr uint64_t kBlobFn = 1050U;
 
-  Add(-1, kBlobFn, "100", "199", 8 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
   VersionEdit version_edit;
-  // SST S1 (level 1) references blob with chunks {0, 3}.
+  // SST references blob with blocks {0, 2}, layout_id stamped to the
+  // blob's own (current) physical file number.
+  version_edit.AddFile(
+      2, 2050U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
+      200, false,
+      GetPropCacheWithBlockBitmapsLayoutId(
+          0, kBlobFn, {{kBlobFn, std::vector<uint64_t>{0, 2}}}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
+
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
+  ASSERT_NE(nullptr, info);
+  EXPECT_TRUE(info->bitmap_available);
+  EXPECT_TRUE(info->live_block_bitmap.Test(0));
+  EXPECT_TRUE(info->live_block_bitmap.Test(2));
+  EXPECT_EQ(2U, info->live_block_count);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+// When a row's layout_id does NOT match the blob's current physical
+// file number (e.g. a stale value-index that survived a vSST GC
+// rewrite), the aggregator must reject the row and the blob's
+// aggregated view must be unavailable. This is the core safety
+// guarantee that prevents stale block ids from being misused after a
+// layout change.
+TEST_F(VersionBuilderTest, VersionBuilderRejectsStaleLayoutId) {
+  constexpr uint64_t kBlockUnit = 4096;
+  constexpr uint64_t kBlobFn = 1060U;
+  constexpr uint64_t kStaleLayoutId = 99999U;
+
+  Add(-1, kBlobFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
+      100);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  // SST references blob with blocks {0, 2} but stamped with a layout_id
+  // that does not match the blob's current physical file number.
+  version_edit.AddFile(
+      2, 2060U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
+      200, false,
+      GetPropCacheWithBlockBitmapsLayoutId(
+          0, kStaleLayoutId, {{kBlobFn, std::vector<uint64_t>{0, 2}}}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
+
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
+  ASSERT_NE(nullptr, info);
+  EXPECT_FALSE(info->bitmap_available)
+      << "a row with a stale layout_id must not be trusted";
+  EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobFn, 0));
+  EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobFn, 2));
+  EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobFn));
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+// A single legacy/unavailable row must make the blob sticky-unavailable
+// even when another SST in the same version contributes a perfectly
+// valid layout-matched bitmap for the same blob. Availability is
+// monotone: once cleared it can never be resurrected by a later OR.
+TEST_F(VersionBuilderTest, VersionBuilderStickyUnavailableAcrossSsts) {
+  constexpr uint64_t kBlockUnit = 4096;
+  constexpr uint64_t kBlobFn = 1070U;
+
+  Add(-1, kBlobFn, "100", "199", 8 * kBlockUnit, 0, 100, 100, 100, 0, 100,
+      100);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  // SST S1 contributes a valid layout-matched bitmap {0, 3}.
+  version_edit.AddFile(
+      1, 2070U, 0, 500U, GetInternalKey("100"), GetInternalKey("149"), 200,
+      200, false,
+      GetPropCacheWithBlockBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 3}}}));
+  // SST S2 is legacy for the same blob -> must sticky-clear the blob.
+  version_edit.AddFile(2, 2071U, 0, 500U, GetInternalKey("150"),
+                       GetInternalKey("199"), 201, 201, false,
+                       GetPropCacheBlockBitmapLegacy(0, {kBlobFn}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
+
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
+  ASSERT_NE(nullptr, info);
+  EXPECT_FALSE(info->bitmap_available)
+      << "a single legacy row must make the whole blob unavailable";
+  EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobFn, 0));
+  EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobFn, 3));
+  EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobFn));
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+// when multiple SSTs in the same version reference the same
+// blob with different block bitmaps, the aggregated live bitmap must
+// be the union (OR) of all per-SST bitmaps.
+TEST_F(VersionBuilderTest, VersionBuilderOrsBitmapsFromMultipleSsts) {
+  constexpr uint64_t kBlockUnit = 4096;
+  constexpr uint64_t kBlobFn = 1100U;
+
+  Add(-1, kBlobFn, "100", "199", 8 * kBlockUnit, 0, 100, 100, 100, 0, 100,
+      100);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  // SST S1 (level 1) references blob with blocks {0, 3}.
   version_edit.AddFile(
       1, 2100U, 0, 500U, GetInternalKey("100"), GetInternalKey("149"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 3}}}));
-  // SST S2 (level 2) references blob with chunks {3, 5, 7} (overlap on 3).
+      GetPropCacheWithBlockBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 3}}}));
+  // SST S2 (level 2) references blob with blocks {3, 5, 7} (overlap on 3).
   version_edit.AddFile(
       2, 2101U, 0, 500U, GetInternalKey("150"), GetInternalKey("199"), 201,
       201, false,
-      GetPropCacheWithChunkBitmaps(
+      GetPropCacheWithBlockBitmaps(
           0, {{kBlobFn, std::vector<uint64_t>{3, 5, 7}}}));
 
   EnvOptions env_options;
@@ -720,35 +880,34 @@ TEST_F(VersionBuilderTest, VersionBuilderOrsBitmapsFromMultipleSsts) {
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
 
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  const auto* info = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
   ASSERT_NE(nullptr, info);
   ASSERT_TRUE(info->bitmap_available);
   // Expected union: {0, 3, 5, 7}.
-  for (uint64_t cid : {0U, 3U, 5U, 7U}) {
-    EXPECT_TRUE(info->live_chunk_bitmap.Test(cid))
-        << "expected chunk " << cid << " to be live";
+  for (uint64_t bid : {0U, 3U, 5U, 7U}) {
+    EXPECT_TRUE(info->live_block_bitmap.Test(bid))
+        << "expected block " << bid << " to be live";
   }
-  for (uint64_t cid : {1U, 2U, 4U, 6U}) {
-    EXPECT_FALSE(info->live_chunk_bitmap.Test(cid))
-        << "expected chunk " << cid << " to be dead";
+  for (uint64_t bid : {1U, 2U, 4U, 6U}) {
+    EXPECT_FALSE(info->live_block_bitmap.Test(bid))
+        << "expected block " << bid << " to be dead";
   }
-  EXPECT_EQ(4U, info->live_chunk_count);
-  EXPECT_EQ(4U, info->dead_chunk_count);  // total=8
+  EXPECT_EQ(4U, info->live_block_count);
+  // num_bits = highest set block (7) + 1 = 8.
+  EXPECT_EQ(8U, info->total_block_count);
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
-// dead_chunk_ratio / live_chunk_bytes / dead_chunk_bytes must be
-// computed from chunk_size and blob file size, with the byte counts
-// capped at file_size so a partial trailing chunk is not over-counted.
-TEST_F(VersionBuilderTest, VersionBuilderComputesDeadChunkRatio) {
-  constexpr uint64_t kChunkSize = 1000;
+// dead_block_ratio / live_block_bytes / dead_block_bytes must be
+// derived from the blob file size split proportionally by the
+// live/total block ratio (total comes from the observed bitmap width).
+TEST_F(VersionBuilderTest, VersionBuilderComputesDeadBlockRatio) {
   constexpr uint64_t kBlobFn = 1200U;
-  // Blob file size = 3500 bytes -> ceil(3500/1000) = 4 chunks total.
-  // Live chunks {0, 2}: live bytes = min(2*1000, 3500) = 2000.
-  // Dead bytes = 3500 - 2000 = 1500. dead ratio = 1500/3500.
+  // Blob file size = 3500 bytes. Live blocks {0, 2} -> num_bits = 3.
+  // live_bytes = 3500 * 2 / 3 = 2333; dead_bytes = 3500 - 2333 = 1167.
   constexpr uint64_t kBlobFileSize = 3500;
 
   Add(-1, kBlobFn, "100", "199", kBlobFileSize, 0, 100, 100, 100, 0, 100,
@@ -759,7 +918,7 @@ TEST_F(VersionBuilderTest, VersionBuilderComputesDeadChunkRatio) {
   version_edit.AddFile(
       2, 2200U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 2}}}));
+      GetPropCacheWithBlockBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 2}}}));
 
   EnvOptions env_options;
   VersionBuilder version_builder(env_options, nullptr, &vstorage_);
@@ -768,17 +927,19 @@ TEST_F(VersionBuilderTest, VersionBuilderComputesDeadChunkRatio) {
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
 
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  const auto* info = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
   ASSERT_NE(nullptr, info);
   ASSERT_TRUE(info->bitmap_available);
-  EXPECT_EQ(2U, info->live_chunk_count);
-  EXPECT_EQ(2U, info->dead_chunk_count);  // 4 total - 2 live
-  EXPECT_EQ(2000U, info->live_chunk_bytes);
-  EXPECT_EQ(1500U, info->dead_chunk_bytes);
-  EXPECT_NEAR(static_cast<double>(1500) / 3500.0, info->dead_chunk_ratio,
-              1e-9);
+  EXPECT_EQ(2U, info->live_block_count);
+  EXPECT_EQ(3U, info->total_block_count);
+  const uint64_t expect_live_bytes = kBlobFileSize * 2 / 3;  // 2333
+  const uint64_t expect_dead_bytes = kBlobFileSize - expect_live_bytes;
+  EXPECT_EQ(expect_live_bytes, info->live_block_bytes);
+  EXPECT_EQ(expect_dead_bytes, info->dead_block_bytes);
+  EXPECT_NEAR(static_cast<double>(expect_dead_bytes) / kBlobFileSize,
+              info->dead_block_ratio, 1e-9);
 
   UnrefFilesInVersion(&new_vstorage);
 }
@@ -789,24 +950,24 @@ TEST_F(VersionBuilderTest, VersionBuilderComputesDeadChunkRatio) {
 // derived stats must then be zeroed out so callers cannot mistakenly
 // use a partial bitmap.
 TEST_F(VersionBuilderTest, VersionBuilderFallbackWhenAnyReferenceIsLegacy) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1300U;
 
-  Add(-1, kBlobFn, "100", "199", 8 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 8 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
   VersionEdit version_edit;
-  // SST S1 supplies a good chunk bitmap on chunks {0, 1}.
+  // SST S1 supplies a good block bitmap on blocks {0, 1}.
   version_edit.AddFile(
       1, 2300U, 0, 500U, GetInternalKey("100"), GetInternalKey("149"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 1}}}));
+      GetPropCacheWithBlockBitmaps(0, {{kBlobFn, std::vector<uint64_t>{0, 1}}}));
   // SST S2 references the same blob but in the legacy regime
-  // (dependence_chunk_bitmaps omitted).
+  // (dependence_block_bitmaps omitted).
   version_edit.AddFile(
       2, 2301U, 0, 500U, GetInternalKey("150"), GetInternalKey("199"), 201,
-      201, false, GetPropCacheChunkBitmapLegacy(0, {kBlobFn}));
+      201, false, GetPropCacheBlockBitmapLegacy(0, {kBlobFn}));
 
   EnvOptions env_options;
   VersionBuilder version_builder(env_options, nullptr, &vstorage_);
@@ -815,55 +976,46 @@ TEST_F(VersionBuilderTest, VersionBuilderFallbackWhenAnyReferenceIsLegacy) {
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
 
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  const auto* info = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
   ASSERT_NE(nullptr, info);
   EXPECT_FALSE(info->bitmap_available);
-  EXPECT_EQ(0U, info->live_chunk_count);
-  EXPECT_EQ(0U, info->dead_chunk_count);
-  EXPECT_EQ(0U, info->live_chunk_bytes);
-  EXPECT_EQ(0U, info->dead_chunk_bytes);
-  EXPECT_DOUBLE_EQ(0.0, info->dead_chunk_ratio);
+  EXPECT_EQ(0U, info->live_block_count);
+  EXPECT_EQ(0U, info->total_block_count);
+  EXPECT_EQ(0U, info->live_block_bytes);
+  EXPECT_EQ(0U, info->dead_block_bytes);
+  EXPECT_DOUBLE_EQ(0.0, info->dead_block_ratio);
   // Sticky-clear implies the bitmap is empty (no partial OR survives).
-  EXPECT_TRUE(info->live_chunk_bitmap.empty());
-
-  // Same fallback must also fire when one row in an otherwise-bitmap-aware
-  // SST is the explicit "bitmap unavailable" sentinel (empty bitmap).
-  // Build a fresh setup to verify the sentinel path.
-  // (Re-using kBlobFn would require re-creating vstorage_; instead we
-  // also assert that an SST whose row carries an empty BlobChunkBitmap
-  // for this blob would have produced the same result. That path is
-  // exercised by VersionBuilderRecoveryPathRestoresAggregatedState
-  // below via GetPropCacheChunkBitmapWithUnavailableRow.)
+  EXPECT_TRUE(info->live_block_bitmap.empty());
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
 // after a recovery-style rebuild of VersionStorageInfo (which
 // is what happens when VersionSet replays the manifest into a brand
-// new VersionStorageInfo), AggregateBlobLiveChunkBitmaps() must
+// new VersionStorageInfo), AggregateBlobLiveBlockBitmaps() must
 // reproduce the same aggregated state as during a fresh apply, and
 // the per-row "bitmap unavailable" sentinel must continue to mark the
 // affected blob as legacy without poisoning unrelated blobs.
 TEST_F(VersionBuilderTest, VersionBuilderRecoveryPathRestoresAggregatedState) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobA = 1400U;
   constexpr uint64_t kBlobB = 1401U;
 
   // Two blobs at hidden level -1.
-  Add(-1, kBlobA, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0, 100, 100);
-  Add(-1, kBlobB, "200", "299", 4 * kChunkSize, 0, 100, 100, 100, 0, 100, 100);
+  Add(-1, kBlobA, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100, 100);
+  Add(-1, kBlobB, "200", "299", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100, 100);
   UpdateVersionStorageInfo();
 
   VersionEdit version_edit;
-  // SST references both blobs. For blob A it supplies chunks {1}; for blob
+  // SST references both blobs. For blob A it supplies blocks {1}; for blob
   // B it supplies the empty bitmap sentinel -> blob B becomes unavailable
   // while blob A stays available.
   version_edit.AddFile(
       2, 2400U, 0, 500U, GetInternalKey("100"), GetInternalKey("299"), 200,
       200, false,
-      GetPropCacheChunkBitmapWithUnavailableRow(
+      GetPropCacheBlockBitmapWithUnavailableRow(
           0,
           {{kBlobA, std::vector<uint64_t>{1}}, {kBlobB, std::vector<uint64_t>{}}},
           kBlobB));
@@ -875,73 +1027,71 @@ TEST_F(VersionBuilderTest, VersionBuilderRecoveryPathRestoresAggregatedState) {
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
 
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  // First aggregation: blob A available with chunk 1 live; blob B legacy.
+  // First aggregation: blob A available with block 1 live; blob B legacy.
   {
-    const auto* info_a = new_vstorage.GetBlobLiveChunkInfo(kBlobA);
+    const auto* info_a = new_vstorage.GetBlobLiveBlockInfo(kBlobA);
     ASSERT_NE(nullptr, info_a);
     EXPECT_TRUE(info_a->bitmap_available);
-    EXPECT_TRUE(info_a->live_chunk_bitmap.Test(1));
-    EXPECT_EQ(1U, info_a->live_chunk_count);
+    EXPECT_TRUE(info_a->live_block_bitmap.Test(1));
+    EXPECT_EQ(1U, info_a->live_block_count);
 
-    const auto* info_b = new_vstorage.GetBlobLiveChunkInfo(kBlobB);
+    const auto* info_b = new_vstorage.GetBlobLiveBlockInfo(kBlobB);
     ASSERT_NE(nullptr, info_b);
     EXPECT_FALSE(info_b->bitmap_available);
-    EXPECT_EQ(0U, info_b->live_chunk_count);
+    EXPECT_EQ(0U, info_b->live_block_count);
   }
 
   // Recovery-style replay: invoke aggregation a second time. It must
   // be idempotent (wipe + recompute) and converge to identical state.
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
   {
-    const auto* info_a = new_vstorage.GetBlobLiveChunkInfo(kBlobA);
+    const auto* info_a = new_vstorage.GetBlobLiveBlockInfo(kBlobA);
     ASSERT_NE(nullptr, info_a);
     EXPECT_TRUE(info_a->bitmap_available);
-    EXPECT_TRUE(info_a->live_chunk_bitmap.Test(1));
-    EXPECT_EQ(1U, info_a->live_chunk_count);
+    EXPECT_TRUE(info_a->live_block_bitmap.Test(1));
+    EXPECT_EQ(1U, info_a->live_block_count);
 
-    const auto* info_b = new_vstorage.GetBlobLiveChunkInfo(kBlobB);
+    const auto* info_b = new_vstorage.GetBlobLiveBlockInfo(kBlobB);
     ASSERT_NE(nullptr, info_b);
     EXPECT_FALSE(info_b->bitmap_available);
-    EXPECT_EQ(0U, info_b->live_chunk_count);
+    EXPECT_EQ(0U, info_b->live_block_count);
   }
 
-  // chunk_size == 0 (feature disabled) must sticky-clear every blob's
-  // bitmap_available regardless of prior state.
-  new_vstorage.AggregateBlobLiveChunkBitmaps(0);
+  // Feature disabled (the CF toggle is off): Version::PrepareApply calls
+  // ClearBlobLiveBlockInfo() so GC consumers consistently observe "bitmap
+  // unavailable" instead of a stale view. After clearing, no blob has an
+  // aggregated entry at all.
+  new_vstorage.ClearBlobLiveBlockInfo();
   {
-    const auto* info_a = new_vstorage.GetBlobLiveChunkInfo(kBlobA);
-    ASSERT_NE(nullptr, info_a);
-    EXPECT_FALSE(info_a->bitmap_available);
-    const auto* info_b = new_vstorage.GetBlobLiveChunkInfo(kBlobB);
-    ASSERT_NE(nullptr, info_b);
-    EXPECT_FALSE(info_b->bitmap_available);
+    EXPECT_EQ(nullptr, new_vstorage.GetBlobLiveBlockInfo(kBlobA));
+    EXPECT_EQ(nullptr, new_vstorage.GetBlobLiveBlockInfo(kBlobB));
   }
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
 // The production GC loop in ProcessGarbageCollection() uses the
-// aggregated live-chunk view from Phase 6 to decide whether the
-// per-record GetKey() point lookup can be skipped. The decision
-// logic is exposed on VersionStorageInfo as two APIs:
-//   - IsChunkLive(blob_fn, chunk_id): three-state (kLive / kDead /
+// aggregated live-block view to decide whether the per-record
+// GetKey() point lookup can be skipped. The decision logic is
+// exposed on VersionStorageInfo as two APIs:
+//   - IsBlockLive(blob_fn, block_id): three-state (kLive / kDead /
 //     kUnknown).
 //   - IsBlobEntirelyDead(blob_fn): blob-level gate used by the GC
 //     loop to short-circuit every record in a blob that has zero
-//     live chunks under the aggregated view.
+//     live blocks under the aggregated view.
 // These UTs validate the decision contract so downstream GC code
 // can rely on it.
 
 // when the aggregated bitmap is available and the queried
-// chunk has at least one SST reference, IsChunkLive must return kLive;
-// IsBlobEntirelyDead must be false because the blob has live chunks.
+// block has at least one SST reference, IsBlockLive must return kLive;
+// IsBlobEntirelyDead must be false because the blob has live blocks.
 TEST_F(VersionBuilderTest, GcUsesBitmapFastPathWhenAvailable) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1500U;
 
-  Add(-1, kBlobFn, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
@@ -949,7 +1099,7 @@ TEST_F(VersionBuilderTest, GcUsesBitmapFastPathWhenAvailable) {
   version_edit.AddFile(
       2, 2500U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(0, {{kBlobFn, std::vector<uint64_t>{1, 3}}}));
+      GetPropCacheWithBlockBitmaps(0, {{kBlobFn, std::vector<uint64_t>{1, 3}}}));
 
   EnvOptions env_options;
   VersionBuilder version_builder(env_options, nullptr, &vstorage_);
@@ -957,35 +1107,35 @@ TEST_F(VersionBuilderTest, GcUsesBitmapFastPathWhenAvailable) {
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  using L = VersionStorageInfo::BlobChunkLiveness;
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobFn, 1));
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobFn, 3));
-  EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobFn, 0));
-  EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobFn, 2));
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobFn, 1));
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobFn, 3));
+  EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobFn, 0));
+  EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobFn, 2));
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobFn));
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
 // when the aggregated bitmap is sticky-cleared because some
-// referencing SST is in legacy regime, IsChunkLive must return
-// kUnknown for every chunk (signalling "fall back to GetKey()") and
+// referencing SST is in legacy regime, IsBlockLive must return
+// kUnknown for every block (signalling "fall back to GetKey()") and
 // IsBlobEntirelyDead must return false (GC must not skip records).
 TEST_F(VersionBuilderTest, GcFallsBackToLookupWhenBitmapUnavailable) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1501U;
 
-  Add(-1, kBlobFn, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
   VersionEdit version_edit;
-  // Legacy regime: dependence_chunk_bitmaps vector omitted.
+  // Legacy regime: dependence_block_bitmaps vector omitted.
   version_edit.AddFile(2, 2501U, 0, 500U, GetInternalKey("100"),
                        GetInternalKey("199"), 200, 200, false,
-                       GetPropCacheChunkBitmapLegacy(0, {kBlobFn}));
+                       GetPropCacheBlockBitmapLegacy(0, {kBlobFn}));
 
   EnvOptions env_options;
   VersionBuilder version_builder(env_options, nullptr, &vstorage_);
@@ -993,58 +1143,58 @@ TEST_F(VersionBuilderTest, GcFallsBackToLookupWhenBitmapUnavailable) {
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  using L = VersionStorageInfo::BlobChunkLiveness;
-  for (uint64_t cid : {0U, 1U, 2U, 3U}) {
-    EXPECT_EQ(L::kUnknown, new_vstorage.IsChunkLive(kBlobFn, cid))
-        << "legacy blob must report kUnknown for chunk " << cid;
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  for (uint64_t bid : {0U, 1U, 2U, 3U}) {
+    EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobFn, bid))
+        << "legacy blob must report kUnknown for block " << bid;
   }
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobFn))
       << "IsBlobEntirelyDead must be false when bitmap is unavailable, so GC "
          "falls back to GetKey() instead of silently dropping records";
 
   // And for an entirely unknown blob (never aggregated / not present
-  // in the version), IsChunkLive must also be kUnknown.
-  EXPECT_EQ(L::kUnknown, new_vstorage.IsChunkLive(999999U, 0));
+  // in the version), IsBlockLive must also be kUnknown.
+  EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(999999U, 0));
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(999999U));
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
-// GC must be able to skip dead chunks wholesale. This test
+// GC must be able to skip dead blocks wholesale. This test
 // locks the decision contract: for a blob whose aggregated bitmap is
-// available, every chunk id that was never OR-ed in by any
+// available, every block id that was never OR-ed in by any
 // referencing SST must be reported as kDead (i.e. the GC loop can
-// skip records belonging to that chunk without a GetKey() lookup),
-// while any chunk id that appears in the aggregated bitmap must be
+// skip records belonging to that block without a GetKey() lookup),
+// while any block id that appears in the aggregated bitmap must be
 // reported as kLive (GC must still validate those). A second blob in
-// the same version whose chunks are all live must not be affected.
-TEST_F(VersionBuilderTest, GcSkipsDeadChunks) {
-  constexpr uint64_t kChunkSize = 4096;
+// the same version whose blocks are all live must not be affected.
+TEST_F(VersionBuilderTest, GcSkipsDeadBlocks) {
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1502U;
   constexpr uint64_t kOtherBlob = 1503U;
 
-  Add(-1, kBlobFn, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
-  Add(-1, kOtherBlob, "200", "299", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kOtherBlob, "200", "299", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
   VersionEdit version_edit;
-  // S1 references kBlobFn and marks only chunk {0} live. Chunks
+  // S1 references kBlobFn and marks only block {0} live. Blocks
   // {1,2,3} become dead -> GC may skip them wholesale.
   version_edit.AddFile(
       2, 2502U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(
+      GetPropCacheWithBlockBitmaps(
           0, {{kBlobFn, std::vector<uint64_t>{0}}}));
-  // S2 references kOtherBlob and marks every chunk live so it must
-  // NOT be collaterally treated as dead by Phase 7's fast path.
+  // S2 references kOtherBlob and marks every block live so it must
+  // NOT be collaterally treated as dead by the fast path.
   version_edit.AddFile(
       2, 2503U, 0, 500U, GetInternalKey("200"), GetInternalKey("299"), 201,
       201, false,
-      GetPropCacheWithChunkBitmaps(
+      GetPropCacheWithBlockBitmaps(
           0, {{kOtherBlob, std::vector<uint64_t>{0, 1, 2, 3}}}));
 
   EnvOptions env_options;
@@ -1053,38 +1203,38 @@ TEST_F(VersionBuilderTest, GcSkipsDeadChunks) {
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  using L = VersionStorageInfo::BlobChunkLiveness;
-  // kBlobFn: chunk 0 is live, chunks 1..3 must be reported kDead so
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  // kBlobFn: block 0 is live, blocks 1..3 must be reported kDead so
   // GC can skip them without touching the LSM.
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobFn, 0));
-  for (uint64_t cid : {1U, 2U, 3U}) {
-    EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobFn, cid))
-        << "dead chunk must be skippable, cid=" << cid;
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobFn, 0));
+  for (uint64_t bid : {1U, 2U, 3U}) {
+    EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobFn, bid))
+        << "dead block must be skippable, bid=" << bid;
   }
-  // At least one chunk is live -> not entirely dead.
+  // At least one block is live -> not entirely dead.
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobFn));
 
-  // kOtherBlob: all chunks live, none must be reported kDead.
-  for (uint64_t cid : {0U, 1U, 2U, 3U}) {
-    EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kOtherBlob, cid))
-        << "live chunk must not be mis-flagged dead, cid=" << cid;
+  // kOtherBlob: all blocks live, none must be reported kDead.
+  for (uint64_t bid : {0U, 1U, 2U, 3U}) {
+    EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kOtherBlob, bid))
+        << "live block must not be mis-flagged dead, bid=" << bid;
   }
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kOtherBlob));
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
-// when a blob mixes live and dead chunks, IsBlobEntirelyDead
+// when a blob mixes live and dead blocks, IsBlobEntirelyDead
 // must be false (GC must not skip the blob wholesale) while
-// IsChunkLive must return kLive for live chunks and kDead for dead
+// IsBlockLive must return kLive for live blocks and kDead for dead
 // ones. This is the common in-production case.
-TEST_F(VersionBuilderTest, GcPreservesCorrectnessForLiveChunks) {
-  constexpr uint64_t kChunkSize = 4096;
+TEST_F(VersionBuilderTest, GcPreservesCorrectnessForLiveBlocks) {
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1504U;
 
-  Add(-1, kBlobFn, "100", "199", 8 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 8 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
@@ -1092,7 +1242,7 @@ TEST_F(VersionBuilderTest, GcPreservesCorrectnessForLiveChunks) {
   version_edit.AddFile(
       2, 2504U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(
+      GetPropCacheWithBlockBitmaps(
           0, {{kBlobFn, std::vector<uint64_t>{2, 5}}}));
 
   EnvOptions env_options;
@@ -1101,17 +1251,20 @@ TEST_F(VersionBuilderTest, GcPreservesCorrectnessForLiveChunks) {
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobFn));
-  using L = VersionStorageInfo::BlobChunkLiveness;
-  // Live chunks.
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobFn, 2));
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobFn, 5));
-  // Dead chunks (GC could drop records in these without a lookup).
-  for (uint64_t cid : {0U, 1U, 3U, 4U, 6U, 7U}) {
-    EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobFn, cid))
-        << "cid=" << cid << " must be kDead";
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  // Live blocks.
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobFn, 2));
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobFn, 5));
+  // Dead blocks (GC could drop records in these without a lookup).
+  // num_bits = highest set block (5) + 1 = 6, so blocks 0,1,3,4 are
+  // tracked-dead; blocks >= 6 are beyond the bitmap width but a query
+  // still resolves to kDead because the bitmap is available.
+  for (uint64_t bid : {0U, 1U, 3U, 4U, 6U, 7U}) {
+    EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobFn, bid))
+        << "bid=" << bid << " must be kDead";
   }
 
   UnrefFilesInVersion(&new_vstorage);
@@ -1122,27 +1275,27 @@ TEST_F(VersionBuilderTest, GcPreservesCorrectnessForLiveChunks) {
 // isolated: the bitmap-aware blob keeps kLive/kDead answers while
 // the legacy blob yields kUnknown and is NOT entirely dead.
 TEST_F(VersionBuilderTest, GcMixedLegacyAndBitmapBlobUsesSafeFallback) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobBitmap = 1600U;
   constexpr uint64_t kBlobLegacy = 1601U;
 
-  Add(-1, kBlobBitmap, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0,
+  Add(-1, kBlobBitmap, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0,
       100, 100);
-  Add(-1, kBlobLegacy, "200", "299", 4 * kChunkSize, 0, 100, 100, 100, 0,
+  Add(-1, kBlobLegacy, "200", "299", 4 * kBlockUnit, 0, 100, 100, 100, 0,
       100, 100);
   UpdateVersionStorageInfo();
 
   VersionEdit version_edit;
-  // SST S1 -> bitmap-aware reference to kBlobBitmap chunks {0, 2}.
+  // SST S1 -> bitmap-aware reference to kBlobBitmap blocks {0, 2}.
   version_edit.AddFile(
       1, 2600U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(
+      GetPropCacheWithBlockBitmaps(
           0, {{kBlobBitmap, std::vector<uint64_t>{0, 2}}}));
   // SST S2 -> legacy reference to kBlobLegacy.
   version_edit.AddFile(2, 2601U, 0, 500U, GetInternalKey("200"),
                        GetInternalKey("299"), 201, 201, false,
-                       GetPropCacheChunkBitmapLegacy(0, {kBlobLegacy}));
+                       GetPropCacheBlockBitmapLegacy(0, {kBlobLegacy}));
 
   EnvOptions env_options;
   VersionBuilder version_builder(env_options, nullptr, &vstorage_);
@@ -1150,22 +1303,22 @@ TEST_F(VersionBuilderTest, GcMixedLegacyAndBitmapBlobUsesSafeFallback) {
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
   version_builder.SaveTo(&new_vstorage, 0);
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  using L = VersionStorageInfo::BlobChunkLiveness;
+  using L = VersionStorageInfo::BlobBlockLiveness;
   // Bitmap-aware blob: crisp kLive / kDead answers, NOT entirely dead.
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobBitmap));
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobBitmap, 0));
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobBitmap, 2));
-  EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobBitmap, 1));
-  EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobBitmap, 3));
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobBitmap, 0));
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobBitmap, 2));
+  EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobBitmap, 1));
+  EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobBitmap, 3));
 
-  // Legacy blob: every chunk kUnknown, NOT entirely dead, GC must
+  // Legacy blob: every block kUnknown, NOT entirely dead, GC must
   // therefore invoke the legacy GetKey() path for its records.
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobLegacy));
-  for (uint64_t cid : {0U, 1U, 2U, 3U}) {
-    EXPECT_EQ(L::kUnknown, new_vstorage.IsChunkLive(kBlobLegacy, cid))
-        << "legacy blob must report kUnknown for chunk " << cid;
+  for (uint64_t bid : {0U, 1U, 2U, 3U}) {
+    EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobLegacy, bid))
+        << "legacy blob must report kUnknown for block " << bid;
   }
 
   UnrefFilesInVersion(&new_vstorage);
@@ -1174,12 +1327,11 @@ TEST_F(VersionBuilderTest, GcMixedLegacyAndBitmapBlobUsesSafeFallback) {
 // -----------------------------------------------------------------
 // recovery & backward-compatibility validation.
 //
-// Phase 4/5 made the per-SST `dependence_chunk_bitmaps` survive a
-// full VersionEdit encode/decode round-trip through the manifest.
-// Phase 6 made the in-version aggregation step
-// (AggregateBlobLiveChunkBitmaps) idempotent so it can be re-run at
-// recovery time without drift. Phase 7 exposed IsChunkLive /
-// IsBlobEntirelyDead as the GC decision contract.
+// The per-SST `dependence_block_bitmaps` survive a full VersionEdit
+// encode/decode round-trip through the manifest. The in-version
+// aggregation step (AggregateBlobLiveBlockBitmaps) is idempotent so
+// it can be re-run at recovery time without drift. IsBlockLive /
+// IsBlobEntirelyDead are the GC decision contract.
 //
 // These UTs lock the end-to-end recovery + compatibility story:
 //   1. OpenCloseRebuildBitmapState — write, simulate close/reopen
@@ -1187,16 +1339,16 @@ TEST_F(VersionBuilderTest, GcMixedLegacyAndBitmapBlobUsesSafeFallback) {
 //      and prove the rebuilt VersionStorageInfo carries the same
 //      bitmap-backed liveness answers as the pre-close one.
 //   2. OpenLegacyManifestFallback — simulate opening a DB against
-//      a manifest produced by pre-Phase-4 code (no chunk bitmaps
+//      a manifest produced by pre-bitmap code (no block bitmaps
 //      at all) and prove the referenced blob cleanly falls back
 //      to kUnknown without crashing or corrupting neighbours.
 //   3. MixedOldAndNewSstCompatibility — mixed legacy + bitmap-aware
 //      SSTs in the same rebuilt version must still produce strictly
 //      isolated liveness answers per blob.
-//   4. FeatureDisabledRestoresOldGcBehavior — chunk_size == 0
-//      (feature turned off in options) must sticky-clear every
+//   4. FeatureDisabledRestoresOldGcBehavior — clearing the
+//      aggregated state (feature turned off) must drop every
 //      aggregated bitmap even if the on-disk manifest still
-//      carries them, so GC degrades to the pre-Phase-0 behavior.
+//      carries them, so GC degrades to the pre-feature behavior.
 // -----------------------------------------------------------------
 
 // Test 1: write -> close/reopen -> bitmap still usable.
@@ -1206,10 +1358,10 @@ TEST_F(VersionBuilderTest, GcMixedLegacyAndBitmapBlobUsesSafeFallback) {
 // VersionBuilder. The post-recovery aggregated view must be
 // byte-for-byte equivalent to the pre-close view.
 TEST_F(VersionBuilderTest, OpenCloseRebuildBitmapState) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1700U;
 
-  Add(-1, kBlobFn, "100", "199", 8 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 8 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
@@ -1217,7 +1369,7 @@ TEST_F(VersionBuilderTest, OpenCloseRebuildBitmapState) {
   version_edit.AddFile(
       2, 2700U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(
+      GetPropCacheWithBlockBitmaps(
           0, {{kBlobFn, std::vector<uint64_t>{1, 4, 7}}}));
 
   // Simulate the on-disk manifest round-trip: encode the edit to
@@ -1228,16 +1380,19 @@ TEST_F(VersionBuilderTest, OpenCloseRebuildBitmapState) {
   VersionEdit recovered_edit;
   ASSERT_OK(recovered_edit.DecodeFrom(manifest_bytes));
 
-  // The recovered edit must carry the exact same chunk bitmap.
+  // The recovered edit must carry the exact same block bitmap.
   ASSERT_EQ(1U, recovered_edit.GetNewFiles().size());
   const auto& recovered_prop =
       recovered_edit.GetNewFiles()[0].second.prop;
   ASSERT_EQ(1U, recovered_prop.dependence.size());
-  ASSERT_EQ(1U, recovered_prop.dependence_chunk_bitmaps.size());
-  EXPECT_EQ(3U, recovered_prop.dependence_chunk_bitmaps[0].CountSetBits());
-  EXPECT_TRUE(recovered_prop.dependence_chunk_bitmaps[0].Test(1));
-  EXPECT_TRUE(recovered_prop.dependence_chunk_bitmaps[0].Test(4));
-  EXPECT_TRUE(recovered_prop.dependence_chunk_bitmaps[0].Test(7));
+  ASSERT_EQ(1U, recovered_prop.dependence_block_bitmaps.size());
+  EXPECT_TRUE(recovered_prop.dependence_block_bitmaps[0].available);
+  EXPECT_EQ(kBlobFn, recovered_prop.dependence_block_bitmaps[0].layout_id);
+  EXPECT_EQ(3U,
+            recovered_prop.dependence_block_bitmaps[0].bitmap.CountSetBits());
+  EXPECT_TRUE(recovered_prop.dependence_block_bitmaps[0].bitmap.Test(1));
+  EXPECT_TRUE(recovered_prop.dependence_block_bitmaps[0].bitmap.Test(4));
+  EXPECT_TRUE(recovered_prop.dependence_block_bitmaps[0].bitmap.Test(7));
 
   // Replay the recovered edit into a brand-new VersionStorageInfo
   // (this is what VersionSet::Recover does).
@@ -1247,58 +1402,59 @@ TEST_F(VersionBuilderTest, OpenCloseRebuildBitmapState) {
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&recovered_edit);
   version_builder.SaveTo(&new_vstorage, 0);
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
   // Post-recovery liveness answers must match the pre-close contract.
-  using L = VersionStorageInfo::BlobChunkLiveness;
-  const auto* info = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
   ASSERT_NE(nullptr, info);
   EXPECT_TRUE(info->bitmap_available);
-  EXPECT_EQ(3U, info->live_chunk_count);
-  EXPECT_EQ(5U, info->dead_chunk_count);
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobFn, 1));
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobFn, 4));
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobFn, 7));
-  for (uint64_t cid : {0U, 2U, 3U, 5U, 6U}) {
-    EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobFn, cid))
-        << "post-recovery dead chunk must remain dead, cid=" << cid;
+  EXPECT_EQ(3U, info->live_block_count);
+  // num_bits = highest set block (7) + 1 = 8 tracked blocks.
+  EXPECT_EQ(8U, info->total_block_count);
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobFn, 1));
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobFn, 4));
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobFn, 7));
+  for (uint64_t bid : {0U, 2U, 3U, 5U, 6U}) {
+    EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobFn, bid))
+        << "post-recovery dead block must remain dead, bid=" << bid;
   }
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobFn));
 
-  // Re-run the aggregation (Phase 6 guarantees idempotence). The
-  // result must be byte-for-byte identical so a subsequent Recover()
-  // call from a crash mid-replay would converge to the same state.
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
-  const auto* info2 = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
+  // Re-run the aggregation (idempotence guarantee). The result must
+  // be byte-for-byte identical so a subsequent Recover() call from a
+  // crash mid-replay would converge to the same state.
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
+  const auto* info2 = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
   ASSERT_NE(nullptr, info2);
   EXPECT_TRUE(info2->bitmap_available);
-  EXPECT_EQ(info->live_chunk_count, info2->live_chunk_count);
-  EXPECT_EQ(info->dead_chunk_count, info2->dead_chunk_count);
-  EXPECT_EQ(info->live_chunk_bytes, info2->live_chunk_bytes);
-  EXPECT_EQ(info->dead_chunk_bytes, info2->dead_chunk_bytes);
+  EXPECT_EQ(info->live_block_count, info2->live_block_count);
+  EXPECT_EQ(info->total_block_count, info2->total_block_count);
+  EXPECT_EQ(info->live_block_bytes, info2->live_block_bytes);
+  EXPECT_EQ(info->dead_block_bytes, info2->dead_block_bytes);
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
 // Test 2: opening a DB whose manifest was produced by
-// pre-Phase-4 code (no chunk bitmap payload at all) must cleanly
+// pre-bitmap code (no block bitmap payload at all) must cleanly
 // auto-fallback: the recovered VersionEdit decodes, the referenced
-// blob ends up with bitmap_available=false, and every IsChunkLive
+// blob ends up with bitmap_available=false, and every IsBlockLive
 // query returns kUnknown so GC reverts to the legacy lookup path.
 TEST_F(VersionBuilderTest, OpenLegacyManifestFallback) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1701U;
 
-  Add(-1, kBlobFn, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
   VersionEdit version_edit;
-  // Legacy regime: dependence_chunk_bitmaps is omitted, mimicking
-  // what a pre-Phase-4 manifest on disk would decode into.
+  // Legacy regime: dependence_block_bitmaps is omitted, mimicking
+  // what a pre-bitmap manifest on disk would decode into.
   version_edit.AddFile(2, 2701U, 0, 500U, GetInternalKey("100"),
                        GetInternalKey("199"), 200, 200, false,
-                       GetPropCacheChunkBitmapLegacy(0, {kBlobFn}));
+                       GetPropCacheBlockBitmapLegacy(0, {kBlobFn}));
 
   std::string manifest_bytes;
   ASSERT_TRUE(version_edit.EncodeTo(&manifest_bytes));
@@ -1306,12 +1462,12 @@ TEST_F(VersionBuilderTest, OpenLegacyManifestFallback) {
   ASSERT_OK(recovered_edit.DecodeFrom(manifest_bytes));
 
   // A legacy manifest must decode with an empty bitmap vector; this
-  // is the sentinel Phase 6 reads as "bitmap unavailable".
+  // is the sentinel the aggregation reads as "bitmap unavailable".
   ASSERT_EQ(1U, recovered_edit.GetNewFiles().size());
   const auto& recovered_prop =
       recovered_edit.GetNewFiles()[0].second.prop;
   ASSERT_EQ(1U, recovered_prop.dependence.size());
-  EXPECT_TRUE(recovered_prop.dependence_chunk_bitmaps.empty());
+  EXPECT_TRUE(recovered_prop.dependence_block_bitmaps.empty());
 
   EnvOptions env_options;
   VersionBuilder version_builder(env_options, nullptr, &vstorage_);
@@ -1319,19 +1475,19 @@ TEST_F(VersionBuilderTest, OpenLegacyManifestFallback) {
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&recovered_edit);
   version_builder.SaveTo(&new_vstorage, 0);
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  const auto* info = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
+  const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
   ASSERT_NE(nullptr, info);
   EXPECT_FALSE(info->bitmap_available);
-  EXPECT_EQ(0U, info->live_chunk_count);
-  EXPECT_EQ(0U, info->dead_chunk_count);
-  EXPECT_TRUE(info->live_chunk_bitmap.empty());
+  EXPECT_EQ(0U, info->live_block_count);
+  EXPECT_EQ(0U, info->total_block_count);
+  EXPECT_TRUE(info->live_block_bitmap.empty());
 
-  using L = VersionStorageInfo::BlobChunkLiveness;
-  for (uint64_t cid : {0U, 1U, 2U, 3U}) {
-    EXPECT_EQ(L::kUnknown, new_vstorage.IsChunkLive(kBlobFn, cid))
-        << "legacy-manifest blob must report kUnknown for chunk " << cid;
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  for (uint64_t bid : {0U, 1U, 2U, 3U}) {
+    EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobFn, bid))
+        << "legacy-manifest blob must report kUnknown for block " << bid;
   }
   // IsBlobEntirelyDead must be false so GC does NOT silently drop
   // records belonging to a legacy blob.
@@ -1341,20 +1497,20 @@ TEST_F(VersionBuilderTest, OpenLegacyManifestFallback) {
 }
 
 // Test 3: a recovered version in which one SST is legacy
-// (pre-Phase-4) and another SST is bitmap-aware (post-Phase-4),
+// (pre-bitmap) and another SST is bitmap-aware (post-bitmap),
 // referencing distinct blobs, must preserve strict isolation across
 // the two blobs. The bitmap-aware blob keeps kLive/kDead answers;
 // the legacy blob cleanly falls back to kUnknown. This mirrors the
 // real-world rollout case where a previously opened DB has some
 // SSTs flushed before the upgrade and some after.
 TEST_F(VersionBuilderTest, MixedOldAndNewSstCompatibility) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobNew = 1702U;
   constexpr uint64_t kBlobOld = 1703U;
 
-  Add(-1, kBlobNew, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobNew, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
-  Add(-1, kBlobOld, "200", "299", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobOld, "200", "299", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
@@ -1363,12 +1519,12 @@ TEST_F(VersionBuilderTest, MixedOldAndNewSstCompatibility) {
   version_edit.AddFile(
       2, 2702U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(
+      GetPropCacheWithBlockBitmaps(
           0, {{kBlobNew, std::vector<uint64_t>{0, 2}}}));
   // Old SST (pre-upgrade, still on disk): legacy regime.
   version_edit.AddFile(2, 2703U, 0, 500U, GetInternalKey("200"),
                        GetInternalKey("299"), 201, 201, false,
-                       GetPropCacheChunkBitmapLegacy(0, {kBlobOld}));
+                       GetPropCacheBlockBitmapLegacy(0, {kBlobOld}));
 
   // Manifest round-trip both edits together: this is what VersionSet
   // sees when replaying a manifest written partially by old code
@@ -1385,61 +1541,61 @@ TEST_F(VersionBuilderTest, MixedOldAndNewSstCompatibility) {
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&recovered_edit);
   version_builder.SaveTo(&new_vstorage, 0);
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
 
-  using L = VersionStorageInfo::BlobChunkLiveness;
+  using L = VersionStorageInfo::BlobBlockLiveness;
 
   // New blob: aggregated bitmap intact, precise answers.
-  const auto* info_new = new_vstorage.GetBlobLiveChunkInfo(kBlobNew);
+  const auto* info_new = new_vstorage.GetBlobLiveBlockInfo(kBlobNew);
   ASSERT_NE(nullptr, info_new);
   EXPECT_TRUE(info_new->bitmap_available);
-  EXPECT_EQ(2U, info_new->live_chunk_count);
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobNew, 0));
-  EXPECT_EQ(L::kLive, new_vstorage.IsChunkLive(kBlobNew, 2));
-  EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobNew, 1));
-  EXPECT_EQ(L::kDead, new_vstorage.IsChunkLive(kBlobNew, 3));
+  EXPECT_EQ(2U, info_new->live_block_count);
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobNew, 0));
+  EXPECT_EQ(L::kLive, new_vstorage.IsBlockLive(kBlobNew, 2));
+  EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobNew, 1));
+  EXPECT_EQ(L::kDead, new_vstorage.IsBlockLive(kBlobNew, 3));
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobNew));
 
   // Old blob: sticky-cleared, legacy fallback.
-  const auto* info_old = new_vstorage.GetBlobLiveChunkInfo(kBlobOld);
+  const auto* info_old = new_vstorage.GetBlobLiveBlockInfo(kBlobOld);
   ASSERT_NE(nullptr, info_old);
   EXPECT_FALSE(info_old->bitmap_available);
-  for (uint64_t cid : {0U, 1U, 2U, 3U}) {
-    EXPECT_EQ(L::kUnknown, new_vstorage.IsChunkLive(kBlobOld, cid))
-        << "old/legacy blob must report kUnknown for chunk " << cid;
+  for (uint64_t bid : {0U, 1U, 2U, 3U}) {
+    EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobOld, bid))
+        << "old/legacy blob must report kUnknown for block " << bid;
   }
   EXPECT_FALSE(new_vstorage.IsBlobEntirelyDead(kBlobOld));
 
-  // Neither blob may leak into the other: a chunk live on kBlobNew
+  // Neither blob may leak into the other: a block live on kBlobNew
   // must not be reflected on kBlobOld, and vice-versa.
-  EXPECT_NE(L::kLive, new_vstorage.IsChunkLive(kBlobOld, 0));
-  EXPECT_NE(L::kUnknown, new_vstorage.IsChunkLive(kBlobNew, 0));
+  EXPECT_NE(L::kLive, new_vstorage.IsBlockLive(kBlobOld, 0));
+  EXPECT_NE(L::kUnknown, new_vstorage.IsBlockLive(kBlobNew, 0));
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
-// Test 4: when the user turns the feature off at runtime
-// (cf_options.blob_gc_chunk_size == 0), the recovered version must
-// behave exactly like pre-Phase-0 code: every aggregated bitmap is
-// unavailable, every IsChunkLive answer is kUnknown, and GC
-// therefore falls back to GetKey() on every record. Crucially, this
-// must hold even if the on-disk manifest still carries per-SST
-// chunk bitmaps from a previous run when the feature WAS enabled --
-// i.e. the option alone is a hard kill switch.
+// Test 4: when the feature is turned off (Version::PrepareApply
+// calls ClearBlobLiveBlockInfo() because the CF toggle is off), the
+// recovered version must behave exactly like pre-feature code: no
+// blob has an aggregated entry, every IsBlockLive answer is
+// kUnknown, and GC therefore falls back to GetKey() on every record.
+// Crucially, this must hold even if the on-disk manifest still
+// carries per-SST block bitmaps from a previous run when the feature
+// WAS enabled -- i.e. clearing alone is a hard kill switch.
 TEST_F(VersionBuilderTest, FeatureDisabledRestoresOldGcBehavior) {
-  constexpr uint64_t kChunkSize = 4096;
+  constexpr uint64_t kBlockUnit = 4096;
   constexpr uint64_t kBlobFn = 1704U;
 
-  Add(-1, kBlobFn, "100", "199", 4 * kChunkSize, 0, 100, 100, 100, 0, 100,
+  Add(-1, kBlobFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
       100);
   UpdateVersionStorageInfo();
 
-  // The on-disk manifest still has a full chunk bitmap for this blob.
+  // The on-disk manifest still has a full block bitmap for this blob.
   VersionEdit version_edit;
   version_edit.AddFile(
       2, 2704U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
       200, false,
-      GetPropCacheWithChunkBitmaps(
+      GetPropCacheWithBlockBitmaps(
           0, {{kBlobFn, std::vector<uint64_t>{0, 1, 2}}}));
 
   std::string manifest_bytes;
@@ -1456,34 +1612,27 @@ TEST_F(VersionBuilderTest, FeatureDisabledRestoresOldGcBehavior) {
 
   // First aggregate with the feature enabled to prove the persisted
   // bitmap is intact and would otherwise drive the fast path.
-  new_vstorage.AggregateBlobLiveChunkBitmaps(kChunkSize);
+  new_vstorage.AggregateBlobLiveBlockBitmaps();
   {
-    const auto* info = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
+    const auto* info = new_vstorage.GetBlobLiveBlockInfo(kBlobFn);
     ASSERT_NE(nullptr, info);
     EXPECT_TRUE(info->bitmap_available);
-    EXPECT_EQ(3U, info->live_chunk_count);
+    EXPECT_EQ(3U, info->live_block_count);
   }
 
-  // Now simulate the user flipping blob_gc_chunk_size back to 0 at
-  // runtime (the hard kill switch). Re-aggregate under the disabled
-  // regime: sticky-clear must fire on every blob regardless of what
-  // the manifest carries.
-  new_vstorage.AggregateBlobLiveChunkBitmaps(0);
+  // Now simulate the user turning the feature off at runtime (the
+  // hard kill switch). ClearBlobLiveBlockInfo() must drop every
+  // aggregated entry regardless of what the manifest carries.
+  new_vstorage.ClearBlobLiveBlockInfo();
 
-  const auto* info = new_vstorage.GetBlobLiveChunkInfo(kBlobFn);
-  ASSERT_NE(nullptr, info);
-  EXPECT_FALSE(info->bitmap_available);
-  EXPECT_EQ(0U, info->live_chunk_count);
-  EXPECT_EQ(0U, info->dead_chunk_count);
-  EXPECT_EQ(0U, info->live_chunk_bytes);
-  EXPECT_EQ(0U, info->dead_chunk_bytes);
-  EXPECT_TRUE(info->live_chunk_bitmap.empty());
+  // After clearing, no blob has an aggregated entry at all.
+  EXPECT_EQ(nullptr, new_vstorage.GetBlobLiveBlockInfo(kBlobFn));
 
-  using L = VersionStorageInfo::BlobChunkLiveness;
-  // Every chunk query must report kUnknown -> GC degrades to GetKey().
-  for (uint64_t cid : {0U, 1U, 2U, 3U}) {
-    EXPECT_EQ(L::kUnknown, new_vstorage.IsChunkLive(kBlobFn, cid))
-        << "feature-disabled mode must report kUnknown for chunk " << cid;
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  // Every block query must report kUnknown -> GC degrades to GetKey().
+  for (uint64_t bid : {0U, 1U, 2U, 3U}) {
+    EXPECT_EQ(L::kUnknown, new_vstorage.IsBlockLive(kBlobFn, bid))
+        << "feature-disabled mode must report kUnknown for block " << bid;
   }
   // Crucially NOT entirely-dead: GC must still walk the blob's
   // records through the legacy path rather than dropping them.

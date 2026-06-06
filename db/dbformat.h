@@ -794,16 +794,32 @@ class SeparateHelper {
   // Legacy layout (backward compatible):
   //   [ file_number(8B, LE) ] [ meta(M bytes, optional) ]
   //
-  // chunk-aware layout (opt-in, append-only trailer):
+  // block-aware layout (opt-in, fixed-length trailer):
   //   [ file_number(8B, LE) ] [ meta(M bytes, optional) ]
-  //   [ chunk_id(varint64) ]  [ kChunkIdTrailerMagic(1B) ]
+  //   [ block_id(fixed64) ] [ layout_id(fixed64) ]
+  //   [ version(1B) ] [ kBlockIdTrailerMagic(1B) ]
+  //
+  // The trailer is exactly kBlockIdTrailerLength (18) bytes. There is
+  // NO backwards varint scan: validity is decided purely by the fixed
+  // size + magic + version + non-sentinel checks. This eliminates the
+  // ambiguity of the previous reverse-varint-scan scheme.
+  //
+  // `block_id`   : the BlockBasedTable data block ordinal the value was
+  //                written into, *within the vSST layout identified by
+  //                layout_id*.
+  // `layout_id`  : the physical vSST file number the block_id is bound
+  //                to (i.e. blob_meta->fd.GetNumber() at write time).
+  //                A reader must reject a block_id whose layout_id does
+  //                not match the current physical vSST file, because a
+  //                vSST GC rewrite produces a brand-new layout and the
+  //                old block_id no longer addresses the same bytes.
   //
   // Contract:
   //  - EncodeFileNumber / DecodeFileNumber / DecodeValueMeta behave
   //    identically for both layouts (they operate on the head only).
-  //  - HasChunkId / DecodeChunkId are the only readers that must know
-  //    about the new layout. Any slice that does not match the new
-  //    layout is transparently treated as legacy.
+  //  - HasBlockId / DecodeBlockId / DecodeBlockLayoutId are the only
+  //    readers that must know about the new layout. Any slice that does
+  //    not match the new layout is transparently treated as legacy.
   //  - Writers only emit the trailer when the feature switch is on;
   //    readers that are unaware of the trailer will see a safe legacy
   //    view through DecodeValueMeta, because the trailer bytes are
@@ -811,16 +827,29 @@ class SeparateHelper {
   //    inspect the tail (they parse meta by a user-owned length).
   // ---------------------------------------------------------------
 
-  // Sentinel value for DecodeChunkId on slices that do not carry a
-  // chunk-id trailer. Callers in the GC path treat this as
-  // "bitmap unavailable" and fall back to the legacy scan/lookup path.
-  static constexpr uint64_t kNoChunkId = static_cast<uint64_t>(-1);
+  // Sentinel value for DecodeBlockId on slices that do not carry a
+  // block-id trailer. Callers in the GC path treat this as
+  // "block id unavailable" and fall back to the legacy scan/lookup path.
+  static constexpr uint64_t kNoBlockId = static_cast<uint64_t>(-1);
 
-  // Magic byte appended at the very tail of a chunk-aware value index.
+  // Sentinel value for DecodeBlockLayoutId. Same meaning: "no layout id
+  // available", treat the index as legacy.
+  static constexpr uint64_t kNoBlockLayoutId = static_cast<uint64_t>(-1);
+
+  // Magic byte appended at the very tail of a block-aware value index.
   // Chosen as an UTF-8 invalid leading byte to minimize accidental
   // collision with extractor-produced meta tails. Format correctness
-  // is still finally arbitrated at the SST-property / manifest layer.
-  static constexpr uint8_t kChunkIdTrailerMagic = 0xC1;
+  // is still finally arbitrated by the fixed length + version checks.
+  static constexpr uint8_t kBlockIdTrailerMagic = 0xC1;
+
+  // Trailer format version. Readers reject trailers whose version they
+  // do not understand and fall back to the legacy path.
+  static constexpr uint8_t kBlockIndexVersion = 1;
+
+  // Fixed trailer length in bytes:
+  //   block_id(8) + layout_id(8) + version(1) + magic(1) = 18.
+  static constexpr size_t kBlockIdTrailerLength =
+      sizeof(uint64_t) + sizeof(uint64_t) + 2;
 
   static Slice EncodeFileNumber(uint64_t& file_number) {
     if (!port::kLittleEndian) {
@@ -843,50 +872,58 @@ class SeparateHelper {
                  slice.size() - sizeof(uint64_t));
   }
 
-  // Append a chunk-id trailer to an already-encoded value-index slice.
+  // Append a block-id trailer to an already-encoded value-index slice.
   // Caller provides the current encoded head in *dst (which must start
   // with file_number and optional meta). On return, *dst is extended
-  // with [ varint64(chunk_id) || kChunkIdTrailerMagic ].
-  static void EncodeChunkIdTrailer(std::string* dst, uint64_t chunk_id);
+  // with the fixed-length trailer:
+  //   [ fixed64(block_id) || fixed64(layout_id) || version(1B) ||
+  //     kBlockIdTrailerMagic(1B) ].
+  static void EncodeBlockIdTrailer(std::string* dst, uint64_t block_id,
+                                   uint64_t layout_id);
 
-  // Returns true iff slice carries a well-formed chunk-id trailer.
+  // Returns true iff slice carries a well-formed block-id trailer.
   // A well-formed trailer means:
-  //   - slice.size() >= sizeof(uint64_t) + 2 (at least file_number +
-  //     one varint byte + magic)
-  //   - the last byte equals kChunkIdTrailerMagic
-  //   - the bytes preceding the magic decode as a valid varint64 whose
-  //     encoding length plus the magic byte lies strictly inside the
-  //     meta region (i.e. does not eat into the file_number head).
+  //   - slice.size() >= sizeof(uint64_t) + kBlockIdTrailerLength
+  //     (file_number head + fixed trailer)
+  //   - the last byte equals kBlockIdTrailerMagic
+  //   - the version byte equals kBlockIndexVersion
+  //   - neither block_id nor layout_id equals its sentinel value.
   // Does NOT mutate slice.
-  static bool HasChunkId(const Slice& slice);
+  static bool HasBlockId(const Slice& slice);
 
-  // Returns the decoded chunk_id, or kNoChunkId if slice does not
-  // carry a chunk-id trailer. A kNoChunkId return value means the
-  // caller must treat this index as "bitmap unavailable" and fall
-  // back to the legacy GC path.
-  static uint64_t DecodeChunkId(const Slice& slice);
+  // Returns the decoded block_id, or kNoBlockId if slice does not
+  // carry a well-formed block-id trailer. A kNoBlockId return value
+  // means the caller must treat this index as "block id unavailable"
+  // and fall back to the legacy GC path.
+  static uint64_t DecodeBlockId(const Slice& slice);
+
+  // Returns the decoded layout_id (the physical vSST file number the
+  // block_id is bound to), or kNoBlockLayoutId if slice does not carry
+  // a well-formed block-id trailer.
+  static uint64_t DecodeBlockLayoutId(const Slice& slice);
 
   // Helper for readers that want meta without the trailer. Returns the
-  // meta region with trailer bytes removed when present; otherwise
-  // returns DecodeValueMeta(slice) unchanged.
-  static Slice DecodeValueMetaStripChunk(const Slice& slice);
+  // meta region with the fixed trailer bytes removed when the trailer
+  // is complete and legal; otherwise returns DecodeValueMeta(slice)
+  // unchanged (legacy meta view).
+  static Slice DecodeValueMetaStripBlockId(const Slice& slice);
 
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                 uint64_t file_number, const Slice& meta,
                                 bool is_merge, bool is_index,
                                 const ValueExtractor* value_meta_extractor);
 
-  // Overload that additionally appends a chunk-id trailer to the
-  // encoded value-index when `chunk_id != kNoChunkId`. When
-  // `chunk_id == kNoChunkId`, behavior is bit-for-bit identical to
-  // the legacy overload above. This is the single entry point used
-  // by flush/compaction writers once the chunk-aware value-index
-  // format is enabled.
+  // Overload that additionally appends a block-id trailer to the
+  // encoded value-index when `block_id != kNoBlockId` and
+  // `layout_id != kNoBlockLayoutId`. When either is its sentinel,
+  // behavior is bit-for-bit identical to the legacy overload above.
+  // This is the single entry point used by flush/compaction writers
+  // once the block-aware value-index format is enabled.
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                 uint64_t file_number, const Slice& meta,
                                 bool is_merge, bool is_index,
                                 const ValueExtractor* value_meta_extractor,
-                                uint64_t chunk_id);
+                                uint64_t block_id, uint64_t layout_id);
 
   virtual Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                  const Slice& meta, bool is_merge,

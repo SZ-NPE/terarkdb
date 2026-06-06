@@ -159,6 +159,25 @@ class TableBuilder {
   // REQUIRES: Finish(), Abandon() have not been called
   virtual Status Add(const Slice& key, const LazyBuffer& value) = 0;
 
+  // ---------------------------------------------------------------
+  // vSST data-block-level live bitmap support.
+  //
+  // Returns true iff this builder can supply the data block ordinal
+  // (block_id) of the entry written by the most recent Add(). Only
+  // BlockBasedTableBuilder overrides this to return true; every other
+  // builder keeps the default and callers fall back to kNoBlockId.
+  virtual bool SupportsDataBlockId() const { return false; }
+
+  // Returns the 0-based data block ordinal that the entry written by
+  // the most recent successful Add() belongs to. Returns kNoBlockId
+  // (= uint64_t(-1)) when unsupported or before any Add(). When an
+  // Add() triggers a block flush, the returned id is the block the
+  // entry was actually appended to (not the freshly opened empty
+  // block).
+  virtual uint64_t LastAddedDataBlockId() const {
+    return static_cast<uint64_t>(-1);
+  }
+
   virtual Status AddTombstone(const Slice& /*key*/,
                               const LazyBuffer& /*value*/) {
     return Status::NotSupported();

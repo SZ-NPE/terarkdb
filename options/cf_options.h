@@ -159,9 +159,24 @@ struct MutableCFOptions {
         blob_size(0),
         hotness_window_capacity(0),
         hotness_hot_capacity(0),
+        hotness_enable_write_window(false),
+        hotness_enable_compaction_feedback(false),
+        hotness_sketch_width(0),
+        hotness_sketch_depth(0),
+        hotness_write_repeat_weight(0),
+        hotness_compaction_feedback_weight(0),
+        hotness_threshold(0),
+        hotness_decay_interval(0),
+        hotness_half_life_writes(0),
         blob_large_key_ratio(0),
         blob_gc_ratio(0),
         precise_gc(false),
+        enable_blob_block_bitmap(false),
+        enable_blob_block_bitmap_gc_fast_path(true),
+        enable_blob_block_skip(false),
+        blob_block_index_version(1),
+        blob_block_bitmap_strict_fallback(true),
+        blob_block_bitmap_debug(false),
         enable_blob_validity_bitmap(false),
         blob_gc_chunk_size(0),
         target_blob_file_size(0),
@@ -225,9 +240,24 @@ struct MutableCFOptions {
   size_t blob_size;
   size_t hotness_window_capacity;
   size_t hotness_hot_capacity;
+  bool hotness_enable_write_window;
+  bool hotness_enable_compaction_feedback;
+  uint64_t hotness_sketch_width;
+  uint32_t hotness_sketch_depth;
+  uint32_t hotness_write_repeat_weight;
+  uint32_t hotness_compaction_feedback_weight;
+  uint32_t hotness_threshold;
+  uint64_t hotness_decay_interval;
+  uint64_t hotness_half_life_writes;
   double blob_large_key_ratio;
   double blob_gc_ratio;
   bool precise_gc;
+  bool enable_blob_block_bitmap;
+  bool enable_blob_block_bitmap_gc_fast_path;
+  bool enable_blob_block_skip;
+  uint32_t blob_block_index_version;
+  bool blob_block_bitmap_strict_fallback;
+  bool blob_block_bitmap_debug;
   bool enable_blob_validity_bitmap;
   uint64_t blob_gc_chunk_size;
   uint64_t target_blob_file_size;

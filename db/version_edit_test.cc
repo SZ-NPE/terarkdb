@@ -10,7 +10,7 @@
 #include "db/version_edit.h"
 
 #include "rocksdb/terark_namespace.h"
-#include "util/blob_chunk_bitmap.h"
+#include "util/blob_block_bitmap.h"
 #include "util/sync_point.h"
 #include "util/testharness.h"
 
@@ -293,20 +293,26 @@ TEST_F(VersionEditTest, DependenceByteCountDefaultsToZero) {
   ASSERT_EQ(0U, dep[1].byte_count);
 }
 
-// dependence_chunk_bitmaps exactly: size, per-bitmap num_bits, and bit
-// contents. The test also covers a per-row "empty" bitmap (which the
-// GC side reads as "bitmap unavailable for this particular blob").
-TEST_F(VersionEditTest, EncodeDecodeWithChunkBitmap) {
+// dependence_block_bitmaps exactly: size, per-row available/layout_id,
+// per-bitmap bit contents. The test also covers an explicitly
+// unavailable row (which GC reads as "fall back for this blob") versus
+// an available-but-empty row.
+TEST_F(VersionEditTest, EncodeDecodeWithBlockBitmap) {
   static const uint64_t kBig = 1ull << 50;
 
   TablePropertyCache prop = GetPropCache(1, {10U, 11U, 12U}, {});
-  prop.dependence_chunk_bitmaps.resize(prop.dependence.size());
-  prop.dependence_chunk_bitmaps[0].Set(0);
-  prop.dependence_chunk_bitmaps[0].Set(5);
-  prop.dependence_chunk_bitmaps[0].Set(17);
-  // dep[1] intentionally left empty: per-row "bitmap unavailable".
-  prop.dependence_chunk_bitmaps[2].Set(3);
-  prop.dependence_chunk_bitmaps[2].Set(4);
+  prop.dependence_block_bitmaps.resize(prop.dependence.size());
+  prop.dependence_block_bitmaps[0].available = true;
+  prop.dependence_block_bitmaps[0].layout_id = 1000U;
+  prop.dependence_block_bitmaps[0].bitmap.Set(0);
+  prop.dependence_block_bitmaps[0].bitmap.Set(5);
+  prop.dependence_block_bitmaps[0].bitmap.Set(17);
+  // dep[1] intentionally unavailable: per-row "bitmap unavailable".
+  prop.dependence_block_bitmaps[1].available = false;
+  prop.dependence_block_bitmaps[2].available = true;
+  prop.dependence_block_bitmaps[2].layout_id = 1002U;
+  prop.dependence_block_bitmaps[2].bitmap.Set(3);
+  prop.dependence_block_bitmaps[2].bitmap.Set(4);
 
   VersionEdit edit;
   edit.AddFile(3, 300, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
@@ -322,19 +328,23 @@ TEST_F(VersionEditTest, EncodeDecodeWithChunkBitmap) {
   ASSERT_EQ(1U, files.size());
   auto& rp = files[0].second.prop;
   ASSERT_EQ(3U, rp.dependence.size());
-  ASSERT_EQ(3U, rp.dependence_chunk_bitmaps.size());
+  ASSERT_EQ(3U, rp.dependence_block_bitmaps.size());
 
-  EXPECT_EQ(uint64_t(3), rp.dependence_chunk_bitmaps[0].CountSetBits());
-  EXPECT_TRUE(rp.dependence_chunk_bitmaps[0].Test(0));
-  EXPECT_TRUE(rp.dependence_chunk_bitmaps[0].Test(5));
-  EXPECT_TRUE(rp.dependence_chunk_bitmaps[0].Test(17));
-  EXPECT_FALSE(rp.dependence_chunk_bitmaps[0].Test(1));
+  EXPECT_TRUE(rp.dependence_block_bitmaps[0].available);
+  EXPECT_EQ(1000U, rp.dependence_block_bitmaps[0].layout_id);
+  EXPECT_EQ(uint64_t(3), rp.dependence_block_bitmaps[0].bitmap.CountSetBits());
+  EXPECT_TRUE(rp.dependence_block_bitmaps[0].bitmap.Test(0));
+  EXPECT_TRUE(rp.dependence_block_bitmaps[0].bitmap.Test(5));
+  EXPECT_TRUE(rp.dependence_block_bitmaps[0].bitmap.Test(17));
+  EXPECT_FALSE(rp.dependence_block_bitmaps[0].bitmap.Test(1));
 
-  EXPECT_TRUE(rp.dependence_chunk_bitmaps[1].empty());
+  EXPECT_FALSE(rp.dependence_block_bitmaps[1].available);
 
-  EXPECT_EQ(uint64_t(2), rp.dependence_chunk_bitmaps[2].CountSetBits());
-  EXPECT_TRUE(rp.dependence_chunk_bitmaps[2].Test(3));
-  EXPECT_TRUE(rp.dependence_chunk_bitmaps[2].Test(4));
+  EXPECT_TRUE(rp.dependence_block_bitmaps[2].available);
+  EXPECT_EQ(1002U, rp.dependence_block_bitmaps[2].layout_id);
+  EXPECT_EQ(uint64_t(2), rp.dependence_block_bitmaps[2].bitmap.CountSetBits());
+  EXPECT_TRUE(rp.dependence_block_bitmaps[2].bitmap.Test(3));
+  EXPECT_TRUE(rp.dependence_block_bitmaps[2].bitmap.Test(4));
 
   // Re-encoding the decoded edit should be byte-equal to the original
   // encoding. This pins down the stability of the persisted format.
@@ -343,12 +353,12 @@ TEST_F(VersionEditTest, EncodeDecodeWithChunkBitmap) {
   ASSERT_EQ(encoded, re_encoded);
 }
 
-// A VersionEdit produced before Phase 5 (no chunk
+// A VersionEdit produced before the block bitmap feature (no block
 // bitmap at all, i.e. vector is empty and its payload is omitted)
-// must decode cleanly, with `dependence_chunk_bitmaps` staying empty.
+// must decode cleanly, with `dependence_block_bitmaps` staying empty.
 // This is the explicit "bitmap unavailable" sentinel that the GC
 // side uses to pick the legacy lookup path.
-TEST_F(VersionEditTest, DecodeBackwardCompatibleWithoutChunkBitmap) {
+TEST_F(VersionEditTest, DecodeBackwardCompatibleWithoutBlockBitmap) {
   static const uint64_t kBig = 1ull << 50;
   VersionEdit edit;
   edit.AddFile(3, 300, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
@@ -360,7 +370,7 @@ TEST_F(VersionEditTest, DecodeBackwardCompatibleWithoutChunkBitmap) {
   ASSERT_OK(parsed.DecodeFrom(encoded));
   auto& p = parsed.GetNewFiles()[0].second.prop;
   ASSERT_EQ(2U, p.dependence.size());
-  ASSERT_TRUE(p.dependence_chunk_bitmaps.empty());
+  ASSERT_TRUE(p.dependence_block_bitmaps.empty());
 }
 
 }  // namespace TERARKDB_NAMESPACE

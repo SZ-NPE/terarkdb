@@ -196,16 +196,46 @@ void MutableCFOptions::Dump(Logger* log) const {
                  max_subcompactions);
   ROCKS_LOG_INFO(log, "                                blob_size: %zd",
                  blob_size);
+  ROCKS_LOG_INFO(log, "                 hotness_window_capacity: %zu",
+                 hotness_window_capacity);
+  ROCKS_LOG_INFO(log, "                    hotness_hot_capacity: %zu",
+                 hotness_hot_capacity);
+  ROCKS_LOG_INFO(log, "             hotness_enable_write_window: %d",
+                 hotness_enable_write_window);
+  ROCKS_LOG_INFO(log, "      hotness_enable_compaction_feedback: %d",
+                 hotness_enable_compaction_feedback);
+  ROCKS_LOG_INFO(log, "                    hotness_sketch_width: %" PRIu64,
+                 hotness_sketch_width);
+  ROCKS_LOG_INFO(log, "                    hotness_sketch_depth: %u",
+                 hotness_sketch_depth);
+  ROCKS_LOG_INFO(log, "             hotness_write_repeat_weight: %u",
+                 hotness_write_repeat_weight);
+  ROCKS_LOG_INFO(log, "      hotness_compaction_feedback_weight: %u",
+                 hotness_compaction_feedback_weight);
+  ROCKS_LOG_INFO(log, "                       hotness_threshold: %u",
+                 hotness_threshold);
+  ROCKS_LOG_INFO(log, "                  hotness_decay_interval: %" PRIu64,
+                 hotness_decay_interval);
+  ROCKS_LOG_INFO(log, "              hotness_half_life_writes: %" PRIu64,
+                 hotness_half_life_writes);
   ROCKS_LOG_INFO(log, "                     blob_large_key_ratio: %f",
                  blob_large_key_ratio);
   ROCKS_LOG_INFO(log, "                            blob_gc_ratio: %f",
                  blob_gc_ratio);
   ROCKS_LOG_INFO(log, "                               precise_gc: %d",
                  precise_gc);
-  ROCKS_LOG_INFO(log, "              enable_blob_validity_bitmap: %d",
-                 enable_blob_validity_bitmap);
-  ROCKS_LOG_INFO(log, "                       blob_gc_chunk_size: %" PRIu64,
-                 blob_gc_chunk_size);
+  ROCKS_LOG_INFO(log, "                 enable_blob_block_bitmap: %d",
+                 enable_blob_block_bitmap);
+  ROCKS_LOG_INFO(log, "    enable_blob_block_bitmap_gc_fast_path: %d",
+                 enable_blob_block_bitmap_gc_fast_path);
+  ROCKS_LOG_INFO(log, "                   enable_blob_block_skip: %d",
+                 enable_blob_block_skip);
+  ROCKS_LOG_INFO(log, "                 blob_block_index_version: %" PRIu32,
+                 blob_block_index_version);
+  ROCKS_LOG_INFO(log, "        blob_block_bitmap_strict_fallback: %d",
+                 blob_block_bitmap_strict_fallback);
+  ROCKS_LOG_INFO(log, "                  blob_block_bitmap_debug: %d",
+                 blob_block_bitmap_debug);
   ROCKS_LOG_INFO(log, "                    target_blob_file_size: %" PRIu64,
                  target_blob_file_size);
   ROCKS_LOG_INFO(log, "                blob_file_defragment_size: %" PRIu64,
@@ -301,9 +331,28 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       blob_size(options.blob_size),
       hotness_window_capacity(options.hotness_window_capacity),
       hotness_hot_capacity(options.hotness_hot_capacity),
+      hotness_enable_write_window(options.hotness_enable_write_window),
+      hotness_enable_compaction_feedback(
+          options.hotness_enable_compaction_feedback),
+      hotness_sketch_width(options.hotness_sketch_width),
+      hotness_sketch_depth(options.hotness_sketch_depth),
+      hotness_write_repeat_weight(options.hotness_write_repeat_weight),
+      hotness_compaction_feedback_weight(
+          options.hotness_compaction_feedback_weight),
+      hotness_threshold(options.hotness_threshold),
+      hotness_decay_interval(options.hotness_decay_interval),
+      hotness_half_life_writes(options.hotness_half_life_writes),
       blob_large_key_ratio(options.blob_large_key_ratio),
       blob_gc_ratio(options.blob_gc_ratio),
       precise_gc(options.precise_gc),
+      enable_blob_block_bitmap(options.enable_blob_block_bitmap),
+      enable_blob_block_bitmap_gc_fast_path(
+          options.enable_blob_block_bitmap_gc_fast_path),
+      enable_blob_block_skip(options.enable_blob_block_skip),
+      blob_block_index_version(options.blob_block_index_version),
+      blob_block_bitmap_strict_fallback(
+          options.blob_block_bitmap_strict_fallback),
+      blob_block_bitmap_debug(options.blob_block_bitmap_debug),
       enable_blob_validity_bitmap(options.enable_blob_validity_bitmap),
       blob_gc_chunk_size(options.blob_gc_chunk_size),
       target_blob_file_size(options.target_blob_file_size),

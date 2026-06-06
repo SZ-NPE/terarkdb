@@ -20,7 +20,7 @@
 #include "rocksdb/terark_namespace.h"
 #include "util/arena.h"
 #include "util/autovector.h"
-#include "util/blob_chunk_bitmap.h"
+#include "util/blob_block_bitmap.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -98,20 +98,25 @@ struct TablePropertyCache {
   std::vector<Dependence> dependence;  // make these sst hidden
   std::vector<uint64_t> inheritance;   // inheritance set
   // Invariants when non-empty:
-  //   dependence_chunk_bitmaps.size() == dependence.size()
-  //   dependence_chunk_bitmaps[i] corresponds to dependence[i]
+  //   dependence_block_bitmaps.size() == dependence.size()
+  //   dependence_block_bitmaps[i] corresponds to dependence[i]
+  // Each row is a layout-aware DependenceBlockBitmap carrying an
+  // explicit `available` flag, the `layout_id` (physical vSST file
+  // number the block ids were stamped against), and the block bitmap.
   // Left empty when:
-  //   - CF option enable_blob_validity_bitmap is off, OR
-  //   - blob_gc_chunk_size is 0, OR
+  //   - CF option enable_blob_block_bitmap is off, OR
   //   - the producer (flush/compaction) had no separated values to
   //     record (e.g. legacy SSTs and map SSTs).
-  // An empty vector is the explicit "bitmap unavailable" signal; GC
-  // must fall back to the legacy lookup path on such SSTs.
-  // Phase 5 persists this vector both in the SST property block and in
+  // An empty vector is the explicit "whole-SST bitmap unavailable"
+  // signal; GC must fall back to the legacy lookup path on such SSTs.
+  // A present-but-unavailable row (available=false) is likewise a
+  // per-dependence fallback signal, and is NOT the same as an
+  // available row with an empty bitmap.
+  // This vector is persisted both in the SST property block and in
   // the manifest (appended to the kPropertyCache field). When an older
   // manifest is opened, this vector decodes as empty and the GC falls
   // back to the legacy lookup path automatically.
-  std::vector<BlobChunkBitmap> dependence_chunk_bitmaps;
+  std::vector<DependenceBlockBitmap> dependence_block_bitmaps;
   uint64_t earliest_time_begin_compact = port::kMaxUint64;
   uint64_t latest_time_end_compact = port::kMaxUint64;
 

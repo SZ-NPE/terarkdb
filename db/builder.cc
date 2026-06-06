@@ -38,7 +38,7 @@
 #include "util/filename.h"
 #include "util/stop_watch.h"
 #include "util/sync_point.h"
-#include "util/blob_chunk_bitmap.h"
+#include "util/blob_block_bitmap.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -175,10 +175,10 @@ Status BuildTable(
       Status (*trans_to_separate_callback)(void* args, const Slice& key,
                                            LazyBuffer& value) = nullptr;
       void* trans_to_separate_callback_args = nullptr;
-      // per-SST chunk-reference collector. Disabled-by-default
+      // per-SST block-reference collector. Disabled-by-default
       // constructor so that when the CF option is off this is a zero-cost
       // no-op on the flush hot path.
-      FlushChunkBitmapCollector chunk_bitmap_collector{false, 0};
+      FlushBlockBitmapCollector block_bitmap_collector{false};
 
       Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                              const Slice& meta, bool is_merge,
@@ -209,34 +209,31 @@ Status BuildTable(
       separate_helper.value_meta_extractor =
           ioptions.value_meta_extractor_factory->CreateValueExtractor(context);
     }
-    // initialize chunk-reference collector from CF options.
+    // initialize block-reference collector from CF options.
     // Safe even when the feature is off: collector becomes a no-op.
     //
-    // BlockBasedTable-only gate: the chunk-aware value-index format
-    // and its SST-property/manifest plumbing are currently validated
-    // against the default BlockBasedTable builder/reader only. When
-    // the CF is configured to use a different table factory (e.g.
-    // TerarkZipTable), we force-disable the collector so that the
-    // legacy GC path is always used. This keeps the feature boundary
-    // matching the documented POC scope in paper/feature.md.
+    // BlockBasedTable-only gate: the block-aware value-index format
+    // and its SST-property/manifest plumbing require a builder that can
+    // report data block ordinals. When the CF is configured to use a
+    // different table factory (e.g. TerarkZipTable), we force-disable
+    // the collector so that the legacy GC path is always used.
     const bool is_block_based_table =
         ioptions.table_factory != nullptr &&
         ioptions.table_factory->Name() == BlockBasedTableFactory::kName;
-    const bool chunk_bitmap_enabled =
-        mutable_cf_options.enable_blob_validity_bitmap && is_block_based_table;
-    if (mutable_cf_options.enable_blob_validity_bitmap &&
-        !is_block_based_table) {
+    const bool block_bitmap_enabled =
+        mutable_cf_options.enable_blob_block_bitmap && is_block_based_table;
+    if (mutable_cf_options.enable_blob_block_bitmap && !is_block_based_table) {
       ROCKS_LOG_INFO(
           ioptions.info_log,
-          "[Flush] enable_blob_validity_bitmap is set but table_factory is "
-          "'%s' (not BlockBasedTable); chunk-aware value-index is disabled "
+          "[Flush] enable_blob_block_bitmap is set but table_factory is "
+          "'%s' (not BlockBasedTable); block-aware value-index is disabled "
           "for this CF.",
           ioptions.table_factory != nullptr
               ? ioptions.table_factory->Name()
               : "<null>");
     }
-    separate_helper.chunk_bitmap_collector = FlushChunkBitmapCollector(
-        chunk_bitmap_enabled, mutable_cf_options.blob_gc_chunk_size);
+    separate_helper.block_bitmap_collector =
+        FlushBlockBitmapCollector(block_bitmap_enabled);
 
     auto flush_route_hint = [](HotnessTracker::FlushRoute route) {
       switch (route) {
@@ -294,8 +291,7 @@ Status BuildTable(
       Slice user_key = ExtractUserKey(key);
       auto route = HotnessTracker::FlushRoute::kWarm;
       if (hotness_tracker) {
-        route = hotness_tracker->ClassifyForFlush(
-            user_key, HotnessTracker::Hash(user_key));
+        route = hotness_tracker->ClassifyForFlush(user_key);
       }
       int hot_idx = static_cast<int>(route);
       auto& bstate = separate_helper.blobs[hot_idx];
@@ -353,34 +349,41 @@ Status BuildTable(
             true));
         blob_builder = bstate.builder.get();
       }
-      // Observe the chunk this value will live in *before* Add,
-      // because the builder's FileSize reflects the end of the previous
-      // value at this point, which is a well-defined lower bound of the
-      // new value's offset. This matches the invariant used on the GC
-      // side (chunk_id_of(offset) = offset / chunk_size) and keeps the
-      // observation order deterministic w.r.t. the iterator.
-      const uint64_t observed_offset =
-          blob_builder != nullptr ? blob_builder->FileSize() : 0;
       if (status.ok()) {
         status = blob_builder->Add(key, value);
       }
       if (status.ok()) {
-        separate_helper.chunk_bitmap_collector.Observe(
-            blob_meta->fd.GetNumber(), observed_offset);
         blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
-        // When the chunk-aware value-index is enabled for this CF,
-        // stamp the resolved chunk_id onto the outgoing index value
-        // so that downstream compaction/GC readers can decode it
-        // without having to re-derive the blob offset.
-        const uint64_t chunk_id_for_trailer =
-            separate_helper.chunk_bitmap_collector.enabled()
-                ? ChunkIdOfOffset(observed_offset,
-                                  mutable_cf_options.blob_gc_chunk_size)
-                : SeparateHelper::kNoChunkId;
+        // Obtain the real vSST data block ordinal this value was just
+        // written into. When the builder cannot supply one (non
+        // BlockBasedTable), mark the blob's bitmap unavailable so GC
+        // falls back to the legacy GetKey() path.
+        //
+        // layout_id binds the block_id to the *physical* vSST file the
+        // value was written into. A reader must reject the block_id when
+        // the blob's current physical file number no longer matches
+        // (e.g. after a vSST GC rewrite).
+        const uint64_t layout_id = blob_meta->fd.GetNumber();
+        uint64_t block_id = kNoBlockId;
+        if (separate_helper.block_bitmap_collector.enabled()) {
+          if (blob_builder->SupportsDataBlockId()) {
+            block_id = blob_builder->LastAddedDataBlockId();
+          }
+          if (block_id == kNoBlockId) {
+            separate_helper.block_bitmap_collector.MarkUnavailable(layout_id);
+          } else {
+            separate_helper.block_bitmap_collector.ObserveBlockId(
+                layout_id, layout_id, block_id);
+          }
+        }
+        // When the block-aware value-index is enabled for this CF,
+        // stamp the resolved block_id + layout_id onto the outgoing
+        // index value so that downstream compaction/GC readers can
+        // decode it without re-deriving the data block.
         status = SeparateHelper::TransToSeparate(
             key, value, blob_meta->fd.GetNumber(), Slice(),
             GetInternalKeyType(key) == kTypeMerge, false,
-            separate_helper.value_meta_extractor.get(), chunk_id_for_trailer);
+            separate_helper.value_meta_extractor.get(), block_id, layout_id);
       }
       return status;
     };
@@ -506,13 +509,13 @@ Status BuildTable(
         sst_meta()->prop.dependence.emplace_back(Dependence{
             blob.fd.GetNumber(), blob.prop.num_entries, blob.fd.GetFileSize()});
       }
-      // freeze the per-dependence chunk reference bitmaps.
+      // freeze the per-dependence data-block reference bitmaps.
       // When the CF option is off the collector is a no-op and this
       // call clears the target vector to empty, which is the explicit
       // "bitmap unavailable" sentinel expected by later phases.
-      separate_helper.chunk_bitmap_collector.Materialize(
+      separate_helper.block_bitmap_collector.Materialize(
           sst_meta()->prop.dependence,
-          &sst_meta()->prop.dependence_chunk_bitmaps);
+          &sst_meta()->prop.dependence_block_bitmaps);
       auto shrinked_snapshots = sst_meta()->ShrinkSnapshot(snapshots);
       s = builder->Finish(&sst_meta()->prop, &shrinked_snapshots);
 

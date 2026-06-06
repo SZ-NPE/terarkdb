@@ -171,9 +171,34 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.blob_size = mutable_cf_options.blob_size;
   cf_opts.hotness_window_capacity = mutable_cf_options.hotness_window_capacity;
   cf_opts.hotness_hot_capacity = mutable_cf_options.hotness_hot_capacity;
+  cf_opts.hotness_enable_write_window =
+      mutable_cf_options.hotness_enable_write_window;
+  cf_opts.hotness_enable_compaction_feedback =
+      mutable_cf_options.hotness_enable_compaction_feedback;
+  cf_opts.hotness_sketch_width = mutable_cf_options.hotness_sketch_width;
+  cf_opts.hotness_sketch_depth = mutable_cf_options.hotness_sketch_depth;
+  cf_opts.hotness_write_repeat_weight =
+      mutable_cf_options.hotness_write_repeat_weight;
+  cf_opts.hotness_compaction_feedback_weight =
+      mutable_cf_options.hotness_compaction_feedback_weight;
+  cf_opts.hotness_threshold = mutable_cf_options.hotness_threshold;
+  cf_opts.hotness_decay_interval =
+      mutable_cf_options.hotness_decay_interval;
+  cf_opts.hotness_half_life_writes =
+      mutable_cf_options.hotness_half_life_writes;
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
   cf_opts.precise_gc = mutable_cf_options.precise_gc;
+  cf_opts.enable_blob_block_bitmap = mutable_cf_options.enable_blob_block_bitmap;
+  cf_opts.enable_blob_block_bitmap_gc_fast_path =
+      mutable_cf_options.enable_blob_block_bitmap_gc_fast_path;
+  cf_opts.enable_blob_block_skip = mutable_cf_options.enable_blob_block_skip;
+  cf_opts.blob_block_index_version =
+      mutable_cf_options.blob_block_index_version;
+  cf_opts.blob_block_bitmap_strict_fallback =
+      mutable_cf_options.blob_block_bitmap_strict_fallback;
+  cf_opts.blob_block_bitmap_debug =
+      mutable_cf_options.blob_block_bitmap_debug;
   cf_opts.enable_blob_validity_bitmap =
       mutable_cf_options.enable_blob_validity_bitmap;
   cf_opts.blob_gc_chunk_size = mutable_cf_options.blob_gc_chunk_size;
@@ -1944,6 +1969,44 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::hotness_hot_capacity),
           OptionType::kSizeT, OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, hotness_hot_capacity)}},
+        {"hotness_enable_write_window",
+         {offset_of(&ColumnFamilyOptions::hotness_enable_write_window),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_enable_write_window)}},
+        {"hotness_enable_compaction_feedback",
+         {offset_of(&ColumnFamilyOptions::hotness_enable_compaction_feedback),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions,
+                   hotness_enable_compaction_feedback)}},
+        {"hotness_sketch_width",
+         {offset_of(&ColumnFamilyOptions::hotness_sketch_width),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_sketch_width)}},
+        {"hotness_sketch_depth",
+         {offset_of(&ColumnFamilyOptions::hotness_sketch_depth),
+          OptionType::kUInt32T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_sketch_depth)}},
+        {"hotness_write_repeat_weight",
+         {offset_of(&ColumnFamilyOptions::hotness_write_repeat_weight),
+          OptionType::kUInt32T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_write_repeat_weight)}},
+        {"hotness_compaction_feedback_weight",
+         {offset_of(&ColumnFamilyOptions::hotness_compaction_feedback_weight),
+          OptionType::kUInt32T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions,
+                   hotness_compaction_feedback_weight)}},
+        {"hotness_threshold",
+         {offset_of(&ColumnFamilyOptions::hotness_threshold),
+          OptionType::kUInt32T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_threshold)}},
+        {"hotness_decay_interval",
+         {offset_of(&ColumnFamilyOptions::hotness_decay_interval),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_decay_interval)}},
+        {"hotness_half_life_writes",
+         {offset_of(&ColumnFamilyOptions::hotness_half_life_writes),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hotness_half_life_writes)}},
         {"blob_large_key_ratio",
          {offset_of(&ColumnFamilyOptions::blob_large_key_ratio),
           OptionType::kDouble, OptionVerificationType::kNormal, true,
@@ -1956,6 +2019,33 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::precise_gc), OptionType::kBoolean,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, precise_gc)}},
+        {"enable_blob_block_bitmap",
+         {offset_of(&ColumnFamilyOptions::enable_blob_block_bitmap),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, enable_blob_block_bitmap)}},
+        {"enable_blob_block_bitmap_gc_fast_path",
+         {offset_of(
+              &ColumnFamilyOptions::enable_blob_block_bitmap_gc_fast_path),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions,
+                   enable_blob_block_bitmap_gc_fast_path)}},
+        {"enable_blob_block_skip",
+         {offset_of(&ColumnFamilyOptions::enable_blob_block_skip),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, enable_blob_block_skip)}},
+        {"blob_block_index_version",
+         {offset_of(&ColumnFamilyOptions::blob_block_index_version),
+          OptionType::kUInt32T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, blob_block_index_version)}},
+        {"blob_block_bitmap_strict_fallback",
+         {offset_of(&ColumnFamilyOptions::blob_block_bitmap_strict_fallback),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions,
+                   blob_block_bitmap_strict_fallback)}},
+        {"blob_block_bitmap_debug",
+         {offset_of(&ColumnFamilyOptions::blob_block_bitmap_debug),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, blob_block_bitmap_debug)}},
         {"enable_blob_validity_bitmap",
          {offset_of(&ColumnFamilyOptions::enable_blob_validity_bitmap),
           OptionType::kBoolean, OptionVerificationType::kNormal, true,

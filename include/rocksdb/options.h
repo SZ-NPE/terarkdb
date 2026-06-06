@@ -316,6 +316,33 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Capacity of the promoted hot set used by HotnessTracker.
   size_t hotness_hot_capacity = 1000000;
 
+  // Enable write-window repeated-write feedback for HotnessTracker.
+  bool hotness_enable_write_window = true;
+
+  // Enable compaction obsolete-version feedback for HotnessTracker.
+  bool hotness_enable_compaction_feedback = true;
+
+  // Count-min sketch width used by the hotness table.
+  uint64_t hotness_sketch_width = 1ULL << 22;
+
+  // Count-min sketch depth used by the hotness table.
+  uint32_t hotness_sketch_depth = 4;
+
+  // Hotness increment when the write window observes a repeated key.
+  uint32_t hotness_write_repeat_weight = 1;
+
+  // Hotness increment when compaction drops an obsolete version.
+  uint32_t hotness_compaction_feedback_weight = 2;
+
+  // Minimum estimated hotness score for routing a key to hot vSST.
+  uint32_t hotness_threshold = 2;
+
+  // Number of writes between hotness decay operations. 0 disables decay.
+  uint64_t hotness_decay_interval = 1000000;
+
+  // Half-life in writes for decayed hotness scores. 0 disables decay.
+  uint64_t hotness_half_life_writes = 6500000;
+
   // Don't separate Value if key.size > value.size * blob_large_key_ratio
   // valid [0 , 1]
   double blob_large_key_ratio = 0.25;
@@ -328,19 +355,53 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Use byte-precise garbage ratio when metadata is available.
   bool precise_gc = false;
 
-  // Enable chunk-level validity bitmap materialization for Blob GC.
+  // Enable vSST data-block-level live bitmap materialization for Blob GC.
   // When true, flush/compaction output SSTs maintain a per-dependence
-  // chunk bitmap so that Blob GC can use a bitmap fast path and skip
-  // dead chunks without per-key lookup. When false, the system fully
-  // degrades to the legacy GetKey()-based GC path.
+  // bitmap keyed by the real BlockBasedTable data block ordinal of the
+  // referenced vSST. Blob GC can then use a bitmap fast path and skip
+  // dead data blocks without per-key reverse lookup. When false, the
+  // system fully degrades to the legacy GetKey()-based GC path.
   // Default: false
+  bool enable_blob_block_bitmap = false;
+
+  // Whether GC uses the block bitmap to skip GetKey() reverse lookups
+  // for records that live in a vSST data block proven dead (bit == 0).
+  // Only meaningful when enable_blob_block_bitmap is true.
+  // Default: true
+  bool enable_blob_block_bitmap_gc_fast_path = true;
+
+  // Whether GC attempts to physically skip reading dead vSST data
+  // blocks at the table-iterator layer (Phase 6). Physical block skip
+  // is not yet wired through the BlockBasedTable iterator, so this is
+  // reserved and defaults to false; see util/blob_block_bitmap.h and
+  // db/compaction_job.cc for the interface design and TODO.
+  // Default: false
+  bool enable_blob_block_skip = false;
+
+  // ValueIndex block-id trailer format version. Writers stamp this
+  // version into the trailer; readers reject trailers whose version
+  // they do not understand and fall back to the legacy path.
+  // Default: 1
+  uint32_t blob_block_index_version = 1;
+
+  // When a legacy / malformed / missing block-id index is encountered,
+  // whether to force a fallback to the exact GetKey() reverse lookup.
+  // Must remain true to avoid ever dropping a live value.
+  // Default: true
+  bool blob_block_bitmap_strict_fallback = true;
+
+  // Whether to print block bitmap aggregation and GC skip diagnostics
+  // to the info log. Statistics/debugging only.
+  // Default: false
+  bool blob_block_bitmap_debug = false;
+
+  // Deprecated: superseded by enable_blob_block_bitmap. Retained only
+  // so that old option strings still parse; not used by any new logic.
   bool enable_blob_validity_bitmap = false;
 
-  // Chunk size (in bytes) used to granularize blob file content for
-  // chunk-level validity tracking. Only meaningful when
-  // enable_blob_validity_bitmap is true.
-  // valid : power-of-two in [4KB, 4MB] recommended
-  // Default : 64KB
+  // Deprecated: the chunk-size granularization scheme has been replaced
+  // by real data-block-level bitmaps. Retained only so that old option
+  // strings still parse; not used by any new logic.
   uint64_t blob_gc_chunk_size = 64 * 1024;
 
   // Blob file size

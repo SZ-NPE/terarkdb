@@ -986,6 +986,36 @@ DEFINE_uint64(hotness_window_capacity, 1000000,
               "FIFO observation window capacity for HotnessTracker");
 DEFINE_uint64(hotness_hot_capacity, 1000000,
               "Promoted hot-set capacity for HotnessTracker");
+DEFINE_bool(hotness_enable_write_window, true,
+            "Enable write-window repeated-write feedback for HotnessTracker");
+DEFINE_bool(hotness_enable_compaction_feedback, true,
+            "Enable compaction obsolete-version feedback for HotnessTracker");
+DEFINE_uint64(hotness_sketch_width, 1ULL << 22,
+              "Count-min sketch width for HotnessTracker");
+DEFINE_uint64(hotness_sketch_depth, 4,
+              "Count-min sketch depth for HotnessTracker");
+DEFINE_uint64(hotness_write_repeat_weight, 1,
+              "Hotness increment for repeated keys observed in write window");
+DEFINE_uint64(hotness_compaction_feedback_weight, 2,
+              "Hotness increment for obsolete versions found in compaction");
+DEFINE_uint64(hotness_threshold, 2,
+              "Minimum estimated hotness score for routing to hot vSST");
+DEFINE_uint64(hotness_decay_interval, 1000000,
+              "Number of writes between hotness decay operations; 0 disables");
+DEFINE_uint64(hotness_half_life_writes, 6500000,
+              "Hotness half-life measured in writes; 0 disables decay");
+static const bool FLAGS_hotness_sketch_depth_dummy
+    __attribute__((__unused__)) = RegisterFlagValidator(
+        &FLAGS_hotness_sketch_depth, &ValidateUint32Range);
+static const bool FLAGS_hotness_write_repeat_weight_dummy
+    __attribute__((__unused__)) = RegisterFlagValidator(
+        &FLAGS_hotness_write_repeat_weight, &ValidateUint32Range);
+static const bool FLAGS_hotness_compaction_feedback_weight_dummy
+    __attribute__((__unused__)) = RegisterFlagValidator(
+        &FLAGS_hotness_compaction_feedback_weight, &ValidateUint32Range);
+static const bool FLAGS_hotness_threshold_dummy
+    __attribute__((__unused__)) = RegisterFlagValidator(
+        &FLAGS_hotness_threshold, &ValidateUint32Range);
 
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
@@ -994,11 +1024,26 @@ DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
 DEFINE_bool(precise_gc, false,
             "Enable byte-precise garbage ratio calculation for blob GC");
 
-DEFINE_bool(enable_blob_validity_bitmap, false,
-            "Enable chunk-level validity bitmap for blob GC fast path");
+DEFINE_bool(enable_blob_block_bitmap, false,
+            "Enable vSST data-block-level live bitmap for blob GC fast path");
 
-DEFINE_uint64(blob_gc_chunk_size, 64 * 1024,
-              "Chunk size in bytes for blob validity bitmap");
+DEFINE_bool(enable_blob_block_bitmap_gc_fast_path, true,
+            "Use block bitmap to skip GetKey() reverse lookups during GC");
+
+DEFINE_bool(enable_blob_block_skip, false,
+            "RESERVED / NO-OP: physical skip of dead vSST data blocks "
+            "(Phase 6) is not implemented yet. Setting this flag does NOT "
+            "reduce vSST read bandwidth and must not be used to draw "
+            "experimental conclusions about block-skip savings.");
+
+DEFINE_uint32(blob_block_index_version, 1,
+              "ValueIndex block-id trailer format version");
+
+DEFINE_bool(blob_block_bitmap_strict_fallback, true,
+            "Force fallback on legacy/malformed/missing block-id index");
+
+DEFINE_bool(blob_block_bitmap_debug, false,
+            "Print block bitmap aggregation and GC skip diagnostics");
 
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
@@ -3600,11 +3645,38 @@ class Benchmark {
     options.enable_hotness_tracker = FLAGS_enable_hotness_tracker;
     options.hotness_window_capacity = FLAGS_hotness_window_capacity;
     options.hotness_hot_capacity = FLAGS_hotness_hot_capacity;
+    options.hotness_enable_write_window =
+        FLAGS_hotness_enable_write_window;
+    options.hotness_enable_compaction_feedback =
+        FLAGS_hotness_enable_compaction_feedback;
+    options.hotness_sketch_width = FLAGS_hotness_sketch_width;
+    options.hotness_sketch_depth =
+        static_cast<uint32_t>(FLAGS_hotness_sketch_depth);
+    options.hotness_write_repeat_weight =
+        static_cast<uint32_t>(FLAGS_hotness_write_repeat_weight);
+    options.hotness_compaction_feedback_weight =
+        static_cast<uint32_t>(FLAGS_hotness_compaction_feedback_weight);
+    options.hotness_threshold = static_cast<uint32_t>(FLAGS_hotness_threshold);
+    options.hotness_decay_interval = FLAGS_hotness_decay_interval;
+    options.hotness_half_life_writes = FLAGS_hotness_half_life_writes;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;
-    options.enable_blob_validity_bitmap = FLAGS_enable_blob_validity_bitmap;
-    options.blob_gc_chunk_size = FLAGS_blob_gc_chunk_size;
+    options.enable_blob_block_bitmap = FLAGS_enable_blob_block_bitmap;
+    options.enable_blob_block_bitmap_gc_fast_path =
+        FLAGS_enable_blob_block_bitmap_gc_fast_path;
+    options.enable_blob_block_skip = FLAGS_enable_blob_block_skip;
+    if (FLAGS_enable_blob_block_skip) {
+      fprintf(stderr,
+              "WARNING: --enable_blob_block_skip is a NO-OP. Physical vSST "
+              "data-block skip is not implemented; this flag does not reduce "
+              "read bandwidth and must not be used for block-skip experiments."
+              "\n");
+    }
+    options.blob_block_index_version = FLAGS_blob_block_index_version;
+    options.blob_block_bitmap_strict_fallback =
+        FLAGS_blob_block_bitmap_strict_fallback;
+    options.blob_block_bitmap_debug = FLAGS_blob_block_bitmap_debug;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;

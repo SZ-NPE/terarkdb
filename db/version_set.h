@@ -343,76 +343,68 @@ class VersionStorageInfo {
   const DependenceMap& dependence_map() const { return dependence_map_; }
 
   // For every blob file currently referenced by the LSM, this struct
-  // captures the union of chunk references coming from every SST in
-  // the current version (`live_chunk_bitmap`) plus a few derived
+  // captures the union of data-block references coming from every SST
+  // in the current version (`live_block_bitmap`) plus a few derived
   // statistics. Bitmaps are aggregated via OR; once any referencing
   // SST is seen with an unavailable per-dependence bitmap (an empty
-  // `BlobChunkBitmap` produced by Phase 4/5 for legacy or
-  // chunk-unaware paths), the blob's `bitmap_available` flag is
-  // sticky-cleared. In that regime GC must fall back to the legacy
-  // GetKey()-based path.
+  // `BlobBlockBitmap` produced for legacy or block-unaware paths), the
+  // blob's `bitmap_available` flag is sticky-cleared. In that regime
+  // GC must fall back to the legacy GetKey()-based path.
   //
-  // `live_chunk_bytes` / `dead_chunk_bytes` / `dead_chunk_ratio` are
-  // computed only when `bitmap_available == true` and the blob file
-  // size is known (FileMetaData::fd.GetFileSize() > 0). Bytes use the
-  // aggregation chunk_size passed to AggregateBlobLiveChunkBitmaps,
-  // capped by the blob file size so that the last (possibly partial)
-  // chunk is accounted correctly.
-  struct BlobLiveChunkInfo {
-    BlobChunkBitmap live_chunk_bitmap;
+  // `total_block_count` is preferably the vSST data block count taken
+  // from its TableProperties; when unknown it falls back to
+  // bitmap.num_bits() (which cannot be used for physical block skip).
+  struct BlobLiveBlockInfo {
+    BlobBlockBitmap live_block_bitmap;
     bool bitmap_available = true;
-    uint64_t live_chunk_count = 0;
-    uint64_t dead_chunk_count = 0;
-    uint64_t live_chunk_bytes = 0;
-    uint64_t dead_chunk_bytes = 0;
-    double dead_chunk_ratio = 0.0;
+    uint64_t live_block_count = 0;
+    uint64_t total_block_count = 0;
+    uint64_t live_block_bytes = 0;
+    uint64_t dead_block_bytes = 0;
+    double dead_block_ratio = 0.0;
   };
 
-  using BlobLiveChunkMap = std::unordered_map<uint64_t, BlobLiveChunkInfo>;
+  using BlobLiveBlockMap = std::unordered_map<uint64_t, BlobLiveBlockInfo>;
 
-  // Aggregate per-dependence chunk bitmaps coming from every SST in
-  // the current version into per-blob-file live chunk views.
-  //
-  // `chunk_size` is the CF option `blob_gc_chunk_size`. When zero,
-  // every blob is marked `bitmap_available = false` and only legacy
-  // bookkeeping is updated. The method is idempotent: it always wipes
-  // the previous state before recomputing, so it is safe to invoke
-  // multiple times on the same VersionStorageInfo (e.g. after an
-  // option change).
-  void AggregateBlobLiveChunkBitmaps(uint64_t chunk_size);
+  // Aggregate per-dependence block bitmaps coming from every SST in
+  // the current version into per-blob-file live block views. The
+  // method is idempotent: it always wipes the previous state before
+  // recomputing, so it is safe to invoke multiple times on the same
+  // VersionStorageInfo (e.g. after an option change).
+  void AggregateBlobLiveBlockBitmaps();
 
-  // Phase 6 wiring helper: discard any previously-aggregated
-  // blob_live_chunk_info_ without running the aggregation pass.
+  // Wiring helper: discard any previously-aggregated
+  // blob_live_block_info_ without running the aggregation pass.
   // Used by Version::PrepareApply() when the CF feature toggle
-  // (enable_blob_validity_bitmap/blob_gc_chunk_size) is off, so that
-  // GC consumers consistently observe "bitmap unavailable" instead of
-  // a stale view produced under a previous option regime.
-  void ClearBlobLiveChunkInfo() { blob_live_chunk_info_.clear(); }
+  // (enable_blob_block_bitmap) is off, so that GC consumers
+  // consistently observe "bitmap unavailable" instead of a stale view
+  // produced under a previous option regime.
+  void ClearBlobLiveBlockInfo() { blob_live_block_info_.clear(); }
 
-  const BlobLiveChunkMap& blob_live_chunk_info() const {
-    return blob_live_chunk_info_;
+  const BlobLiveBlockMap& blob_live_block_info() const {
+    return blob_live_block_info_;
   }
 
   // Convenience accessor used by GC fast path. Returns nullptr if the
   // blob has never been aggregated; callers must then fall back to
   // the legacy lookup-based GC path.
-  const BlobLiveChunkInfo* GetBlobLiveChunkInfo(uint64_t blob_file_number)
+  const BlobLiveBlockInfo* GetBlobLiveBlockInfo(uint64_t blob_file_number)
       const {
-    auto it = blob_live_chunk_info_.find(blob_file_number);
-    return it == blob_live_chunk_info_.end() ? nullptr : &it->second;
+    auto it = blob_live_block_info_.find(blob_file_number);
+    return it == blob_live_block_info_.end() ? nullptr : &it->second;
   }
 
   // -----------------------------------------------------------------
-  // Phase 7: GC fast-path liveness query.
+  // GC fast-path liveness query.
   //
   // Three-state result:
-  //   kLive    : the aggregated bitmap says the chunk has at least one
+  //   kLive    : the aggregated bitmap says the block has at least one
   //              SST reference in the current version. Callers still
-  //              need to do per-record validation (a chunk can contain
+  //              need to do per-record validation (a block can contain
   //              both live and dead records).
   //   kDead    : the aggregated bitmap is available AND no SST in the
-  //              current version references this chunk. GC may drop
-  //              every record in this chunk without a GetKey() lookup.
+  //              current version references this block. GC may drop
+  //              every record in this block without a GetKey() lookup.
   //   kUnknown : the blob has no aggregated view, or its
   //              bitmap_available flag was sticky-cleared because some
   //              referencing SST was in legacy regime. Callers MUST
@@ -420,35 +412,35 @@ class VersionStorageInfo {
   //
   // The method is const and cheap: a single hash lookup + one bit test.
   // -----------------------------------------------------------------
-  enum class BlobChunkLiveness : uint8_t { kLive, kDead, kUnknown };
+  enum class BlobBlockLiveness : uint8_t { kLive, kDead, kUnknown };
 
-  BlobChunkLiveness IsChunkLive(uint64_t blob_file_number,
-                                uint64_t chunk_id) const {
-    auto it = blob_live_chunk_info_.find(blob_file_number);
-    if (it == blob_live_chunk_info_.end()) {
-      return BlobChunkLiveness::kUnknown;
+  BlobBlockLiveness IsBlockLive(uint64_t blob_file_number,
+                                uint64_t block_id) const {
+    auto it = blob_live_block_info_.find(blob_file_number);
+    if (it == blob_live_block_info_.end()) {
+      return BlobBlockLiveness::kUnknown;
     }
-    const BlobLiveChunkInfo& info = it->second;
+    const BlobLiveBlockInfo& info = it->second;
     if (!info.bitmap_available) {
-      return BlobChunkLiveness::kUnknown;
+      return BlobBlockLiveness::kUnknown;
     }
-    return info.live_chunk_bitmap.Test(chunk_id)
-               ? BlobChunkLiveness::kLive
-               : BlobChunkLiveness::kDead;
+    return info.live_block_bitmap.Test(block_id)
+               ? BlobBlockLiveness::kLive
+               : BlobBlockLiveness::kDead;
   }
 
-  // Phase 7: blob-level fast-path gate. Returns true iff every chunk
-  // in the blob is provably dead under the aggregated bitmap. When
-  // this holds, GC may drop every record in the blob without any
-  // GetKey() lookup. Returns false when the bitmap is unavailable or
-  // when at least one chunk is live.
+  // Blob-level fast-path gate. Returns true iff every block in the
+  // blob is provably dead under the aggregated bitmap. When this
+  // holds, GC may drop every record in the blob without any GetKey()
+  // lookup. Returns false when the bitmap is unavailable or when at
+  // least one block is live.
   bool IsBlobEntirelyDead(uint64_t blob_file_number) const {
-    auto it = blob_live_chunk_info_.find(blob_file_number);
-    if (it == blob_live_chunk_info_.end()) {
+    auto it = blob_live_block_info_.find(blob_file_number);
+    if (it == blob_live_block_info_.end()) {
       return false;
     }
-    const BlobLiveChunkInfo& info = it->second;
-    return info.bitmap_available && info.live_chunk_count == 0;
+    const BlobLiveBlockInfo& info = it->second;
+    return info.bitmap_available && info.live_block_count == 0;
   }
 
   const TERARKDB_NAMESPACE::LevelFilesBrief& LevelFilesBrief(int level) const {
@@ -653,10 +645,10 @@ class VersionStorageInfo {
   // Dependence files both in files[-1] and dependence_map
   DependenceMap dependence_map_;
 
-  // Phase 6: per-blob-file aggregated live-chunk view. Filled by
-  // AggregateBlobLiveChunkBitmaps(); empty until then. Internal-only;
+  // Per-blob-file aggregated live-block view. Filled by
+  // AggregateBlobLiveBlockBitmaps(); empty until then. Internal-only;
   // not part of the on-disk manifest representation.
-  BlobLiveChunkMap blob_live_chunk_info_;
+  BlobLiveBlockMap blob_live_block_info_;
 
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.

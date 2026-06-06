@@ -230,29 +230,33 @@ Status SeparateHelper::TransToSeparate(
 Status SeparateHelper::TransToSeparate(
     const Slice& internal_key, LazyBuffer& value, uint64_t file_number,
     const Slice& meta, bool is_merge, bool is_index,
-    const ValueExtractor* value_meta_extractor, uint64_t chunk_id) {
-  // Fast path: caller has no chunk_id to stamp. Delegate to the
-  // legacy overload so behavior is bit-for-bit identical to pre-
-  // chunk-aware code. This is the path exercised whenever the CF
-  // option `enable_blob_validity_bitmap` is off.
-  if (chunk_id == kNoChunkId) {
+    const ValueExtractor* value_meta_extractor, uint64_t block_id,
+    uint64_t layout_id) {
+  // Fast path: caller has no usable block_id/layout_id to stamp.
+  // Delegate to the legacy overload so behavior is bit-for-bit
+  // identical to pre-block-aware code. This is the path exercised
+  // whenever the CF option `enable_blob_block_bitmap` is off, or when
+  // the builder does not support data block ids.
+  if (block_id == kNoBlockId || layout_id == kNoBlockLayoutId) {
     return TransToSeparate(internal_key, value, file_number, meta, is_merge,
                            is_index, value_meta_extractor);
   }
 
   assert(file_number != uint64_t(-1));
   // Build the encoded value-index into a temporary buffer so that we
-  // can append the chunk-id trailer before handing the final bytes
-  // back to LazyBuffer::reset(). The buffer layout is:
+  // can append the fixed-length block-id trailer before handing the
+  // final bytes back to LazyBuffer::reset(). The buffer layout is:
   //   [ file_number(8B, LE) ]
   //   [ meta(M bytes, optional) ]
-  //   [ varint64(chunk_id) ]
-  //   [ kChunkIdTrailerMagic(1B) ]
+  //   [ block_id(fixed64) ]
+  //   [ layout_id(fixed64) ]
+  //   [ version(1B) ]
+  //   [ kBlockIdTrailerMagic(1B) ]
   //
   // `is_merge` callers never carry meta (see the legacy overload),
   // so we mirror the exact meta-presence policy used there.
   std::string buf;
-  buf.reserve(sizeof(uint64_t) + meta.size() + 11);
+  buf.reserve(sizeof(uint64_t) + meta.size() + kBlockIdTrailerLength);
 
   // file_number head.
   uint64_t fn = file_number;
@@ -261,7 +265,7 @@ Status SeparateHelper::TransToSeparate(
 
   if (value_meta_extractor == nullptr || is_merge) {
     // No meta region. Append trailer directly after file_number.
-    EncodeChunkIdTrailer(&buf, chunk_id);
+    EncodeBlockIdTrailer(&buf, block_id, layout_id);
     value.reset(Slice(buf), true, file_number);
     // reset() with copy=true internally copies the bytes, so `buf`
     // can safely go out of scope after this call.
@@ -271,7 +275,7 @@ Status SeparateHelper::TransToSeparate(
   if (is_index) {
     // Caller already supplies meta as a raw Slice.
     buf.append(meta.data(), meta.size());
-    EncodeChunkIdTrailer(&buf, chunk_id);
+    EncodeBlockIdTrailer(&buf, block_id, layout_id);
     value.reset(Slice(buf), true, file_number);
     return Status::OK();
   }
@@ -288,7 +292,7 @@ Status SeparateHelper::TransToSeparate(
     return s;
   }
   buf.append(value_meta.data(), value_meta.size());
-  EncodeChunkIdTrailer(&buf, chunk_id);
+  EncodeBlockIdTrailer(&buf, block_id, layout_id);
   value.reset(Slice(buf), true, file_number);
   return Status::OK();
 }
@@ -297,117 +301,105 @@ Status SeparateHelper::TransToSeparate(
 // dbformat.h. Required under C++14 for ODR-use (e.g. passing them by
 // reference to ASSERT_EQ in tests). Harmless under C++17+ where they
 // are implicitly inline.
-constexpr uint64_t SeparateHelper::kNoChunkId;
-constexpr uint8_t SeparateHelper::kChunkIdTrailerMagic;
+constexpr uint64_t SeparateHelper::kNoBlockId;
+constexpr uint64_t SeparateHelper::kNoBlockLayoutId;
+constexpr uint8_t SeparateHelper::kBlockIdTrailerMagic;
+constexpr uint8_t SeparateHelper::kBlockIndexVersion;
+constexpr size_t SeparateHelper::kBlockIdTrailerLength;
 
-void SeparateHelper::EncodeChunkIdTrailer(std::string* dst, uint64_t chunk_id) {
+void SeparateHelper::EncodeBlockIdTrailer(std::string* dst, uint64_t block_id,
+                                          uint64_t layout_id) {
   assert(dst != nullptr);
   assert(dst->size() >= sizeof(uint64_t));
-  PutVarint64(dst, chunk_id);
-  dst->push_back(static_cast<char>(kChunkIdTrailerMagic));
+  // Fixed-length trailer: fixed64(block_id) + fixed64(layout_id) +
+  // version(1B) + magic(1B). No varint, no reverse scan.
+  PutFixed64(dst, block_id);
+  PutFixed64(dst, layout_id);
+  dst->push_back(static_cast<char>(kBlockIndexVersion));
+  dst->push_back(static_cast<char>(kBlockIdTrailerMagic));
 }
 
-// Attempt to locate a chunk-id trailer at the tail of slice. On
-// success, returns true and writes the decoded chunk_id to *chunk_id
-// and the varint-encoding length (in bytes, excluding the magic) to
-// *varint_len. On failure (no trailer / malformed / would eat into
-// the file_number head), returns false and leaves outputs unspecified.
-static bool ParseChunkIdTrailer(const Slice& slice, uint64_t* chunk_id,
-                                size_t* varint_len) {
-  // Minimum payload: 8B file_number + 1B varint + 1B magic.
-  if (slice.size() < sizeof(uint64_t) + 2) {
+// Attempt to validate and decode a fixed-length block-id trailer at the
+// tail of slice. On success, returns true and writes the decoded
+// block_id / layout_id to the provided out-params. On failure (slice
+// too short / wrong magic / wrong version / sentinel values), returns
+// false and leaves outputs unspecified.
+//
+// Validity is decided purely by the fixed size + magic + version +
+// non-sentinel checks. There is NO backwards varint scan: this is the
+// whole point of the new format.
+static bool ParseBlockIdTrailer(const Slice& slice, uint64_t* block_id,
+                                uint64_t* layout_id) {
+  // Minimum payload: 8B file_number head + fixed trailer.
+  if (slice.size() < sizeof(uint64_t) + SeparateHelper::kBlockIdTrailerLength) {
     return false;
   }
-  const uint8_t last =
-      static_cast<uint8_t>(slice.data()[slice.size() - 1]);
-  if (last != SeparateHelper::kChunkIdTrailerMagic) {
-    return false;
-  }
-
-  // Scan backwards from the byte just before magic to find the start
-  // of the varint64. A varint64 terminator is a byte whose top bit is
-  // 0, and any "continuation" byte has top bit 1. The start of the
-  // varint is the byte immediately after the previous terminator
-  // (or the first non-head byte, whichever is earlier).
-  //
-  // Upper bound on varint64 length is 10 bytes.
   const char* data = slice.data();
   const size_t n = slice.size();
-  const size_t head = sizeof(uint64_t);  // inclusive lower bound
-  const size_t max_varint_bytes = 10;
-  // last - 1 is the final varint byte; its top bit must be 0.
-  if (n < head + 2) {
+
+  // magic is the very last byte.
+  const uint8_t magic = static_cast<uint8_t>(data[n - 1]);
+  if (magic != SeparateHelper::kBlockIdTrailerMagic) {
     return false;
   }
-  const size_t last_varint_idx = n - 2;
-  if ((static_cast<uint8_t>(data[last_varint_idx]) & 0x80) != 0) {
-    // Last varint byte must be a terminator (top bit 0).
+  // version is the byte before magic.
+  const uint8_t version = static_cast<uint8_t>(data[n - 2]);
+  if (version != SeparateHelper::kBlockIndexVersion) {
+    // Unknown trailer version: treat as legacy and fall back.
     return false;
   }
 
-  // Scan backwards to find either (a) another terminator (meaning the
-  // varint starts just after it), or (b) hit the file_number boundary.
-  size_t start = last_varint_idx;
-  while (start > head) {
-    size_t prev = start - 1;
-    if ((static_cast<uint8_t>(data[prev]) & 0x80) == 0) {
-      // data[prev] is a terminator of something *before* our varint.
-      break;
-    }
-    // data[prev] is a continuation byte of our varint.
-    --start;
-    if (last_varint_idx - start + 1 > max_varint_bytes) {
-      // Would exceed max varint64 length.
-      return false;
-    }
-  }
-  // Do not eat into the file_number head.
-  if (start < head) {
+  // Decode the two fixed64 fields located right before version+magic.
+  const size_t trailer_start = n - SeparateHelper::kBlockIdTrailerLength;
+  const uint64_t decoded_block_id = DecodeFixed64(data + trailer_start);
+  const uint64_t decoded_layout_id =
+      DecodeFixed64(data + trailer_start + sizeof(uint64_t));
+
+  // Reject sentinels so kNoBlockId / kNoBlockLayoutId stay unambiguous.
+  if (decoded_block_id == SeparateHelper::kNoBlockId ||
+      decoded_layout_id == SeparateHelper::kNoBlockLayoutId) {
     return false;
   }
 
-  const size_t varint_bytes = last_varint_idx - start + 1;
-  uint64_t decoded = 0;
-  const char* ptr = GetVarint64Ptr(data + start, data + last_varint_idx + 1,
-                                   &decoded);
-  if (ptr == nullptr || ptr != data + last_varint_idx + 1) {
-    return false;
-  }
-
-  // Reject sentinel as a chunk id to keep kNoChunkId unambiguous.
-  if (decoded == SeparateHelper::kNoChunkId) {
-    return false;
-  }
-
-  *chunk_id = decoded;
-  *varint_len = varint_bytes;
+  *block_id = decoded_block_id;
+  *layout_id = decoded_layout_id;
   return true;
 }
 
-bool SeparateHelper::HasChunkId(const Slice& slice) {
-  uint64_t unused_chunk_id = 0;
-  size_t unused_len = 0;
-  return ParseChunkIdTrailer(slice, &unused_chunk_id, &unused_len);
+bool SeparateHelper::HasBlockId(const Slice& slice) {
+  uint64_t unused_block_id = 0;
+  uint64_t unused_layout_id = 0;
+  return ParseBlockIdTrailer(slice, &unused_block_id, &unused_layout_id);
 }
 
-uint64_t SeparateHelper::DecodeChunkId(const Slice& slice) {
-  uint64_t chunk_id = 0;
-  size_t unused_len = 0;
-  if (!ParseChunkIdTrailer(slice, &chunk_id, &unused_len)) {
-    return kNoChunkId;
+uint64_t SeparateHelper::DecodeBlockId(const Slice& slice) {
+  uint64_t block_id = 0;
+  uint64_t unused_layout_id = 0;
+  if (!ParseBlockIdTrailer(slice, &block_id, &unused_layout_id)) {
+    return kNoBlockId;
   }
-  return chunk_id;
+  return block_id;
 }
 
-Slice SeparateHelper::DecodeValueMetaStripChunk(const Slice& slice) {
+uint64_t SeparateHelper::DecodeBlockLayoutId(const Slice& slice) {
+  uint64_t unused_block_id = 0;
+  uint64_t layout_id = 0;
+  if (!ParseBlockIdTrailer(slice, &unused_block_id, &layout_id)) {
+    return kNoBlockLayoutId;
+  }
+  return layout_id;
+}
+
+Slice SeparateHelper::DecodeValueMetaStripBlockId(const Slice& slice) {
   assert(slice.size() >= sizeof(uint64_t));
-  uint64_t unused_chunk_id = 0;
-  size_t varint_len = 0;
-  if (ParseChunkIdTrailer(slice, &unused_chunk_id, &varint_len)) {
-    const size_t trailer_bytes = varint_len + 1;  // varint + magic
+  uint64_t unused_block_id = 0;
+  uint64_t unused_layout_id = 0;
+  if (ParseBlockIdTrailer(slice, &unused_block_id, &unused_layout_id)) {
+    // Strip exactly the fixed trailer bytes.
     return Slice(slice.data() + sizeof(uint64_t),
-                 slice.size() - sizeof(uint64_t) - trailer_bytes);
+                 slice.size() - sizeof(uint64_t) - kBlockIdTrailerLength);
   }
+  // Legacy meta view (no trailer / malformed): never strip.
   return Slice(slice.data() + sizeof(uint64_t),
                slice.size() - sizeof(uint64_t));
 }

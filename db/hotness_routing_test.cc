@@ -1,87 +1,206 @@
 //  Copyright (c) 2024-present. All rights reserved.
 
+#include <map>
 #include <memory>
 #include <string>
-#include <map>
-#include <vector>
 #include <thread>
+#include <vector>
 
 #include "cache/fifo_cache.h"
 #include "db/db_test_util.h"
-#include "util/hotness_tracker.h"
-#include "util/testharness.h"
+#include "port/stack_trace.h"
 #include "rocksdb/cache.h"
-#include "rocksdb/env.h"
 #include "rocksdb/db.h"
+#include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/terark_namespace.h"
-#include "port/stack_trace.h"
+#include "util/hotness_tracker.h"
+#include "util/testharness.h"
 
 namespace TERARKDB_NAMESPACE {
 
-// Phase 1 & 2: 单元测试 (HotnessTracker 基本逻辑)
+namespace {
+
+// Builds a HotnessTracker::Options with a small but functional Count-Min
+// Sketch and a generous recent write window, suitable for unit tests.
+HotnessTracker::Options MakeTestOptions() {
+  HotnessTracker::Options options;
+  options.window_capacity = 1 << 20;
+  options.enable_write_window = true;
+  options.enable_compaction_feedback = true;
+  options.sketch_width = 4096;
+  options.sketch_depth = 4;
+  options.write_repeat_weight = 1;
+  options.compaction_feedback_weight = 2;
+  options.threshold = 2;
+  options.decay_interval = 0;     // disabled by default
+  options.half_life_writes = 0;   // disabled by default
+  return options;
+}
+
+}  // namespace
+
+// Unit tests for the Count-Min Sketch based HotnessTracker.
 class HotnessTrackerTest : public testing::Test {};
 
-TEST_F(HotnessTrackerTest, BasicThreeStateClassification) {
-  HotnessTracker tracker(16, 64, 0);
+// (a) A single write must never exceed the threshold.
+TEST_F(HotnessTrackerTest, SingleWriteStaysBelowThreshold) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
-  Slice warm_key("w001");
-  uint32_t warm_hash = HotnessTracker::Hash(warm_key);
-  ASSERT_EQ(tracker.ClassifyForFlush(warm_key, warm_hash),
+  Slice key("single_write_key");
+  tracker.RecordWrite(key);
+
+  ASSERT_LT(tracker.Estimate(key), 2U);
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kWarm);
+}
+
+// (b) Repeated writes raise the score and route the key to the hot route.
+TEST_F(HotnessTrackerTest, RepeatedWritesBecomeHot) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
+
+  Slice key("repeat_write_key");
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kWarm);
 
-  tracker.RecordHotness(warm_key, warm_hash);
-  ASSERT_EQ(tracker.ClassifyForFlush(warm_key, warm_hash),
-            HotnessTracker::FlushRoute::kWarm);
-  ASSERT_FALSE(tracker.IsHot(warm_key, warm_hash));
+  // First write only inserts into the window. The next two writes are
+  // overwrites and each adds write_repeat_weight (=1), reaching threshold (=2).
+  tracker.RecordWrite(key);
+  tracker.RecordWrite(key);
+  tracker.RecordWrite(key);
 
-  Slice stateful_key("s001");
-  uint32_t stateful_hash = HotnessTracker::Hash(stateful_key);
-  tracker.RecordHotness(stateful_key, stateful_hash);
-  tracker.RecordHotness(stateful_key, stateful_hash);
-  ASSERT_EQ(tracker.ClassifyForFlush(stateful_key, stateful_hash),
+  ASSERT_GE(tracker.Estimate(key), 2U);
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kEphemeral);
-  ASSERT_TRUE(tracker.IsHot(stateful_key, stateful_hash));
-
-  for (int i = 0; i < 4; ++i) {
-    std::string filler = "f00" + std::to_string(i);
-    tracker.RecordHotness(filler, HotnessTracker::Hash(filler));
-  }
-
-  ASSERT_EQ(tracker.ClassifyForFlush(stateful_key, stateful_hash),
-            HotnessTracker::FlushRoute::kStable);
-  ASSERT_TRUE(tracker.IsHot(stateful_key, stateful_hash));
 }
 
-TEST_F(HotnessTrackerTest, FlushQueryDoesNotExtendLifecycle) {
-  // 设置较小的 Cache 方便触发淘汰，如 1024 字节
-  HotnessTracker tracker(1024, 1024, 0);
+// (c) Compaction feedback raises the score.
+TEST_F(HotnessTrackerTest, CompactionFeedbackBecomesHot) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
-  Slice key("target_hot_key");
+  Slice key("compaction_feedback_key");
+  ASSERT_EQ(tracker.Estimate(key), 0U);
 
-  // 1. 连续写入两次，使其晋升为 Hot (进入 Cache2)
-  tracker.RecordHotness(key, HotnessTracker::Hash(key));
-  tracker.RecordHotness(key, HotnessTracker::Hash(key));
-  ASSERT_TRUE(tracker.IsHot(key, HotnessTracker::Hash(key)));
+  // compaction_feedback_weight (=2) reaches threshold (=2) in one shot.
+  tracker.RecordCompactionFeedback(key);
 
-  // 2. 模拟 Flush 时的频繁查询。这绝对不能触发 LRU 内部的晋升/刷新。
+  ASSERT_GE(tracker.Estimate(key), 2U);
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kEphemeral);
+}
+
+// (d) Decay reduces a previously accumulated score.
+TEST_F(HotnessTrackerTest, DecayReducesScore) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
+
+  Slice key("decay_key");
+  // Accumulate a clearly-hot score via compaction feedback (weight 2 each).
+  tracker.RecordCompactionFeedback(key);
+  tracker.RecordCompactionFeedback(key);
+  uint32_t before = tracker.Estimate(key);
+  ASSERT_EQ(before, 4U);
+
+  tracker.TEST_ForceDecay();
+
+  uint32_t after = tracker.Estimate(key);
+  ASSERT_LT(after, before);
+  ASSERT_EQ(after, before / 2);
+}
+
+// (f) When the write window is disabled, repeated writes do not raise score.
+TEST_F(HotnessTrackerTest, WriteWindowDisabledKeepsScoreFlat) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.enable_write_window = false;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("no_window_key");
+  for (int i = 0; i < 100; ++i) {
+    tracker.RecordWrite(key);
+  }
+
+  ASSERT_EQ(tracker.Estimate(key), 0U);
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kWarm);
+}
+
+// (g) When compaction feedback is disabled, feedback does not raise score.
+TEST_F(HotnessTrackerTest, CompactionFeedbackDisabledKeepsScoreFlat) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.enable_compaction_feedback = false;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("no_feedback_key");
+  for (int i = 0; i < 100; ++i) {
+    tracker.RecordCompactionFeedback(key);
+  }
+
+  ASSERT_EQ(tracker.Estimate(key), 0U);
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kWarm);
+}
+
+// Decay must remain disabled when either knob is zero.
+TEST_F(HotnessTrackerTest, DecayDisabledByZeroIntervalDoesNotFire) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.decay_interval = 0;
+  options.half_life_writes = 6500000;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("decay_disabled_key");
+  tracker.RecordCompactionFeedback(key);
+  uint32_t before = tracker.Estimate(key);
+
   for (int i = 0; i < 1000; ++i) {
-    tracker.IsHot(key, HotnessTracker::Hash(key));
+    std::string filler = "filler_" + std::to_string(i);
+    tracker.RecordWrite(filler);
   }
 
-  // 3. 写入大量其他 Hot Key，触发 Cache2 (LRU) 的淘汰
-  for (int i = 0; i < 200; ++i) {
-    std::string filler = "other_hot_key_" + std::to_string(i);
-    tracker.RecordHotness(filler, HotnessTracker::Hash(filler));
-    tracker.RecordHotness(filler, HotnessTracker::Hash(filler)); // 第二次写入使其晋升，挤占 Cache2 空间
-  }
-
-  // 4. 验证：由于之前的 IsHot 查询不应延长 target_hot_key 的生命周期，
-  // 此时它应该已经被新晋升的 filler keys 淘汰出 Cache2。
-  ASSERT_FALSE(tracker.IsHot(key, HotnessTracker::Hash(key)));
+  // No automatic decay should have occurred.
+  ASSERT_EQ(tracker.Estimate(key), before);
 }
 
-// Phase 3 & 4: 端到端集成测试 (DB Flush 分流 & GC 冷通道)
+// Cold keys written only once must never be promoted to the hot route.
+TEST_F(HotnessTrackerTest, ColdKeysNeverPromoted) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
+
+  for (int i = 0; i < 1000; ++i) {
+    std::string key = "cold_" + std::to_string(i);
+    tracker.RecordWrite(key);
+    ASSERT_EQ(tracker.ClassifyForFlush(key),
+              HotnessTracker::FlushRoute::kWarm);
+  }
+}
+
+TEST_F(HotnessTrackerTest, ConcurrentSafetyBasicCheck) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
+
+  const int num_threads = 4;
+  const int ops_per_thread = 100;
+  std::vector<std::thread> threads;
+
+  for (int t = 0; t < num_threads; ++t) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < ops_per_thread; ++i) {
+        std::string key =
+            "thread_" + std::to_string(t) + "_op_" + std::to_string(i);
+        if (i % 3 == 0) {
+          tracker.RecordWrite(key);
+          tracker.RecordWrite(key);
+        } else {
+          tracker.Estimate(key);
+        }
+      }
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  SUCCEED();
+}
+
+// End-to-end routing tests exercising the full DB write/flush path.
 class AdaptiveHotnessRoutingTest : public DBTestBase {
  public:
   AdaptiveHotnessRoutingTest() : DBTestBase("/hotness_routing_test") {}
@@ -93,13 +212,16 @@ class TrackHintWritableFile : public WritableFileWrapper {
  private:
   std::unique_ptr<WritableFile> owner_;
   TrackHintEnv* env_;
+
  public:
   std::string fname_;
 
-  TrackHintWritableFile(std::unique_ptr<WritableFile>&& t, 
-                        TrackHintEnv* env,
-                        const std::string& fname) 
-      : WritableFileWrapper(t.get()), owner_(std::move(t)), env_(env), fname_(fname) {}
+  TrackHintWritableFile(std::unique_ptr<WritableFile>&& t, TrackHintEnv* env,
+                        const std::string& fname)
+      : WritableFileWrapper(t.get()),
+        owner_(std::move(t)),
+        env_(env),
+        fname_(fname) {}
 
   void SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) override;
 };
@@ -148,153 +270,42 @@ void TrackHintWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
   owner_->SetWriteLifeTimeHint(hint);
 }
 
-TEST_F(AdaptiveHotnessRoutingTest, Phase3And4E2ERouting) {
+// Repeatedly-written keys should be flushed to the hot (short-lived) route,
+// while a key written only once stays on the cold (medium) route.
+TEST_F(AdaptiveHotnessRoutingTest, RepeatedWritesRouteToHotBlob) {
   TrackHintEnv track_env(env_);
   Options options = CurrentOptions();
   options.env = &track_env;
   options.create_if_missing = true;
-  options.disable_auto_compactions = true;  // 禁用后台 Compaction 以控制测试流程
+  options.disable_auto_compactions = true;
 
   options.blob_size = 0;
   options.enable_hotness_tracker = true;
-  options.hotness_window_capacity = 8;
-  options.hotness_hot_capacity = 4096;
+  options.hotness_window_capacity = 1 << 20;
+  options.hotness_enable_write_window = true;
+  options.hotness_enable_compaction_feedback = true;
+  options.hotness_sketch_width = 4096;
+  options.hotness_sketch_depth = 4;
+  options.hotness_write_repeat_weight = 1;
+  options.hotness_compaction_feedback_weight = 2;
+  options.hotness_threshold = 2;
+  options.hotness_decay_interval = 0;
+  options.hotness_half_life_writes = 0;
   options.target_blob_file_size = 10 * 1024;
 
   DestroyAndReopen(options);
 
-  ASSERT_OK(Put("s000", "sv1"));
-  ASSERT_OK(Put("s000", "sv2"));
-  ASSERT_OK(Put("w000", "wv0"));
-  ASSERT_OK(Put("f001", "fv1"));
-  ASSERT_OK(Put("f002", "fv2"));
-  ASSERT_OK(Put("e000", "ev1"));
-  ASSERT_OK(Put("e000", "ev2"));
-
-  std::map<std::string, int> pre_flush_live_files;
-  {
-    std::vector<LiveFileMetaData> live_files;
-    db_->GetLiveFilesMetaData(&live_files);
-    for (const auto& meta : live_files) {
-      size_t pos = meta.name.find_last_of('/');
-      const std::string key =
-          (pos == std::string::npos) ? meta.name : meta.name.substr(pos + 1);
-      pre_flush_live_files.emplace(key, meta.level);
-    }
+  // Hot keys: written 3 times each (two overwrites -> score reaches threshold).
+  for (int i = 0; i < 8; ++i) {
+    std::string key = "hot" + std::to_string(i);
+    ASSERT_OK(Put(key, "v1"));
+    ASSERT_OK(Put(key, "v2"));
+    ASSERT_OK(Put(key, "v3"));
   }
-  {
-    MutexLock l(&track_env.mutex_);
-    track_env.file_hints_.clear();
-  }
-
-  Flush(); // 强制触发 MemTable Flush
-
-  size_t new_file_count = 0;
-  size_t new_sst_count = 0;
-  size_t new_blob_count = 0;
-  size_t sst_medium_count = 0;
-  size_t blob_medium_count = 0;
-  size_t blob_extreme_count = 0;
-  size_t blob_short_count = 0;
-  {
-    std::vector<LiveFileMetaData> live_files;
-    db_->GetLiveFilesMetaData(&live_files);
-
-    MutexLock l(&track_env.mutex_);
-    for (const auto& meta : live_files) {
-      size_t pos = meta.name.find_last_of('/');
-      const std::string key =
-          (pos == std::string::npos) ? meta.name : meta.name.substr(pos + 1);
-      if (pre_flush_live_files.count(key) != 0) {
-        continue;
-      }
-      ++new_file_count;
-      const Env::WriteLifeTimeHint* hint =
-          FindHintByBasename(track_env.file_hints_, key);
-      ASSERT_NE(hint, nullptr) << meta.db_path << "/" << meta.name;
-
-      if (meta.level == -1) {
-        ++new_blob_count;
-        if (*hint == Env::WLTH_MEDIUM) ++blob_medium_count;
-        if (*hint == Env::WLTH_EXTREME) ++blob_extreme_count;
-        if (*hint == Env::WLTH_SHORT) ++blob_short_count;
-      } else {
-        ++new_sst_count;
-        if (*hint == Env::WLTH_MEDIUM) ++sst_medium_count;
-      }
-    }
-  }
-
-  ASSERT_GE(new_file_count, 2U);
-  ASSERT_EQ(new_sst_count, 1U);
-  ASSERT_GE(new_blob_count, 1U);
-  ASSERT_EQ(sst_medium_count, 1U);
-  ASSERT_EQ(blob_medium_count + blob_short_count + blob_extreme_count,
-            new_blob_count);
-
-  {
-    MutexLock l(&track_env.mutex_);
-    track_env.file_hints_.clear();
-  }
-
-  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
-
-  bool found_short = false;
-  bool found_extreme = false;
-  {
-    MutexLock l(&track_env.mutex_);
-    for (const auto& pair : track_env.file_hints_) {
-      if (pair.first.find(".blob") != std::string::npos ||
-          pair.first.find(".sst") != std::string::npos) {
-        if (pair.second == Env::WLTH_SHORT) found_short = true;
-        if (pair.second == Env::WLTH_EXTREME) found_extreme = true;
-      }
-    }
-  }
-
-  ASSERT_TRUE(found_extreme);
-  ASSERT_FALSE(found_short);
-
-  // Cleanup DB manually before env goes out of scope
-  Close();
-}
-
-TEST_F(AdaptiveHotnessRoutingTest, WriteBatchInterception) {
-  TrackHintEnv track_env(env_);
-  Options options = CurrentOptions();
-  options.env = &track_env;
-  options.create_if_missing = true;
-  options.disable_auto_compactions = true;  // 禁用后台 Compaction
-
-  options.blob_size = 0;
-  options.enable_hotness_tracker = true;
-  options.hotness_window_capacity = 8;
-  options.hotness_hot_capacity = 4096;
-  options.target_blob_file_size = 10 * 1024;
-
-  DestroyAndReopen(options);
-
-  WriteBatch batch;
-  batch.Put("s100", "sv1");
-  batch.Put("s100", "sv2");
-  batch.Put("w100", "wv0");
-  batch.Put("f101", "fv1");
-  batch.Put("f102", "fv2");
-  batch.Put("e100", "ev1");
-  batch.Put("e100", "ev2");
-
-  ASSERT_OK(db_->Write(WriteOptions(), &batch));
-
-  std::map<std::string, int> pre_flush_live_files;
-  {
-    std::vector<LiveFileMetaData> live_files;
-    db_->GetLiveFilesMetaData(&live_files);
-    for (const auto& meta : live_files) {
-      size_t pos = meta.name.find_last_of('/');
-      const std::string key =
-          (pos == std::string::npos) ? meta.name : meta.name.substr(pos + 1);
-      pre_flush_live_files.emplace(key, meta.level);
-    }
+  // Cold keys: written once.
+  for (int i = 0; i < 8; ++i) {
+    std::string key = "cold" + std::to_string(i);
+    ASSERT_OK(Put(key, "v1"));
   }
 
   {
@@ -304,32 +315,52 @@ TEST_F(AdaptiveHotnessRoutingTest, WriteBatchInterception) {
 
   Flush();
 
-  size_t blob_medium_count = 0;
-  size_t blob_extreme_count = 0;
-  size_t blob_short_count = 0;
+  bool found_short = false;
+  bool found_medium = false;
   {
-    std::vector<LiveFileMetaData> live_files;
-    db_->GetLiveFilesMetaData(&live_files);
-
     MutexLock l(&track_env.mutex_);
-    for (const auto& meta : live_files) {
-      size_t pos = meta.name.find_last_of('/');
-      const std::string key =
-          (pos == std::string::npos) ? meta.name : meta.name.substr(pos + 1);
-      if (pre_flush_live_files.count(key) != 0 || meta.level != -1) {
+    for (const auto& pair : track_env.file_hints_) {
+      if (pair.first.find(".blob") == std::string::npos) {
         continue;
       }
-
-      const Env::WriteLifeTimeHint* hint =
-          FindHintByBasename(track_env.file_hints_, key);
-      ASSERT_NE(hint, nullptr) << meta.db_path << "/" << meta.name;
-      if (*hint == Env::WLTH_SHORT) ++blob_short_count;
-      if (*hint == Env::WLTH_MEDIUM) ++blob_medium_count;
-      if (*hint == Env::WLTH_EXTREME) ++blob_extreme_count;
+      if (pair.second == Env::WLTH_SHORT) found_short = true;
+      if (pair.second == Env::WLTH_MEDIUM) found_medium = true;
     }
   }
 
-  ASSERT_GE(blob_short_count + blob_medium_count + blob_extreme_count, 1U);
+  // Hot keys produce a short-lived blob; cold keys produce a medium blob.
+  ASSERT_TRUE(found_short);
+  ASSERT_TRUE(found_medium);
+
+  Close();
+}
+
+// With the hotness tracker disabled the DB must behave exactly as before:
+// writes succeed, flush succeeds and data is readable.
+TEST_F(AdaptiveHotnessRoutingTest, DisabledTrackerBehavesNormally) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.blob_size = 0;
+  options.enable_hotness_tracker = false;
+  options.target_blob_file_size = 10 * 1024;
+
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 8; ++i) {
+    std::string key = "k" + std::to_string(i);
+    ASSERT_OK(Put(key, "v1"));
+    ASSERT_OK(Put(key, "v2"));
+  }
+
+  Flush();
+
+  for (int i = 0; i < 8; ++i) {
+    std::string key = "k" + std::to_string(i);
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), key, &value));
+    ASSERT_EQ(value, "v2");
+  }
 
   Close();
 }
@@ -338,9 +369,7 @@ TEST_F(AdaptiveHotnessRoutingTest, WriteBatchInterception) {
 // 验证: 无锁读取、FIFO淘汰顺序、生命周期不延长
 class FIFOCacheTest : public testing::Test {
  protected:
-  void SetUp() override {
-    CreateCache(1024);
-  }
+  void SetUp() override { CreateCache(1024); }
 
   void CreateCache(size_t capacity) {
     FIFOCacheOptions opts;
@@ -374,7 +403,8 @@ TEST_F(FIFOCacheTest, BasicInsertAndLookup) {
   uint32_t hash = ShardedCache::HashSlice(key);
 
   Cache::Handle* handle = nullptr;
-  Status s = cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter, &handle);
+  Status s =
+      cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter, &handle);
   ASSERT_OK(s);
   ASSERT_NE(handle, nullptr);
   cache_->Release(handle);
@@ -400,11 +430,14 @@ TEST_F(FIFOCacheTest, LookupDoesNotExtendLifecycle) {
   uint32_t hash5 = ShardedCache::HashSlice(key5);
 
   Cache::Handle* handle = nullptr;
-  ASSERT_OK(cache_->Insert(key1, hash1, nullptr, key1.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key1, hash1, nullptr, key1.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
-  ASSERT_OK(cache_->Insert(key2, hash2, nullptr, key2.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key2, hash2, nullptr, key2.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
-  ASSERT_OK(cache_->Insert(key3, hash3, nullptr, key3.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key3, hash3, nullptr, key3.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
 
   ASSERT_EQ(FIFOSize(), 3U);
@@ -418,7 +451,8 @@ TEST_F(FIFOCacheTest, LookupDoesNotExtendLifecycle) {
     cache_->Release(h);
   }
 
-  ASSERT_OK(cache_->Insert(key4, hash4, nullptr, key4.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key4, hash4, nullptr, key4.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
 
   ASSERT_FALSE(Contains(key1, hash1));
@@ -433,7 +467,8 @@ TEST_F(FIFOCacheTest, LookupDoesNotExtendLifecycle) {
     cache_->Release(h);
   }
 
-  ASSERT_OK(cache_->Insert(key5, hash5, nullptr, key5.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key5, hash5, nullptr, key5.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
 
   // 如果 Lookup 会延长生命周期，这里被淘汰的会是 key3 而不是 key2。
@@ -447,14 +482,16 @@ TEST_F(FIFOCacheTest, FIFOFevictionOrder) {
   // 使用固定容量构造可精确预期的淘汰顺序。
   CreateCache(16);
 
-  std::vector<std::string> keys = {"a001", "a002", "a003", "a004", "a005", "a006"};
+  std::vector<std::string> keys = {"a001", "a002", "a003",
+                                   "a004", "a005", "a006"};
 
   Cache::Handle* handle = nullptr;
   for (int i = 0; i < 4; ++i) {
     const auto& key_str = keys[i];
     Slice key(key_str);
     uint32_t hash = ShardedCache::HashSlice(key);
-    ASSERT_OK(cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter, &handle));
+    ASSERT_OK(
+        cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter, &handle));
     cache_->Release(handle);
   }
 
@@ -464,7 +501,8 @@ TEST_F(FIFOCacheTest, FIFOFevictionOrder) {
 
   Slice key5(keys[4]);
   uint32_t hash5 = ShardedCache::HashSlice(key5);
-  ASSERT_OK(cache_->Insert(key5, hash5, nullptr, key5.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key5, hash5, nullptr, key5.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
 
   ASSERT_FALSE(Contains(keys[0], ShardedCache::HashSlice(keys[0])));
@@ -475,7 +513,8 @@ TEST_F(FIFOCacheTest, FIFOFevictionOrder) {
 
   Slice key6(keys[5]);
   uint32_t hash6 = ShardedCache::HashSlice(key6);
-  ASSERT_OK(cache_->Insert(key6, hash6, nullptr, key6.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key6, hash6, nullptr, key6.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
 
   ASSERT_FALSE(Contains(keys[1], ShardedCache::HashSlice(keys[1])));
@@ -491,7 +530,8 @@ TEST_F(FIFOCacheTest, EraseAndReinsert) {
   uint32_t hash = ShardedCache::HashSlice(key);
 
   Cache::Handle* handle = nullptr;
-  ASSERT_OK(cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
 
   // 验证存在
@@ -506,168 +546,15 @@ TEST_F(FIFOCacheTest, EraseAndReinsert) {
   ASSERT_EQ(cache_->Lookup(key, hash), nullptr);
 
   // 重新插入
-  ASSERT_OK(cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter, &handle));
+  ASSERT_OK(
+      cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter, &handle));
   cache_->Release(handle);
   lookup = cache_->Lookup(key, hash);
   ASSERT_NE(lookup, nullptr);
   cache_->Release(lookup);
 }
 
-// HotnessTracker 边界条件测试
-// 验收标准 #2: 无锁晋升（不删除 Cache1 条目）
-// 验收标准补充: 热键维持热度逻辑
-
-TEST_F(HotnessTrackerTest, NoEraseFromCache1OnPromotion) {
-  // 强验证:
-  // 1. 首次写入后仅存在于 Cache1
-  // 2. 第二次写入后同时存在于 Cache1 和 Cache2
-  // 3. 之后它只能被 FIFO 自然淘汰，而不是在晋升时被主动删除
-  HotnessTracker tracker(16, 32, 0);
-
-  Slice key("p001");
-  uint32_t hash = HotnessTracker::Hash(key);
-
-  tracker.RecordHotness(key, hash);
-  ASSERT_TRUE(tracker.TEST_WindowContains(key, hash));
-  ASSERT_FALSE(tracker.TEST_HotContains(key, hash));
-  ASSERT_EQ(tracker.TEST_WindowFIFOSize(), 1U);
-
-  tracker.RecordHotness(key, hash);
-  ASSERT_TRUE(tracker.TEST_WindowContains(key, hash));
-  ASSERT_TRUE(tracker.TEST_HotContains(key, hash));
-  ASSERT_EQ(tracker.TEST_WindowFIFOSize(), 1U);
-  ASSERT_EQ(tracker.ClassifyForFlush(key, hash),
-            HotnessTracker::FlushRoute::kEphemeral);
-
-  for (int i = 0; i < 4; ++i) {
-    std::string cold = "c00" + std::to_string(i);
-    tracker.RecordHotness(cold, HotnessTracker::Hash(cold));
-  }
-
-  // key 的 charge 为 4，窗口容量为 16。写入 4 个新 cold key 后，
-  // p001 应该由 FIFO 自然淘汰出 Cache1，但仍保留在 Cache2。
-  ASSERT_FALSE(tracker.TEST_WindowContains(key, hash));
-  ASSERT_TRUE(tracker.TEST_HotContains(key, hash));
-  ASSERT_TRUE(tracker.IsHot(key, hash));
-  ASSERT_EQ(tracker.ClassifyForFlush(key, hash),
-            HotnessTracker::FlushRoute::kStable);
-}
-
-TEST_F(HotnessTrackerTest, HotKeyMaintainsHeatOnRepeatedWrites) {
-  // 热缓存容量为 8，只能保留两个 4-byte key。
-  // 如果命中 Cache2 时没有更新 LRU，那么后续插入第三个 hot key 会把 h001 淘汰；
-  // 反之应淘汰较久未命中的 h002。
-  HotnessTracker tracker(32, 8, 0);
-
-  Slice hot_a("h001");
-  Slice hot_b("h002");
-  Slice hot_c("h003");
-  uint32_t hash_a = HotnessTracker::Hash(hot_a);
-  uint32_t hash_b = HotnessTracker::Hash(hot_b);
-  uint32_t hash_c = HotnessTracker::Hash(hot_c);
-
-  tracker.RecordHotness(hot_a, hash_a);
-  tracker.RecordHotness(hot_a, hash_a);
-  tracker.RecordHotness(hot_b, hash_b);
-  tracker.RecordHotness(hot_b, hash_b);
-
-  ASSERT_TRUE(tracker.TEST_HotContains(hot_a, hash_a));
-  ASSERT_TRUE(tracker.TEST_HotContains(hot_b, hash_b));
-
-  // 这次写入应命中 Cache2 并刷新 h001 的 LRU 位置。
-  tracker.RecordHotness(hot_a, hash_a);
-
-  tracker.RecordHotness(hot_c, hash_c);
-  tracker.RecordHotness(hot_c, hash_c);
-
-  ASSERT_TRUE(tracker.TEST_HotContains(hot_a, hash_a));
-  ASSERT_FALSE(tracker.TEST_HotContains(hot_b, hash_b));
-  ASSERT_TRUE(tracker.TEST_HotContains(hot_c, hash_c));
-}
-
-TEST_F(HotnessTrackerTest, ColdKeyNeverPromotedWithSingleWrite) {
-  // 验证: 仅写入一次的 key 永远不会被误判为 Hot
-
-  HotnessTracker tracker(4096, 4096, 0);
-
-  for (int i = 0; i < 1000; ++i) {
-    std::string key = "cold_" + std::to_string(i);
-    Slice skey(key);
-    uint32_t hash = HotnessTracker::Hash(skey);
-
-    // 只写入一次
-    tracker.RecordHotness(skey, hash);
-
-    // 绝对不能成为 Hot
-    ASSERT_FALSE(tracker.IsHot(skey, hash));
-    ASSERT_EQ(tracker.ClassifyForFlush(skey, hash),
-              HotnessTracker::FlushRoute::kWarm);
-  }
-}
-
-TEST_F(HotnessTrackerTest, HashKeyConsistency) {
-  // 验证 Hash Key 共用机制
-  // 同一个 key 的 Hash 值必须一致，且可以被 Cache1 和 Cache2 共用
-
-  HotnessTracker tracker(1024, 1024, 0);
-
-  Slice test_key("consistency_key");
-
-  // 多次计算 Hash 应该得到相同结果
-  uint32_t hash1 = HotnessTracker::Hash(test_key);
-  uint32_t hash2 = HotnessTracker::Hash(test_key);
-  uint32_t hash3 = HotnessTracker::Hash(test_key);
-
-  ASSERT_EQ(hash1, hash2);
-  ASSERT_EQ(hash2, hash3);
-
-  // 使用相同的 hash 值进行操作应该工作正常
-  tracker.RecordHotness(test_key, hash1);
-  ASSERT_FALSE(tracker.IsHot(test_key, hash1));
-
-  // 使用不同的 hash 值（模拟错误情况）应该查找不到
-  // 这证明了 Hash 一致性的重要性
-  uint32_t wrong_hash = hash1 ^ 0xFFFFFFFF;  // 故意翻转所有位
-  ASSERT_FALSE(tracker.IsHot(test_key, wrong_hash));  // 错误的 hash 应该找不到
-}
-
-TEST_F(HotnessTrackerTest, ConcurrentSafetyBasicCheck) {
-  // 基本并发安全性验证
-  // 虽然 full concurrency test 需要 stress test framework，
-  // 但我们可以验证基本的线程安全性假设
-
-  HotnessTracker tracker(1024 * 1024, 1024 * 1024, 0);  // 大容量避免竞争淘汰
-
-  const int num_threads = 4;
-  const int ops_per_thread = 100;
-  std::vector<std::thread> threads;
-
-  for (int t = 0; t < num_threads; ++t) {
-    threads.emplace_back([&, t]() {
-      for (int i = 0; i < ops_per_thread; ++i) {
-        std::string key = "thread_" + std::to_string(t) + "_op_" + std::to_string(i);
-        Slice skey(key);
-        uint32_t hash = HotnessTracker::Hash(skey);
-
-        // 每个线程执行混合读写操作
-        if (i % 3 == 0) {
-          tracker.RecordHotness(skey, hash);
-          tracker.RecordHotness(skey, hash);  // 第二次写入尝试晋升
-        } else {
-          tracker.IsHot(skey, hash);  // 只读查询
-        }
-      }
-    });
-  }
-
-  for (auto& t : threads) {
-    t.join();
-  }
-
-  SUCCEED();  // 如果没有崩溃或死锁，说明基本线程安全
-}
-
-} // namespace TERARKDB_NAMESPACE
+}  // namespace TERARKDB_NAMESPACE
 
 int main(int argc, char** argv) {
   TERARKDB_NAMESPACE::port::InstallStackTraceHandler();

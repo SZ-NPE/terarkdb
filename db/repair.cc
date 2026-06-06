@@ -673,19 +673,19 @@ class Repairer {
       t->meta.prop.max_read_amp = props->max_read_amp;
       t->meta.prop.read_amp = props->read_amp;
       t->meta.prop.dependence = props->dependence;
-      // reinflate per-dependence chunk bitmaps from the SST
+      // reinflate per-dependence block bitmaps from the SST
       // property block when present. Empty payload means the legacy
       // "bitmap unavailable" regime.
-      if (!props->dependence_chunk_bitmaps.empty() &&
-          props->dependence_chunk_bitmaps.size() == props->dependence.size()) {
-        t->meta.prop.dependence_chunk_bitmaps.clear();
-        t->meta.prop.dependence_chunk_bitmaps.resize(
-            props->dependence_chunk_bitmaps.size());
-        for (size_t i = 0; i < props->dependence_chunk_bitmaps.size(); ++i) {
-          const std::string& payload = props->dependence_chunk_bitmaps[i];
+      if (!props->dependence_block_bitmaps.empty() &&
+          props->dependence_block_bitmaps.size() == props->dependence.size()) {
+        t->meta.prop.dependence_block_bitmaps.clear();
+        t->meta.prop.dependence_block_bitmaps.resize(
+            props->dependence_block_bitmaps.size());
+        for (size_t i = 0; i < props->dependence_block_bitmaps.size(); ++i) {
+          const std::string& payload = props->dependence_block_bitmaps[i];
           if (!payload.empty()) {
             Slice in(payload);
-            t->meta.prop.dependence_chunk_bitmaps[i].Deserialize(&in);
+            t->meta.prop.dependence_block_bitmaps[i].Deserialize(&in);
           }
         }
       }

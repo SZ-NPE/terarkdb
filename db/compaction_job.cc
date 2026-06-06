@@ -1281,20 +1281,20 @@ Status CompactionJob::Run() {
           output.meta.prop.max_read_amp = tp->max_read_amp;
           output.meta.prop.read_amp = tp->read_amp;
           output.meta.prop.dependence = tp->dependence;
-          // reinflate per-dependence chunk bitmaps that were
+          // reinflate per-dependence data-block bitmaps that were
           // persisted by TableBuilder. Preserve "bitmap unavailable"
           // semantics when the SST carries no payload (legacy file or
           // producer did not opt into the feature).
-          if (!tp->dependence_chunk_bitmaps.empty() &&
-              tp->dependence_chunk_bitmaps.size() == tp->dependence.size()) {
-            output.meta.prop.dependence_chunk_bitmaps.clear();
-            output.meta.prop.dependence_chunk_bitmaps.resize(
-                tp->dependence_chunk_bitmaps.size());
-            for (size_t i = 0; i < tp->dependence_chunk_bitmaps.size(); ++i) {
-              const std::string& payload = tp->dependence_chunk_bitmaps[i];
+          if (!tp->dependence_block_bitmaps.empty() &&
+              tp->dependence_block_bitmaps.size() == tp->dependence.size()) {
+            output.meta.prop.dependence_block_bitmaps.clear();
+            output.meta.prop.dependence_block_bitmaps.resize(
+                tp->dependence_block_bitmaps.size());
+            for (size_t i = 0; i < tp->dependence_block_bitmaps.size(); ++i) {
+              const std::string& payload = tp->dependence_block_bitmaps[i];
               if (!payload.empty()) {
                 Slice in(payload);
-                output.meta.prop.dependence_chunk_bitmaps[i].Deserialize(&in);
+                output.meta.prop.dependence_block_bitmaps[i].Deserialize(&in);
               }
             }
           }
@@ -1753,39 +1753,31 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         raw_value_bytes = value.slice().size();
       }
     }
-    // Snapshot the blob builder's pre-Add file size so that the chunk
-    // id we stamp onto the outgoing value-index matches the chunk the
-    // value will actually live in. Mirrors the flush path invariant.
-    const uint64_t observed_offset =
-        blob_builder != nullptr ? blob_builder->FileSize() : 0;
     if (s.ok()) {
       s = blob_builder->Add(key, value);
     }
     if (s.ok()) {
       blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
       new_blob_bytes_per_fn[blob_meta->fd.GetNumber()] += raw_value_bytes;
-      // Only stamp a chunk_id trailer when the feature is enabled for
-      // this CF *and* the configured table factory is BlockBasedTable
-      // (the only factory the chunk-aware value-index format has been
-      // validated against). Otherwise we emit a legacy value-index and
-      // downstream GC falls back to the whole-blob scan path.
-      const auto* iopt =
-          sub_compact->compaction->immutable_cf_options();
-      const bool is_block_based_table =
-          iopt != nullptr && iopt->table_factory != nullptr &&
-          iopt->table_factory->Name() == BlockBasedTableFactory::kName;
-      const bool chunk_aware =
-          mutable_cf_options->enable_blob_validity_bitmap &&
-          mutable_cf_options->blob_gc_chunk_size > 0 &&
-          is_block_based_table;
-      const uint64_t chunk_id_for_trailer =
-          chunk_aware ? ChunkIdOfOffset(observed_offset,
-                                        mutable_cf_options->blob_gc_chunk_size)
-                      : SeparateHelper::kNoChunkId;
+      // Scenario B: the value is rewritten into a brand new vSST. Stamp
+      // the value-index with the real data-block ordinal returned by the
+      // BlockBasedTableBuilder. The rewritten value-index flows back
+      // through the compaction iterator and is observed (decoded) by the
+      // per-output-SST block bitmap collector in the main loop, so we do
+      // not record it here to avoid double counting. When the feature is
+      // off, the builder is not BlockBasedTable, or it cannot report a
+      // block id, we emit a legacy value-index (kNoBlockId) and the main
+      // loop will MarkUnavailable so downstream GC falls back.
+      uint64_t block_id = SeparateHelper::kNoBlockId;
+      const uint64_t layout_id = blob_meta->fd.GetNumber();
+      if (mutable_cf_options->enable_blob_block_bitmap &&
+          blob_builder->SupportsDataBlockId()) {
+        block_id = blob_builder->LastAddedDataBlockId();
+      }
       s = SeparateHelper::TransToSeparate(
           key, value, blob_meta->fd.GetNumber(), Slice(),
           GetInternalKeyType(key) == kTypeMerge, false,
-          separate_helper.value_meta_extractor.get(), chunk_id_for_trailer);
+          separate_helper.value_meta_extractor.get(), block_id, layout_id);
     }
     return s;
   };
@@ -1832,7 +1824,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       ShouldReportDetailedTime(env_, stats_), false, &range_del_agg,
       sub_compact->compaction, mutable_cf_options->get_blob_config(),
       compaction_filter, shutting_down_, preserve_deletes_seqnum_,
-      &rebuild_blobs_info.blobs));
+      &rebuild_blobs_info.blobs, cfd->hotness_tracker().get()));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
 
@@ -1886,7 +1878,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         snapshot_checker_, env_, false, false, range_del_agg_ptr,
         sub_compact->compaction, mutable_cf_options->get_blob_config(),
         second_pass_iter_storage.compaction_filter, shutting_down_,
-        preserve_deletes_seqnum_, &rebuild_blobs_info.blobs);
+        preserve_deletes_seqnum_, &rebuild_blobs_info.blobs,
+        cfd->hotness_tracker().get());
   };
   std::unique_ptr<InternalIterator> second_pass_iter(
       NewCompactionIterator(c_style_callback(make_compaction_iterator),
@@ -1910,8 +1903,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   }
   std::unordered_map<uint64_t, uint64_t> dependence;
 
-  // per-output-SST chunk reference bitmap collector.
-  // Gathers (blob_file_number, chunk_id) pairs observed on the
+  // per-output-SST data-block reference bitmap collector.
+  // Gathers (blob_file_number, block_id) pairs observed on the
   // kTypeValueIndex/kTypeMergeIndex entries that are about to be
   // written into the *current* output SST. The collector is reset
   // (by assignment) every time FinishCompactionOutputFile produces
@@ -1926,23 +1919,22 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   const bool compaction_is_block_based_table =
       compaction_iopt != nullptr && compaction_iopt->table_factory != nullptr &&
       compaction_iopt->table_factory->Name() == BlockBasedTableFactory::kName;
-  const bool compaction_chunk_bitmap_enabled =
-      mutable_cf_options->enable_blob_validity_bitmap &&
+  const bool compaction_block_bitmap_enabled =
+      mutable_cf_options->enable_blob_block_bitmap &&
       compaction_is_block_based_table;
-  if (mutable_cf_options->enable_blob_validity_bitmap &&
+  if (mutable_cf_options->enable_blob_block_bitmap &&
       !compaction_is_block_based_table) {
     ROCKS_LOG_INFO(
         db_options_.info_log,
-        "[Compaction] enable_blob_validity_bitmap is set but table_factory is "
-        "'%s' (not BlockBasedTable); chunk-aware value-index is disabled for "
+        "[Compaction] enable_blob_block_bitmap is set but table_factory is "
+        "'%s' (not BlockBasedTable); block-aware value-index is disabled for "
         "this CF.",
         compaction_iopt != nullptr && compaction_iopt->table_factory != nullptr
             ? compaction_iopt->table_factory->Name()
             : "<null>");
   }
-  CompactionChunkBitmapCollector chunk_bitmap_collector(
-      compaction_chunk_bitmap_enabled,
-      mutable_cf_options->blob_gc_chunk_size);
+  CompactionBlockBitmapCollector block_bitmap_collector(
+      compaction_block_bitmap_enabled);
 
   size_t yield_count = 0;
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid()) {
@@ -1957,32 +1949,36 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       if (!ib.second) {
         ++ib.first->second;
       }
-      // decode chunk_id (if present) so that the output SST
-      // records exactly which chunks of the underlying blob file it
-      // references. When the value-index is legacy (no trailer), mark
-      // the entire blob as unavailable for this output SST, which
-      // forces later GC on this SST/blob pair to fall back to the
-      // legacy whole-blob scan path.
-      if (chunk_bitmap_collector.enabled()) {
+      // Scenarios A/B/C: decode the data-block id (if present) so that
+      // the output SST records exactly which vSST data blocks it
+      // references. Scenario A (forwarded value-index) and scenario B
+      // (rewritten value-index) both carry a well-formed block-id
+      // trailer here and are recorded via ObserveBlockId. Scenario C
+      // (legacy value-index, no/malformed trailer) marks the entire
+      // blob as unavailable for this output SST, forcing later GC on
+      // this SST/blob pair to fall back to the legacy reverse-lookup.
+      if (block_bitmap_collector.enabled()) {
         Status fetch_s = value.fetch();
         if (fetch_s.ok()) {
+          // NOTE: this `value` is a kSST ValueIndex payload (the entry
+          // type is kTypeValueIndex/kTypeMergeIndex), so decoding the
+          // block-id trailer here is correct. This is NOT the vSST user
+          // value (that is only seen in ProcessGarbageCollection, where
+          // we must never decode a trailer).
           const Slice& vslice = value.slice();
-          if (vslice.size() >= sizeof(uint64_t) &&
-              SeparateHelper::HasChunkId(vslice)) {
-            uint64_t chunk_id = SeparateHelper::DecodeChunkId(vslice);
-            if (chunk_id != SeparateHelper::kNoChunkId) {
-              chunk_bitmap_collector.ObserveChunkId(value.file_number(),
-                                                    chunk_id);
-            } else {
-              chunk_bitmap_collector.MarkUnavailable(value.file_number());
-            }
+          uint64_t block_id = SeparateHelper::DecodeBlockId(vslice);
+          uint64_t layout_id = SeparateHelper::DecodeBlockLayoutId(vslice);
+          if (block_id != SeparateHelper::kNoBlockId &&
+              layout_id != SeparateHelper::kNoBlockLayoutId) {
+            block_bitmap_collector.ObserveBlockId(value.file_number(),
+                                                  layout_id, block_id);
           } else {
-            chunk_bitmap_collector.MarkUnavailable(value.file_number());
+            block_bitmap_collector.MarkUnavailable(value.file_number());
           }
         } else {
           // Failure to fetch the index payload is treated as legacy
-          // for safety; the bitmap stays empty and GC will fall back.
-          chunk_bitmap_collector.MarkUnavailable(value.file_number());
+          // for safety; the blob is marked unavailable and GC falls back.
+          block_bitmap_collector.MarkUnavailable(value.file_number());
         }
       }
     }
@@ -2125,15 +2121,14 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       status = FinishCompactionOutputFile(input_status, sub_compact,
                                           &range_del_agg, &range_del_out_stats,
                                           dependence, new_blob_bytes_per_fn,
-                                          &chunk_bitmap_collector, next_key);
+                                          &block_bitmap_collector, next_key);
       dependence.clear();
       // reset the collector for the next output SST. Using
       // assignment (rather than a dedicated Reset()) keeps the
-      // collector's feature-switch/chunk-size state but drops all
-      // accumulated observations and unavailable marks.
-      chunk_bitmap_collector = CompactionChunkBitmapCollector(
-          compaction_chunk_bitmap_enabled,
-          mutable_cf_options->blob_gc_chunk_size);
+      // collector's feature-switch state but drops all accumulated
+      // observations and unavailable marks.
+      block_bitmap_collector =
+          CompactionBlockBitmapCollector(compaction_block_bitmap_enabled);
       RecordDroppedKeys(range_del_out_stats,
                         &sub_compact->compaction_job_stats);
       if (sub_compact->compaction->partial_compaction()) {
@@ -2203,7 +2198,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     Status s = FinishCompactionOutputFile(status, sub_compact, &range_del_agg,
                                           &range_del_out_stats, dependence,
                                           new_blob_bytes_per_fn,
-                                          &chunk_bitmap_collector);
+                                          &block_bitmap_collector);
     dependence.clear();
     if (status.ok()) {
       status = s;
@@ -2327,15 +2322,14 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t live = 0, dead = 0, live_runs = 0, dead_runs = 0;
     uint64_t max_live_run = 0, curr_run = 0;
     bool has_run = false, run_live = false;
-    // bitmap fast-path counters.
+    // block-bitmap fast-path counters.
     //   bitmap_fast_path_skips   : GetKey() calls avoided because the
     //                              GC record was provably dead under
-    //                              the aggregated live-chunk bitmap
+    //                              the aggregated live-block bitmap
     //                              (either the entire blob was dead,
-    //                              or the record's chunk was dead).
+    //                              or the record's data block was dead).
     //   bitmap_aware_blobs       : distinct blobs whose aggregated
-    //                              view was available (kLive or kDead
-    //                              regime, i.e. not kUnknown).
+    //                              view was available (bitmap_available).
     //   bitmap_fallback_blobs    : distinct blobs that had to fall
     //                              back to the legacy GetKey() path
     //                              because the aggregated bitmap was
@@ -2347,13 +2341,14 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t bitmap_aware_blobs = 0;
     uint64_t bitmap_fallback_blobs = 0;
     uint64_t bitmap_entirely_dead_blobs = 0;
-    // Phase 6 wiring observability: how many of the fallback blobs
-    // were fallback because Phase 6 aggregation *never ran* for this
-    // Version (live_info == nullptr), versus because Phase 6 ran but
-    // sticky-cleared the blob. This answers the common ops question
-    // "is my chunk-aware GC actually on?" without any log parsing.
-    uint64_t bitmap_unaggregated_blobs = 0;
-    // Phase 8: byte-level accounting for observability.
+    // How many records fell back to the per-record GetKey() path. This
+    // is the GC_BLOCK_BITMAP_FALLBACK_GETKEY ticker source.
+    uint64_t bitmap_fallback_getkey = 0;
+    // Live / dead data-block verdicts observed during the per-record
+    // fast-path gate (a record-level, not block-level, count).
+    uint64_t bitmap_live_blocks = 0;
+    uint64_t bitmap_dead_blocks = 0;
+    // byte-level accounting for observability.
     //   bitmap_skipped_bytes : cumulative record size (key+value
     //                          reference) that was short-circuited
     //                          by the fast-path gate.
@@ -2361,9 +2356,13 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     //                          through the per-record GetKey() path.
     uint64_t bitmap_skipped_bytes = 0;
     uint64_t bitmap_live_bytes = 0;
+    // bytes of vSST data-block reads physically avoided by the
+    // iterator-level block-skip path (Phase 6). Stays 0 until that
+    // optional optimization is implemented; see the TODO in the loop.
+    uint64_t bitmap_block_skip_bytes = 0;
   } counter;
   // cache resolves (blob_file_number -> (meta, entirely_dead))
-  // once per blob so we don't rehash the live-chunk map for every
+  // once per blob so we don't rehash the live-block map for every
   // record. `entirely_dead == true` means IsBlobEntirelyDead() said
   // yes and we can skip GetKey() for every record in this blob.
   struct BlobGcCacheEntry {
@@ -2374,10 +2373,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   std::vector<BlobGcCacheEntry> blob_meta_cache;
   assert(!sub_compact->compaction->inputs()->empty());
   blob_meta_cache.reserve(sub_compact->compaction->inputs()->front().size());
-  // Phase 7: VersionStorageInfo aggregated live-chunk view. May be
-  // empty (no chunk-aware SST in the current version) -- in that case
+  // VersionStorageInfo aggregated live-block view. May be empty (no
+  // block-aware SST in the current version) -- in that case
   // IsBlobEntirelyDead() always returns false and this loop behaves
-  // exactly like the legacy pre-Phase-7 path.
+  // exactly like the legacy reverse-lookup path.
   const VersionStorageInfo* vstorage = input_version->storage_info();
 
   // --- block-level invalidity distribution tracking setup ---
@@ -2446,30 +2445,24 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         break;
       }
       blob_meta = find_dependence_map->second;
-      // consult the aggregated live-chunk view once per
-      // blob. IsBlobEntirelyDead() is safe even when Phase 6
-      // aggregation never ran (returns false via map miss).
-      const auto* live_info = vstorage->GetBlobLiveChunkInfo(blob_file_number);
-      if (live_info != nullptr && live_info->bitmap_available) {
+      // consult the aggregated live-block view once per blob.
+      // IsBlobEntirelyDead() is safe even when aggregation never ran
+      // (returns false via map miss). The blob-level entirely-dead skip
+      // is the ONLY block-aware GC shortcut and is gated by
+      // enable_blob_block_bitmap_gc_fast_path; it never inspects the
+      // per-record vSST user value.
+      const auto* live_info = vstorage->GetBlobLiveBlockInfo(blob_file_number);
+      if (mutable_cf_options->enable_blob_block_bitmap_gc_fast_path &&
+          live_info != nullptr && live_info->bitmap_available) {
         ++counter.bitmap_aware_blobs;
-        if (live_info->live_chunk_count == 0) {
+        if (live_info->live_block_count == 0) {
           blob_entirely_dead = true;
           ++counter.bitmap_entirely_dead_blobs;
         }
-      } else if (live_info != nullptr) {
-        // bitmap was sticky-cleared -> legacy fallback for this blob.
-        // Phase 6 did run, but mixed-regime data forced it to mark
-        // this blob as unavailable. Count under the existing
-        // "sticky-cleared" ticker, not the new "unaggregated" one.
-        ++counter.bitmap_fallback_blobs;
       } else {
-        // Phase 6 was never wired for this Version, so there is no
-        // live-view for this blob at all. This case is tracked under
-        // a dedicated ticker (`GC_BITMAP_UNAGGREGATED_FALLBACK`) so
-        // operators can distinguish "feature off / install path
-        // broken" from "feature on but degraded by legacy data".
+        // feature off, bitmap unavailable (sticky-cleared), or never
+        // aggregated for this Version -> legacy GetKey() fallback.
         ++counter.bitmap_fallback_blobs;
-        ++counter.bitmap_unaggregated_blobs;
       }
       blob_meta_cache.emplace_back(
           BlobGcCacheEntry{blob_file_number, blob_meta, blob_entirely_dead});
@@ -2481,42 +2474,48 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         gc_invalid_read_bytes_ += record_bytes;
         break;
       }
-      // fast path: if the aggregated bitmap says every chunk
-      // of this blob is dead, the record is guaranteed to be dead as
+      // fast path: if the aggregated bitmap says every data block of
+      // this blob is dead, the record is guaranteed to be dead as
       // well. Skip the per-record GetKey() point lookup entirely.
       if (blob_entirely_dead) {
         ++counter.bitmap_fast_path_skips;
+        ++counter.bitmap_dead_blocks;
         ++counter.get_not_found;
-        // Phase 8: account for bytes avoided by the fast path so
-        // external observers can reason about the savings without
-        // parsing logs.
+        // account for bytes avoided by the fast path so external
+        // observers can reason about the savings without parsing logs.
         counter.bitmap_skipped_bytes +=
             curr_key.size() + input->value().size();
         gc_invalid_read_bytes_ += record_bytes;
         break;
       }
-      // Per-record chunk-aware fast path: when the blob-level view is
-      // available and the value-index carries a chunk_id trailer, a
-      // dead chunk lets us skip the expensive GetKey() lookup for just
-      // this record. Live / unknown chunks still fall back to the
-      // legacy point lookup for correctness.
-      const uint64_t chunk_id =
-          SeparateHelper::DecodeChunkId(input->value().slice());
-      if (chunk_id != SeparateHelper::kNoChunkId) {
-        const auto chunk_liveness =
-            vstorage->IsChunkLive(blob_file_number, chunk_id);
-        if (chunk_liveness == VersionStorageInfo::BlobChunkLiveness::kDead) {
-          ++counter.bitmap_fast_path_skips;
-          ++counter.get_not_found;
-          counter.bitmap_skipped_bytes +=
-              curr_key.size() + input->value().size();
-          gc_invalid_read_bytes_ += record_bytes;
-          break;
-        }
+      // NOTE: `input->value()` here is the *real vSST user value*, not a
+      // kSST ValueIndex. It does NOT carry a block-id trailer, so we must
+      // never call SeparateHelper::DecodeBlockId() on it. Doing so was a
+      // correctness bug: an arbitrary user value whose tail happens to
+      // look like a trailer would be mis-decoded and could wrongly skip a
+      // live record. The only block-aware shortcut allowed in the GC path
+      // is the blob-level `blob_entirely_dead` gate handled above, which
+      // is derived from the aggregated (layout-checked) bitmap. Anything
+      // not provably dead falls through to the legacy GetKey() lookup.
+      //
+      // Phase 6 (optional, gated by enable_blob_block_skip, default
+      // false): iterator-level physical data-block skip. Until a
+      // table-iterator hook that consults the aggregated live-block
+      // bitmap (e.g. CurrentDataBlockId()/SkipCurrentDataBlock()) lands,
+      // this option is an explicit NO-OP: it must never change GC
+      // correctness, the records read, or the measured read bandwidth.
+      // It is reserved purely so enabling it later needs no manifest /
+      // option migration.
+      if (mutable_cf_options->enable_blob_block_skip) {
+        // Intentionally no-op for now: physical block skip is not wired
+        // into the GC input iterator yet. Do NOT derive any liveness from
+        // input->value() here.
       }
-      // record bytes that will flow through the legacy
-      // per-record path so observers can compute the fast-path
-      // savings ratio as skipped / (skipped + live).
+
+      // record bytes that will flow through the legacy per-record
+      // GetKey() path so observers can compute the fast-path savings
+      // ratio as skipped / (skipped + live).
+      ++counter.bitmap_fallback_getkey;
       counter.bitmap_live_bytes += curr_key.size() + input->value().size();
       iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kValueTypeForSeek);
       Status s;
@@ -2670,9 +2669,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         ", max_live_run=%" PRIu64 "]"
         ", lookup_micros=%" PRIu64 ", run_micros=%" PRIu64
         ", read_bytes=%" PRIu64 ", write_bytes=%" PRIu64
-        ", bitmap=[aware=%" PRIu64 ", fallback=%" PRIu64
-        ", unaggregated=%" PRIu64 ", entirely_dead=%" PRIu64
-        ", fast_path_skips=%" PRIu64
+        ", block_bitmap=[aware=%" PRIu64 ", fallback_blobs=%" PRIu64
+        ", entirely_dead=%" PRIu64 ", fast_path_skips=%" PRIu64
+        ", fallback_getkey=%" PRIu64 ", live_blocks=%" PRIu64
+        ", dead_blocks=%" PRIu64
         ", skipped_bytes=%" PRIu64 ", live_bytes=%" PRIu64 "]"
         ", inheritance=%zd->%zd",
         cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
@@ -2684,26 +2684,29 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         counter.lookup_micros, env_->NowMicros() - gc_begin_ts,
         gc_read_bytes, gc_write_bytes,
         counter.bitmap_aware_blobs, counter.bitmap_fallback_blobs,
-        counter.bitmap_unaggregated_blobs,
         counter.bitmap_entirely_dead_blobs, counter.bitmap_fast_path_skips,
+        counter.bitmap_fallback_getkey, counter.bitmap_live_blocks,
+        counter.bitmap_dead_blocks,
         counter.bitmap_skipped_bytes, counter.bitmap_live_bytes,
         meta.prop.inheritance.size() + inheritance_tree_pruge_count,
         meta.prop.inheritance.size());
-    // emit bitmap fast-path observability tickers. These are
+    // emit block-bitmap fast-path observability tickers. These are
     // counters (not gauges), so every GC sub-compaction accumulates
     // into the CF-level Statistics handle exposed via DBOptions.
-    RecordTick(db_options_.statistics.get(), GC_BITMAP_FAST_PATH_COUNT,
+    RecordTick(db_options_.statistics.get(), GC_BLOCK_BITMAP_FAST_PATH_SKIPS,
                counter.bitmap_fast_path_skips);
-    RecordTick(db_options_.statistics.get(), GC_BITMAP_FALLBACK_COUNT,
-               counter.bitmap_fallback_blobs);
-    RecordTick(db_options_.statistics.get(), GC_BITMAP_UNAGGREGATED_FALLBACK,
-               counter.bitmap_unaggregated_blobs);
-    RecordTick(db_options_.statistics.get(), GC_SKIPPED_DEAD_CHUNK_BYTES,
+    RecordTick(db_options_.statistics.get(), GC_BLOCK_BITMAP_FALLBACK_GETKEY,
+               counter.bitmap_fallback_getkey);
+    RecordTick(db_options_.statistics.get(), GC_BLOCK_BITMAP_SKIPPED_RECORDS,
+               counter.bitmap_fast_path_skips);
+    RecordTick(db_options_.statistics.get(), GC_BLOCK_BITMAP_SKIPPED_BYTES,
                counter.bitmap_skipped_bytes);
-    RecordTick(db_options_.statistics.get(), GC_READ_LIVE_CHUNK_BYTES,
-               counter.bitmap_live_bytes);
-    RecordTick(db_options_.statistics.get(), GC_LOOKUP_AVOIDED_COUNT,
-               counter.bitmap_fast_path_skips);
+    RecordTick(db_options_.statistics.get(), GC_BLOCK_BITMAP_LIVE_BLOCKS,
+               counter.bitmap_live_blocks);
+    RecordTick(db_options_.statistics.get(), GC_BLOCK_BITMAP_DEAD_BLOCKS,
+               counter.bitmap_dead_blocks);
+    RecordTick(db_options_.statistics.get(), GC_BLOCK_BITMAP_BLOCK_SKIP_BYTES,
+               counter.bitmap_block_skip_bytes);
     if ((std::find_if(files.begin(), files.end(),
                       [](FileMetaData* f) {
                         return f->marked_for_compaction;
@@ -2796,7 +2799,7 @@ Status CompactionJob::FinishCompactionOutputFile(
     CompactionIterationStats* range_del_out_stats,
     const std::unordered_map<uint64_t, uint64_t>& dependence,
     const std::unordered_map<uint64_t, uint64_t>& new_blob_bytes_per_fn,
-    CompactionChunkBitmapCollector* chunk_bitmap_collector,
+    CompactionBlockBitmapCollector* block_bitmap_collector,
     const Slice* next_table_min_key /* = nullptr */) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_SYNC_FILE);
@@ -2930,19 +2933,18 @@ Status CompactionJob::FinishCompactionOutputFile(
     std::sort(meta->prop.dependence.begin(), meta->prop.dependence.end(),
               TERARK_CMP(file_number, <));
 
-    // materialize the per-dependence chunk reference bitmap
+    // materialize the per-dependence data-block reference bitmap
     // collected from this output SST's kTypeValueIndex/kTypeMergeIndex
     // entries. Must be done *after* prop.dependence has been finalized
     // so that the output vector is aligned to prop.dependence by index.
-    // When the CF option is off (or the collector was never given a
-    // non-zero chunk_size), the collector is a no-op and this call
-    // clears dependence_chunk_bitmaps, which is the explicit
+    // When the CF option is off, the collector is a no-op and this call
+    // clears dependence_block_bitmaps, which is the explicit
     // "bitmap unavailable" sentinel consumed by later phases.
-    if (chunk_bitmap_collector != nullptr) {
-      chunk_bitmap_collector->Materialize(meta->prop.dependence,
-                                          &meta->prop.dependence_chunk_bitmaps);
+    if (block_bitmap_collector != nullptr) {
+      block_bitmap_collector->Materialize(meta->prop.dependence,
+                                          &meta->prop.dependence_block_bitmaps);
     } else {
-      meta->prop.dependence_chunk_bitmaps.clear();
+      meta->prop.dependence_block_bitmaps.clear();
     }
 
     auto shrinked_snapshots = meta->ShrinkSnapshot(existing_snapshots_);
