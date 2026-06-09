@@ -1311,10 +1311,12 @@ InternalIterator* NewIteratorSelect(Reader* reader, const ReadOptions& ro,
 
 InternalIterator* TerarkZipTableReader::NewIterator(
     const ReadOptions& ro, const SliceTransform* prefix_extractor, Arena* arena,
-    bool skip_filters, bool for_compaction) {
+    bool skip_filters, bool for_compaction,
+    const BlobGcBlockSkipContext* blob_gc_block_skip_context) {
   TERARK_UNUSED_VAR(skip_filters);
   TERARK_UNUSED_VAR(prefix_extractor);
   TERARK_UNUSED_VAR(for_compaction);
+  TERARK_UNUSED_VAR(blob_gc_block_skip_context);
   return NewIteratorSelect(this, ro, isReverseBytewiseOrder_,
                            subReader_.store_->is_offsets_zipped(), arena,
                            nullptr, nullptr);
@@ -1533,10 +1535,12 @@ const TerarkZipSubReader* TerarkZipTableMultiReader::SubIndex::GetSubReader(
 
 InternalIterator* TerarkZipTableMultiReader::NewIterator(
     const ReadOptions& ro, const SliceTransform* prefix_extractor, Arena* arena,
-    bool skip_filters, bool for_compaction) {
+    bool skip_filters, bool for_compaction,
+    const BlobGcBlockSkipContext* blob_gc_block_skip_context) {
   TERARK_UNUSED_VAR(skip_filters);
   TERARK_UNUSED_VAR(prefix_extractor);
   TERARK_UNUSED_VAR(for_compaction);
+  TERARK_UNUSED_VAR(blob_gc_block_skip_context);
   return NewIteratorSelect(this, ro, isReverseBytewiseOrder_,
                            subIndex_.HasAnyZipOffset(), arena, nullptr,
                            nullptr);

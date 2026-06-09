@@ -385,12 +385,33 @@ class VersionStorageInfo {
     return blob_live_block_info_;
   }
 
+  // Canonicalize a (possibly logical) blob file number to the current
+  // physical vSST file number under which the aggregated live-block
+  // view is keyed. After a vSST GC rewrite/inheritance a logical file
+  // number maps to a brand new physical file; the aggregation pass and
+  // the table iterator layer both agree on the *physical* fd.GetNumber()
+  // as the canonical key. Any liveness query must therefore resolve the
+  // incoming file number through dependence_map_ first, otherwise a
+  // logical key and a physical key would address two semantically split
+  // entries. When the file number does not resolve (not in
+  // dependence_map_) it is returned unchanged.
+  uint64_t CanonicalBlobFileNumber(uint64_t blob_file_number) const {
+    auto it = dependence_map_.find(blob_file_number);
+    if (it != dependence_map_.end() && it->second != nullptr) {
+      return it->second->fd.GetNumber();
+    }
+    return blob_file_number;
+  }
+
   // Convenience accessor used by GC fast path. Returns nullptr if the
   // blob has never been aggregated; callers must then fall back to
-  // the legacy lookup-based GC path.
+  // the legacy lookup-based GC path. The incoming file number may be a
+  // logical dependence key and is canonicalized to the physical vSST
+  // file number before lookup.
   const BlobLiveBlockInfo* GetBlobLiveBlockInfo(uint64_t blob_file_number)
       const {
-    auto it = blob_live_block_info_.find(blob_file_number);
+    const uint64_t canonical_fn = CanonicalBlobFileNumber(blob_file_number);
+    auto it = blob_live_block_info_.find(canonical_fn);
     return it == blob_live_block_info_.end() ? nullptr : &it->second;
   }
 
@@ -416,7 +437,12 @@ class VersionStorageInfo {
 
   BlobBlockLiveness IsBlockLive(uint64_t blob_file_number,
                                 uint64_t block_id) const {
-    auto it = blob_live_block_info_.find(blob_file_number);
+    // The caller (table iterator layer) passes the physical fd number,
+    // but logical dependence numbers may also reach here. Canonicalize
+    // to the physical key the aggregated view is stored under so that
+    // logical and physical lookups never diverge.
+    const uint64_t canonical_fn = CanonicalBlobFileNumber(blob_file_number);
+    auto it = blob_live_block_info_.find(canonical_fn);
     if (it == blob_live_block_info_.end()) {
       return BlobBlockLiveness::kUnknown;
     }
@@ -435,7 +461,8 @@ class VersionStorageInfo {
   // lookup. Returns false when the bitmap is unavailable or when at
   // least one block is live.
   bool IsBlobEntirelyDead(uint64_t blob_file_number) const {
-    auto it = blob_live_block_info_.find(blob_file_number);
+    const uint64_t canonical_fn = CanonicalBlobFileNumber(blob_file_number);
+    auto it = blob_live_block_info_.find(canonical_fn);
     if (it == blob_live_block_info_.end()) {
       return false;
     }
@@ -1188,7 +1215,8 @@ class VersionSet {
   // The caller should delete the iterator when no longer needed.
   InternalIterator* MakeInputIterator(
       const Compaction* c, RangeDelAggregator* range_del_agg,
-      const EnvOptions& env_options_compactions);
+      const EnvOptions& env_options_compactions,
+      const BlobGcBlockSkipContext* blob_gc_block_skip_context = nullptr);
 
   // Add all files listed in any live version to *live.
   void AddLiveFiles(std::vector<FileDescriptor>* live_list);

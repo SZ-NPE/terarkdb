@@ -1811,6 +1811,211 @@ TEST_P(BlockBasedTableTest, NumBlockStat) {
   c.ResetTableReader();
 }
 
+namespace {
+
+bool TestGcSkipFileSkippable(void* /*arg*/, uint64_t /*file_number*/) {
+  return true;
+}
+
+bool TestGcSkipOddBlocksDead(void* /*arg*/, uint64_t /*file_number*/,
+                             uint64_t block_id) {
+  return block_id % 2 == 1;
+}
+
+bool TestGcSkipNoDeadBlocks(void* /*arg*/, uint64_t /*file_number*/,
+                            uint64_t /*block_id*/) {
+  return false;
+}
+
+// Mimics a physical-key bitmap lookup where only block 0 is live: every
+// other block is reported dead so the GC fast path skips it. Used to
+// lock down that a block proven live by the (physical) bitmap is always
+// read, while only bitmap-dead blocks are counted as skipped.
+bool TestGcSkipOnlyBlock0Live(void* /*arg*/, uint64_t /*file_number*/,
+                              uint64_t block_id) {
+  return block_id != 0;
+}
+
+std::string EncodeSeekKey(const std::string& user_key) {
+  std::string encoded;
+  AppendInternalKey(&encoded,
+                    ParsedInternalKey(user_key, kMaxSequenceNumber, kTypeValue));
+  return encoded;
+}
+
+}  // namespace
+
+TEST_P(BlockBasedTableTest, GcBlockSkipForwardScan) {
+  Random rnd(test::RandomSeed());
+  TableConstructor c(BytewiseComparator(), true /* convert_to_internal_key_ */);
+  Options options;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
+  table_options.block_restart_interval = 1;
+  table_options.block_size = 1000;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  for (int i = 0; i < 10; ++i) {
+    c.Add(RandomString(&rnd, 900), "val");
+  }
+
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  const ImmutableCFOptions ioptions(options);
+  const MutableCFOptions moptions(options);
+  c.Finish(options, ioptions, moptions, table_options,
+           GetPlainInternalComparator(options.comparator), &keys, &kvmap);
+  ASSERT_EQ(kvmap.size(),
+            c.GetTableReader()->GetTableProperties()->num_data_blocks);
+
+  uint64_t skipped_blocks = 0;
+  uint64_t skipped_bytes = 0;
+  uint64_t read_blocks = 0;
+  BlobGcBlockSkipContext ctx;
+  ctx.enabled = true;
+  ctx.file_number = 123;
+  ctx.is_file_skippable = TestGcSkipFileSkippable;
+  ctx.is_block_dead = TestGcSkipOddBlocksDead;
+  ctx.skipped_blocks = &skipped_blocks;
+  ctx.skipped_bytes = &skipped_bytes;
+  ctx.read_blocks = &read_blocks;
+
+  std::unique_ptr<InternalIterator> iter(c.GetTableReader()->NewIterator(
+      ReadOptions(), moptions.prefix_extractor.get(), nullptr,
+      false /* skip_filters */, true /* for_compaction */, &ctx));
+  iter->SeekToFirst();
+  size_t count = 0;
+  for (; iter->Valid(); iter->Next()) {
+    ++count;
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(keys.size() / 2, count);
+  ASSERT_EQ(keys.size() / 2, skipped_blocks);
+  ASSERT_EQ(keys.size() / 2, read_blocks);
+  ASSERT_GT(skipped_bytes, 0);
+  iter.reset();
+  c.ResetTableReader();
+}
+
+// When the (physical-key) bitmap proves block 0 live, that block must be
+// read by the forward scan; only blocks the bitmap marks dead may be
+// counted in skipped_blocks. This mirrors the GC fast path where
+// TableCache sets ctx.file_number to the physical fd.GetNumber() and the
+// liveness comes from the per-physical-file aggregated bitmap.
+TEST_P(BlockBasedTableTest, GcBlockSkipReadsLiveBlock) {
+  Random rnd(test::RandomSeed());
+  TableConstructor c(BytewiseComparator(), true /* convert_to_internal_key_ */);
+  Options options;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
+  table_options.block_restart_interval = 1;
+  table_options.block_size = 1000;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  for (int i = 0; i < 10; ++i) {
+    c.Add(RandomString(&rnd, 900), "val");
+  }
+
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  const ImmutableCFOptions ioptions(options);
+  const MutableCFOptions moptions(options);
+  c.Finish(options, ioptions, moptions, table_options,
+           GetPlainInternalComparator(options.comparator), &keys, &kvmap);
+  const size_t num_blocks =
+      c.GetTableReader()->GetTableProperties()->num_data_blocks;
+  ASSERT_EQ(kvmap.size(), num_blocks);
+
+  uint64_t skipped_blocks = 0;
+  uint64_t read_blocks = 0;
+  BlobGcBlockSkipContext ctx;
+  ctx.enabled = true;
+  // The physical vSST file number, exactly as TableCache wires it.
+  ctx.file_number = 420;
+  ctx.is_file_skippable = TestGcSkipFileSkippable;
+  ctx.is_block_dead = TestGcSkipOnlyBlock0Live;
+  ctx.skipped_blocks = &skipped_blocks;
+  ctx.read_blocks = &read_blocks;
+
+  std::unique_ptr<InternalIterator> iter(c.GetTableReader()->NewIterator(
+      ReadOptions(), moptions.prefix_extractor.get(), nullptr,
+      false /* skip_filters */, true /* for_compaction */, &ctx));
+  iter->SeekToFirst();
+  size_t count = 0;
+  for (; iter->Valid(); iter->Next()) {
+    ++count;
+  }
+  ASSERT_OK(iter->status());
+  // Only block 0 is live, so the scan yields exactly one record and the
+  // remaining blocks are all skipped.
+  ASSERT_EQ(1U, count);
+  ASSERT_EQ(1U, read_blocks);
+  ASSERT_EQ(num_blocks - 1, skipped_blocks);
+  iter.reset();
+  c.ResetTableReader();
+}
+
+TEST_P(BlockBasedTableTest, GcBlockSkipFallbackAndSeekSafety) {
+  Random rnd(test::RandomSeed());
+  TableConstructor c(BytewiseComparator(), true /* convert_to_internal_key_ */);
+  Options options;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
+  table_options.block_restart_interval = 1;
+  table_options.block_size = 1000;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  for (int i = 0; i < 10; ++i) {
+    c.Add(RandomString(&rnd, 900), "val");
+  }
+
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  const ImmutableCFOptions ioptions(options);
+  const MutableCFOptions moptions(options);
+  c.Finish(options, ioptions, moptions, table_options,
+           GetPlainInternalComparator(options.comparator), &keys, &kvmap);
+  ASSERT_EQ(kvmap.size(),
+            c.GetTableReader()->GetTableProperties()->num_data_blocks);
+
+  BlobGcBlockSkipContext fallback_ctx;
+  fallback_ctx.enabled = true;
+  fallback_ctx.is_file_skippable = TestGcSkipFileSkippable;
+  fallback_ctx.is_block_dead = TestGcSkipNoDeadBlocks;
+
+  std::unique_ptr<InternalIterator> fallback_iter(
+      c.GetTableReader()->NewIterator(ReadOptions(),
+                                      moptions.prefix_extractor.get(), nullptr,
+                                      false /* skip_filters */,
+                                      true /* for_compaction */,
+                                      &fallback_ctx));
+  fallback_iter->SeekToFirst();
+  size_t fallback_count = 0;
+  for (; fallback_iter->Valid(); fallback_iter->Next()) {
+    ++fallback_count;
+  }
+  ASSERT_OK(fallback_iter->status());
+  ASSERT_EQ(keys.size(), fallback_count);
+
+  uint64_t skipped_blocks = 0;
+  BlobGcBlockSkipContext skip_ctx;
+  skip_ctx.enabled = true;
+  skip_ctx.is_file_skippable = TestGcSkipFileSkippable;
+  skip_ctx.is_block_dead = TestGcSkipOddBlocksDead;
+  skip_ctx.skipped_blocks = &skipped_blocks;
+  std::unique_ptr<InternalIterator> seek_iter(c.GetTableReader()->NewIterator(
+      ReadOptions(), moptions.prefix_extractor.get(), nullptr,
+      false /* skip_filters */, true /* for_compaction */, &skip_ctx));
+  const std::string target = EncodeSeekKey(keys[1]);
+  seek_iter->Seek(target);
+  ASSERT_TRUE(seek_iter->Valid());
+  ASSERT_EQ(keys[1], ExtractUserKey(seek_iter->key()).ToString());
+  ASSERT_EQ(0U, skipped_blocks);
+  fallback_iter.reset();
+  seek_iter.reset();
+  c.ResetTableReader();
+}
+
 // A simple tool that takes the snapshot of block cache statistics.
 class BlockCachePropertiesSnapshot {
  public:

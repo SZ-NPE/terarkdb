@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <stdint.h>
+
 #include <memory>
 
 #include "db/range_tombstone_fragmenter.h"
@@ -26,6 +28,18 @@ class Statistics;
 struct ReadOptions;
 struct TableProperties;
 class GetContext;
+
+struct BlobGcBlockSkipContext {
+  bool enabled = false;
+  uint64_t file_number = static_cast<uint64_t>(-1);
+  bool (*is_file_skippable)(void* arg, uint64_t file_number) = nullptr;
+  bool (*is_block_dead)(void* arg, uint64_t file_number,
+                        uint64_t block_id) = nullptr;
+  void* arg = nullptr;
+  uint64_t* skipped_blocks = nullptr;
+  uint64_t* skipped_bytes = nullptr;
+  uint64_t* read_blocks = nullptr;
+};
 
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
@@ -47,7 +61,10 @@ class TableReader {
                                         const SliceTransform* prefix_extractor,
                                         Arena* arena = nullptr,
                                         bool skip_filters = false,
-                                        bool for_compaction = false) = 0;
+                                        bool for_compaction = false,
+                                        const BlobGcBlockSkipContext*
+                                            blob_gc_block_skip_context =
+                                                nullptr) = 0;
 
   virtual FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& /*read_options*/) {

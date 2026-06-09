@@ -2251,9 +2251,47 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact != nullptr);
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
+  const MutableCFOptions* mutable_cf_options =
+      sub_compact->compaction->mutable_cf_options();
+  Version* input_version = sub_compact->compaction->input_version();
+  const VersionStorageInfo* vstorage = input_version->storage_info();
 
+  uint64_t bitmap_block_skip_blocks = 0;
+  uint64_t bitmap_block_skip_bytes = 0;
+  uint64_t bitmap_block_read_blocks = 0;
+  BlobGcBlockSkipContext gc_block_skip_context;
+  gc_block_skip_context.enabled =
+      mutable_cf_options->enable_blob_block_bitmap &&
+      mutable_cf_options->enable_blob_block_skip &&
+      mutable_cf_options->enable_blob_block_bitmap_gc_fast_path &&
+      vstorage != nullptr;
+  gc_block_skip_context.arg = const_cast<VersionStorageInfo*>(vstorage);
+  gc_block_skip_context.is_file_skippable = [](void* arg,
+                                               uint64_t blob_file_number) {
+    auto* skip_vstorage = static_cast<const VersionStorageInfo*>(arg);
+    if (skip_vstorage == nullptr) {
+      return false;
+    }
+    const auto* live_info = skip_vstorage->GetBlobLiveBlockInfo(
+        blob_file_number);
+    return live_info != nullptr && live_info->bitmap_available;
+  };
+  gc_block_skip_context.is_block_dead = [](void* arg,
+                                           uint64_t blob_file_number,
+                                           uint64_t block_id) {
+    auto* skip_vstorage = static_cast<const VersionStorageInfo*>(arg);
+    return skip_vstorage != nullptr &&
+           skip_vstorage->IsBlockLive(blob_file_number, block_id) ==
+               VersionStorageInfo::BlobBlockLiveness::kDead;
+  };
+  gc_block_skip_context.skipped_blocks = &bitmap_block_skip_blocks;
+  gc_block_skip_context.skipped_bytes = &bitmap_block_skip_bytes;
+  gc_block_skip_context.read_blocks = &bitmap_block_read_blocks;
+  const BlobGcBlockSkipContext* gc_block_skip_context_ptr =
+      gc_block_skip_context.enabled ? &gc_block_skip_context : nullptr;
   std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
-      sub_compact->compaction, nullptr, env_options_for_read_));
+      sub_compact->compaction, nullptr, env_options_for_read_,
+      gc_block_skip_context_ptr));
 
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
@@ -2290,7 +2328,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
 
   auto create_iter = [&](Arena* /* arena */) {
     return versions_->MakeInputIterator(sub_compact->compaction, nullptr,
-                                        env_options_for_read_);
+                                        env_options_for_read_,
+                                        gc_block_skip_context_ptr);
   };
   auto filter_conflict = [&](const Slice& ikey, const LazyBuffer& value) {
     std::lock_guard<std::mutex> lock(conflict_map_mutex);
@@ -2309,7 +2348,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   }
   sub_compact->blob_builder->SetSecondPassIterator(&second_pass_iter);
 
-  Version* input_version = sub_compact->compaction->input_version();
   auto& dependence_map = input_version->storage_info()->dependence_map();
   auto& comp = cfd->internal_comparator();
   std::string last_key;
@@ -2357,9 +2395,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t bitmap_skipped_bytes = 0;
     uint64_t bitmap_live_bytes = 0;
     // bytes of vSST data-block reads physically avoided by the
-    // iterator-level block-skip path (Phase 6). Stays 0 until that
-    // optional optimization is implemented; see the TODO in the loop.
+    // iterator-level block-skip path.
     uint64_t bitmap_block_skip_bytes = 0;
+    uint64_t bitmap_block_skip_blocks = 0;
+    uint64_t bitmap_block_read_blocks = 0;
   } counter;
   // cache resolves (blob_file_number -> (meta, entirely_dead))
   // once per blob so we don't rehash the live-block map for every
@@ -2377,8 +2416,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   // block-aware SST in the current version) -- in that case
   // IsBlobEntirelyDead() always returns false and this loop behaves
   // exactly like the legacy reverse-lookup path.
-  const VersionStorageInfo* vstorage = input_version->storage_info();
-
   // --- block-level invalidity distribution tracking setup ---
   size_t gc_block_size = 4096;  // default BlockBasedTable block size
   {
@@ -2490,27 +2527,11 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       }
       // NOTE: `input->value()` here is the *real vSST user value*, not a
       // kSST ValueIndex. It does NOT carry a block-id trailer, so we must
-      // never call SeparateHelper::DecodeBlockId() on it. Doing so was a
-      // correctness bug: an arbitrary user value whose tail happens to
-      // look like a trailer would be mis-decoded and could wrongly skip a
-      // live record. The only block-aware shortcut allowed in the GC path
-      // is the blob-level `blob_entirely_dead` gate handled above, which
-      // is derived from the aggregated (layout-checked) bitmap. Anything
-      // not provably dead falls through to the legacy GetKey() lookup.
-      //
-      // Phase 6 (optional, gated by enable_blob_block_skip, default
-      // false): iterator-level physical data-block skip. Until a
-      // table-iterator hook that consults the aggregated live-block
-      // bitmap (e.g. CurrentDataBlockId()/SkipCurrentDataBlock()) lands,
-      // this option is an explicit NO-OP: it must never change GC
-      // correctness, the records read, or the measured read bandwidth.
-      // It is reserved purely so enabling it later needs no manifest /
-      // option migration.
-      if (mutable_cf_options->enable_blob_block_skip) {
-        // Intentionally no-op for now: physical block skip is not wired
-        // into the GC input iterator yet. Do NOT derive any liveness from
-        // input->value() here.
-      }
+      // never call SeparateHelper::DecodeBlockId() on it. Physical
+      // data-block skip, when enabled, has already happened in the table
+      // iterator before the data block was read. Anything that reaches this
+      // loop and is not provably dead still falls through to the legacy
+      // GetKey() lookup.
 
       // record bytes that will flow through the legacy per-record
       // GetKey() path so observers can compute the fast-path savings
@@ -2651,6 +2672,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     if (counter.has_run && counter.run_live) {
       counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
     }
+    counter.bitmap_block_skip_bytes = bitmap_block_skip_bytes;
+    counter.bitmap_block_skip_blocks = bitmap_block_skip_blocks;
+    counter.bitmap_block_read_blocks = bitmap_block_read_blocks;
     const uint64_t gc_read_bytes =
         measure_io_stats_ ? IOSTATS(bytes_read) - prev_read_bytes : 0;
     const uint64_t gc_write_bytes =
@@ -2673,7 +2697,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         ", entirely_dead=%" PRIu64 ", fast_path_skips=%" PRIu64
         ", fallback_getkey=%" PRIu64 ", live_blocks=%" PRIu64
         ", dead_blocks=%" PRIu64
-        ", skipped_bytes=%" PRIu64 ", live_bytes=%" PRIu64 "]"
+        ", skipped_bytes=%" PRIu64 ", live_bytes=%" PRIu64
+        ", block_skip_blocks=%" PRIu64 ", block_skip_bytes=%" PRIu64
+        ", block_read_blocks=%" PRIu64 "]"
         ", inheritance=%zd->%zd",
         cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
         files.size(), counter.input - meta.prop.num_entries,
@@ -2688,6 +2714,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         counter.bitmap_fallback_getkey, counter.bitmap_live_blocks,
         counter.bitmap_dead_blocks,
         counter.bitmap_skipped_bytes, counter.bitmap_live_bytes,
+        counter.bitmap_block_skip_blocks, counter.bitmap_block_skip_bytes,
+        counter.bitmap_block_read_blocks,
         meta.prop.inheritance.size() + inheritance_tree_pruge_count,
         meta.prop.inheritance.size());
     // emit block-bitmap fast-path observability tickers. These are

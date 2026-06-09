@@ -404,7 +404,8 @@ LazyBuffer CuckooTableIterator::value() const {
 InternalIterator* CuckooTableReader::NewIterator(
     const ReadOptions& /*read_options*/,
     const SliceTransform* /* prefix_extractor */, Arena* arena,
-    bool /*skip_filters*/, bool /*for_compaction*/) {
+    bool /*skip_filters*/, bool /*for_compaction*/,
+    const BlobGcBlockSkipContext* /*blob_gc_block_skip_context*/) {
   if (!status().ok()) {
     return NewErrorInternalIterator<LazyBuffer>(
         Status::Corruption("CuckooTableReader status is not okay."), arena);

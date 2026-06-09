@@ -371,10 +371,9 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   bool enable_blob_block_bitmap_gc_fast_path = true;
 
   // Whether GC attempts to physically skip reading dead vSST data
-  // blocks at the table-iterator layer (Phase 6). Physical block skip
-  // is not yet wired through the BlockBasedTable iterator, so this is
-  // reserved and defaults to false; see util/blob_block_bitmap.h and
-  // db/compaction_job.cc for the interface design and TODO.
+  // blocks at the table-iterator layer. Only data blocks proven dead by
+  // the aggregated live-block bitmap are skipped; unknown/unavailable
+  // bitmap state falls back to reading the block and per-record GetKey().
   // Default: false
   bool enable_blob_block_skip = false;
 

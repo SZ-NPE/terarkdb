@@ -49,7 +49,10 @@ class CuckooTableReader : public TableReader {
                                 const SliceTransform* prefix_extractor,
                                 Arena* arena = nullptr,
                                 bool skip_filters = false,
-                                bool for_compaction = false) override;
+                                bool for_compaction = false,
+                                const BlobGcBlockSkipContext*
+                                    blob_gc_block_skip_context = nullptr)
+      override;
   void Prepare(const Slice& target) override;
 
   // Report an approximation of how much memory has been used.

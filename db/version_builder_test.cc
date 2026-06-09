@@ -805,6 +805,87 @@ TEST_F(VersionBuilderTest, VersionBuilderRejectsStaleLayoutId) {
   UnrefFilesInVersion(&new_vstorage);
 }
 
+// Logical vs physical vSST file number: after a vSST GC rewrite the
+// logical dependence file number (e.g. 100) is inherited by a brand new
+// physical vSST file (e.g. 420). dependence_map_ maps the logical number
+// to the physical FileMetaData. The aggregation must key the live-block
+// view on the *physical* number, and IsBlockLive() must canonicalize a
+// logical query to the same physical key, so that the table iterator
+// layer (which queries with the physical fd.GetNumber()) and the
+// aggregator never split the bitmap across two keys.
+TEST_F(VersionBuilderTest, AggregatesUnderPhysicalFileNumber) {
+  constexpr uint64_t kBlockUnit = 4096;
+  constexpr uint64_t kLogicalFn = 100U;
+  constexpr uint64_t kPhysicalFn = 420U;
+
+  // Physical vSST 420 inherits the logical dependence number 100, so
+  // dependence_map_ maps both 100 -> f(420) and 420 -> f(420).
+  TablePropertyCache blob_prop;
+  blob_prop.inheritance = {kLogicalFn};
+  Add(-1, kPhysicalFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0, 100,
+      100, blob_prop);
+  // SST references the blob via the LOGICAL file number 100, but stamps
+  // the row layout_id with the CURRENT physical file number 420 (which is
+  // what the producer observes at write time). Block 0 is marked live.
+  Add(2, 2420U, "100", "199", 500U, 0, 200, 200, 1, 0, 200, 200,
+      GetPropCacheWithBlockBitmapsLayoutId(
+          0, kPhysicalFn, {{kLogicalFn, std::vector<uint64_t>{0}}}));
+  UpdateVersionStorageInfo();
+
+  vstorage_.AggregateBlobLiveBlockBitmaps();
+
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  // The bitmap must be keyed under the physical number.
+  const auto* info = vstorage_.GetBlobLiveBlockInfo(kPhysicalFn);
+  ASSERT_NE(nullptr, info);
+  EXPECT_TRUE(info->bitmap_available);
+  EXPECT_TRUE(info->live_block_bitmap.Test(0));
+
+  // Physical-key query (table iterator path).
+  EXPECT_EQ(L::kLive, vstorage_.IsBlockLive(kPhysicalFn, 0));
+  // Logical-key query must canonicalize to the same physical entry.
+  EXPECT_EQ(L::kLive, vstorage_.IsBlockLive(kLogicalFn, 0));
+  // A block that was never marked live must be dead under the physical
+  // key (so GC can skip it), never a phantom available/empty entry.
+  EXPECT_EQ(L::kDead, vstorage_.IsBlockLive(kPhysicalFn, 1));
+}
+
+// When a row stamps a STALE physical layout (the old physical file 350
+// that the logical number used to map to before a vSST GC rewrite to
+// 420), the aggregator must reject the row and sticky-clear the current
+// physical entry. IsBlockLive() must then report kUnknown so the GC
+// block skip never drops a block whose liveness it cannot prove.
+TEST_F(VersionBuilderTest, RejectsStalePhysicalLayoutUnderPhysicalKey) {
+  constexpr uint64_t kBlockUnit = 4096;
+  constexpr uint64_t kLogicalFn = 100U;
+  constexpr uint64_t kCurrentPhysicalFn = 420U;
+  constexpr uint64_t kStalePhysicalFn = 350U;
+
+  TablePropertyCache blob_prop;
+  blob_prop.inheritance = {kLogicalFn};
+  Add(-1, kCurrentPhysicalFn, "100", "199", 4 * kBlockUnit, 0, 100, 100, 100, 0,
+      100, 100, blob_prop);
+  // Row stamped with the OLD physical layout 350, which no longer
+  // matches the current physical file 420.
+  Add(2, 2421U, "100", "199", 500U, 0, 200, 200, 1, 0, 200, 200,
+      GetPropCacheWithBlockBitmapsLayoutId(
+          0, kStalePhysicalFn, {{kLogicalFn, std::vector<uint64_t>{0}}}));
+  UpdateVersionStorageInfo();
+
+  vstorage_.AggregateBlobLiveBlockBitmaps();
+
+  using L = VersionStorageInfo::BlobBlockLiveness;
+  const auto* info = vstorage_.GetBlobLiveBlockInfo(kCurrentPhysicalFn);
+  ASSERT_NE(nullptr, info);
+  EXPECT_FALSE(info->bitmap_available)
+      << "a row stamped against a stale physical layout must not be trusted";
+  // Both physical and logical queries must report kUnknown so GC block
+  // skip falls back and never drops any block.
+  EXPECT_EQ(L::kUnknown, vstorage_.IsBlockLive(kCurrentPhysicalFn, 0));
+  EXPECT_EQ(L::kUnknown, vstorage_.IsBlockLive(kLogicalFn, 0));
+  EXPECT_FALSE(vstorage_.IsBlobEntirelyDead(kCurrentPhysicalFn));
+}
+
 // A single legacy/unavailable row must make the blob sticky-unavailable
 // even when another SST in the same version contributes a perfectly
 // valid layout-matched bitmap for the same blob. Availability is

@@ -114,7 +114,10 @@ class BlockBasedTable : public TableReader {
                                 const SliceTransform* prefix_extractor,
                                 Arena* arena = nullptr,
                                 bool skip_filters = false,
-                                bool for_compaction = false) override;
+                                bool for_compaction = false,
+                                const BlobGcBlockSkipContext*
+                                    blob_gc_block_skip_context = nullptr)
+      override;
 
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& read_options) override;
@@ -554,7 +557,9 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
                               const SliceTransform* prefix_extractor,
                               bool is_index, bool key_includes_seq = true,
                               bool index_key_is_full = true,
-                              bool for_compaction = false)
+                              bool for_compaction = false,
+                              const BlobGcBlockSkipContext*
+                                  blob_gc_block_skip_context = nullptr)
       : table_(table),
         read_options_(read_options),
         icomp_(icomp),
@@ -566,7 +571,11 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
         is_index_(is_index),
         key_includes_seq_(key_includes_seq),
         index_key_is_full_(index_key_is_full),
-        for_compaction_(for_compaction) {}
+        for_compaction_(for_compaction) {
+    if (blob_gc_block_skip_context != nullptr) {
+      gc_block_skip_ctx_ = *blob_gc_block_skip_context;
+    }
+  }
 
   ~BlockBasedTableIteratorBase() { delete index_iter_; }
 
@@ -625,7 +634,19 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
     }
   }
 
-  void InitDataBlock();
+  enum class InitDataBlockResult { kLoaded, kSkipped, kInvalid };
+
+  void DisableGcBlockSkip() {
+    current_data_block_id_valid_ = false;
+    gc_forward_scan_mode_ = false;
+  }
+
+  bool GcBlockSkipEnabled() const {
+    return gc_block_skip_ctx_.enabled &&
+           gc_block_skip_ctx_.is_block_dead != nullptr;
+  }
+
+  InitDataBlockResult InitDataBlock();
   void FindKeyForward();
   void FindKeyBackward();
 
@@ -649,6 +670,10 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   // If this iterator is created for compaction
   bool for_compaction_;
   BlockHandle prev_index_value_;
+  BlobGcBlockSkipContext gc_block_skip_ctx_;
+  uint64_t current_data_block_id_ = 0;
+  bool current_data_block_id_valid_ = false;
+  bool gc_forward_scan_mode_ = false;
 
   static const size_t kInitReadaheadSize = 8 * 1024;
   // Found that 256 KB readahead size provides the best performance, based on

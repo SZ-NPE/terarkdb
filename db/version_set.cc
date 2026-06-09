@@ -504,7 +504,10 @@ class LevelIterator final : public InternalIterator, public Snapshot {
                 const DependenceMap& dependence_map,
                 const SliceTransform* prefix_extractor, bool should_sample,
                 HistogramImpl* file_read_hist, bool for_compaction,
-                bool skip_filters, int level, RangeDelAggregator* range_del_agg)
+                bool skip_filters, int level,
+                RangeDelAggregator* range_del_agg,
+                const BlobGcBlockSkipContext* blob_gc_block_skip_context =
+                    nullptr)
       : table_cache_(table_cache),
         read_options_(read_options),
         snapshot_(0),
@@ -519,7 +522,8 @@ class LevelIterator final : public InternalIterator, public Snapshot {
         skip_filters_(skip_filters),
         file_index_(flevel_->num_files),
         level_(level),
-        range_del_agg_(range_del_agg) {
+        range_del_agg_(range_del_agg),
+        blob_gc_block_skip_context_(blob_gc_block_skip_context) {
     // Empty level is not supported.
     assert(flevel_ != nullptr && flevel_->num_files > 0);
     if (read_options_.snapshot != nullptr) {
@@ -580,7 +584,8 @@ class LevelIterator final : public InternalIterator, public Snapshot {
         read_options_, env_options_, *file_meta.file_metadata, dependence_map_,
         range_del_agg_, prefix_extractor_,
         nullptr /* don't need reference to table */, file_read_hist_,
-        for_compaction_, nullptr /* arena */, skip_filters_, level_);
+        for_compaction_, nullptr /* arena */, skip_filters_, level_,
+        blob_gc_block_skip_context_);
   }
 
   TableCache* table_cache_;
@@ -600,6 +605,7 @@ class LevelIterator final : public InternalIterator, public Snapshot {
   size_t file_index_;
   int level_;
   RangeDelAggregator* range_del_agg_;
+  const BlobGcBlockSkipContext* blob_gc_block_skip_context_;
   IteratorWrapper file_iter_;  // May be nullptr
 };
 
@@ -4728,7 +4734,8 @@ void VersionSet::AddLiveFiles(std::vector<FileDescriptor>* live_list) {
 
 InternalIterator* VersionSet::MakeInputIterator(
     const Compaction* c, RangeDelAggregator* range_del_agg,
-    const EnvOptions& env_options_compactions) {
+    const EnvOptions& env_options_compactions,
+    const BlobGcBlockSkipContext* blob_gc_block_skip_context) {
   auto cfd = c->column_family_data();
   ReadOptions read_options;
   read_options.verify_checksums = true;
@@ -4760,7 +4767,8 @@ InternalIterator* VersionSet::MakeInputIterator(
               nullptr /* table_reader_ptr */,
               nullptr /* no per level latency histogram */,
               true /* for_compaction */, nullptr /* arena */,
-              false /* skip_filters */, c->level(which) /* level */);
+              false /* skip_filters */, c->level(which) /* level */,
+              blob_gc_block_skip_context);
         }
       } else {
         // Create concatenating iterator for the files from this level
@@ -4771,7 +4779,8 @@ InternalIterator* VersionSet::MakeInputIterator(
             false /* should_sample */,
             nullptr /* no per level latency histogram */,
             true /* for_compaction */, false /* skip_filters */,
-            static_cast<int>(which) /* level */, range_del_agg);
+            static_cast<int>(which) /* level */, range_del_agg,
+            blob_gc_block_skip_context);
       }
     }
   }
@@ -5007,20 +5016,29 @@ void VersionStorageInfo::CalculateBlobInfo() {
 
 // Algorithm:
 //   1. Reset the previous map (idempotent).
-//   2. Pre-seed an entry for every blob file present in dependence_map_,
-//      so that an SST that references a blob without ever populating
-//      a per-row block bitmap (e.g. legacy index entries decoded as
-//      empty bitmaps) still ends up tagged as `bitmap_available =
-//      false` rather than missing.
-//   3. Walk every level (0..num_levels-1) plus level -1, and for each
+//   2. Walk every level (0..num_levels-1) plus level -1, and for each
 //      SST `f` whose `prop.dependence_block_bitmaps.size()` matches
 //      `prop.dependence.size()`, fold each per-row bitmap into the
-//      corresponding blob's `live_block_bitmap` via OrWith. An empty
-//      per-row bitmap is the explicit "bitmap unavailable" sentinel;
-//      encountering it sticky-clears `bitmap_available` for that blob.
-//   4. For SSTs whose per-dependence bitmap vector is missing entirely
+//      corresponding blob's `live_block_bitmap` via OrWith. The bitmap
+//      is keyed by the blob's *current physical* vSST file number
+//      (the value resolved through dependence_map_), NOT the logical
+//      dependence file number stored in the row. After a vSST GC
+//      rewrite/inheritance the logical file number maps to a brand new
+//      physical file, and table iterators query the live view with the
+//      physical fd.GetNumber(); keying on the logical number here would
+//      split the bitmap across two keys and corrupt the GC fast path.
+//      An empty / unavailable per-row bitmap is the explicit "bitmap
+//      unavailable" sentinel; encountering it sticky-clears
+//      `bitmap_available` for that physical blob.
+//   3. For SSTs whose per-dependence bitmap vector is missing entirely
 //      (size mismatch), the SST is treated as legacy: every blob it
-//      references is sticky-marked unavailable.
+//      references is sticky-marked unavailable (under its physical key).
+//   4. Entries are created lazily and start out with
+//      bitmap_available=false; an entry is only promoted to
+//      bitmap_available=true when at least one referencing row is
+//      available with a layout_id matching the current physical file.
+//      We never pre-seed phantom "available && empty" entries, which
+//      would otherwise make IsBlockLive() return kDead for a live block.
 //   5. Once all SSTs have been visited, derive live_block_count /
 //      live_block_bytes / dead_block_bytes / dead_block_ratio for
 //      blobs whose bitmap is still available. `total_block_count`
@@ -5030,12 +5048,16 @@ void VersionStorageInfo::CalculateBlobInfo() {
 void VersionStorageInfo::AggregateBlobLiveBlockBitmaps() {
   blob_live_block_info_.clear();
 
-  // Step 2: pre-seed an entry for every known dependence so that
-  // reverse-lookups never miss a blob present in the LSM but never
-  // referenced by a block-aware SST.
-  for (auto& kv : dependence_map_) {
-    blob_live_block_info_[kv.first];  // default-constructed
-  }
+  // Track which physical blobs have been sticky-cleared so a later row
+  // can never re-promote them to available within this aggregation pass.
+  std::unordered_set<uint64_t> sticky_unavailable;
+
+  auto sticky_clear = [&](uint64_t physical_fn) {
+    auto& info = blob_live_block_info_[physical_fn];
+    info.bitmap_available = false;
+    info.live_block_bitmap.Clear();
+    sticky_unavailable.insert(physical_fn);
+  };
 
   auto fold_one_sst = [&](FileMetaData* f) {
     if (f == nullptr) return;
@@ -5044,47 +5066,53 @@ void VersionStorageInfo::AggregateBlobLiveBlockBitmaps() {
     const auto& bms = f->prop.dependence_block_bitmaps;
     const bool has_bitmaps = (bms.size() == deps.size());
     for (size_t i = 0; i < deps.size(); ++i) {
-      const uint64_t fn = deps[i].file_number;
-      auto& info = blob_live_block_info_[fn];  // default-create on demand
-      if (!info.bitmap_available) {
+      const uint64_t logical_fn = deps[i].file_number;
+      // Resolve the *current* physical vSST file the logical dependence
+      // file number maps to. The block ids in row.bitmap are only valid
+      // under the layout identified by row.layout_id; the physical file
+      // number is the canonical key under which both this aggregation
+      // and the table iterator layer (which uses fd.GetNumber()) agree.
+      auto dep_it = dependence_map_.find(logical_fn);
+      const FileMetaData* current_vsst =
+          dep_it == dependence_map_.end() ? nullptr : dep_it->second;
+      if (current_vsst == nullptr) {
+        // The logical dependence does not resolve to any physical file
+        // in this version. There is nothing trustworthy to key on, so
+        // there is no entry to clear; skip it.
+        continue;
+      }
+      const uint64_t physical_fn = current_vsst->fd.GetNumber();
+
+      if (sticky_unavailable.count(physical_fn) != 0) {
         // Already sticky-cleared: nothing to merge anymore.
         continue;
       }
       if (!has_bitmaps) {
         // SST has no per-row bitmap vector at all: legacy regime.
-        info.bitmap_available = false;
-        info.live_block_bitmap.Clear();
+        sticky_clear(physical_fn);
         continue;
       }
       const DependenceBlockBitmap& row = bms[i];
       if (!row.available) {
         // Explicit per-dependence "unavailable" signal.
-        info.bitmap_available = false;
-        info.live_block_bitmap.Clear();
+        sticky_clear(physical_fn);
         continue;
       }
-      // Resolve the *current* physical vSST file the logical dependence
-      // file number maps to. The block ids in row.bitmap are only valid
-      // under the layout identified by row.layout_id; if the current
-      // physical file differs (e.g. a vSST GC rewrite produced a new
-      // file), the old block ids no longer address the same bytes and
-      // we must fall back.
-      auto dep_it = dependence_map_.find(fn);
-      const FileMetaData* current_vsst =
-          dep_it == dependence_map_.end() ? nullptr : dep_it->second;
-      const uint64_t current_layout_id =
-          current_vsst == nullptr ? kNoBlockLayoutId
-                                  : current_vsst->fd.GetNumber();
+      // The row's block ids are only valid under the physical layout it
+      // was stamped against. If the current physical file differs (e.g.
+      // a vSST GC rewrite produced a new file), the old block ids no
+      // longer address the same bytes and we must fall back.
       if (row.layout_id == kNoBlockLayoutId ||
-          current_layout_id == kNoBlockLayoutId ||
-          row.layout_id != current_layout_id) {
+          row.layout_id != physical_fn) {
         // Either the row never bound a usable layout, or it was stamped
         // against a stale physical layout. Sticky-clear and fall back.
-        info.bitmap_available = false;
-        info.live_block_bitmap.Clear();
+        sticky_clear(physical_fn);
         continue;
       }
-      // Layout matches: it is safe to OR the live blocks in.
+      // Layout matches the current physical file: it is safe to OR the
+      // live blocks in. Promote the entry to available.
+      auto& info = blob_live_block_info_[physical_fn];
+      info.bitmap_available = true;
       info.live_block_bitmap.OrWith(row.bitmap);
     }
   };
