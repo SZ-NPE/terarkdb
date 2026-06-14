@@ -107,6 +107,29 @@ TEST_F(HotnessTrackerTest, DecayReducesScore) {
   ASSERT_EQ(after, before / 2);
 }
 
+TEST_F(HotnessTrackerTest, DecayUsesHalfLifeRatio) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.decay_interval = 100;
+  options.half_life_writes = 400;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("half_life_key");
+  for (int i = 0; i < 8; ++i) {
+    tracker.RecordCompactionFeedback(key);
+  }
+  const uint32_t before = tracker.Estimate(key);
+  ASSERT_EQ(before, 16U);
+
+  for (int i = 0; i < 100; ++i) {
+    std::string filler = "decay_filler_" + std::to_string(i);
+    tracker.RecordWrite(filler);
+  }
+
+  const uint32_t after = tracker.Estimate(key);
+  ASSERT_LT(after, before);
+  ASSERT_GT(after, before / 2);
+}
+
 // (f) When the write window is disabled, repeated writes do not raise score.
 TEST_F(HotnessTrackerTest, WriteWindowDisabledKeepsScoreFlat) {
   HotnessTracker::Options options = MakeTestOptions();

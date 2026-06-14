@@ -281,16 +281,20 @@ Status BuildTable(
 
     size_t target_blob_file_size = MaxBlobSize(
         mutable_cf_options, ioptions.num_levels, ioptions.compaction_style);
+    std::shared_ptr<HotnessTracker> hotness_tracker;
+    ColumnFamilyData* cfd =
+        versions_->GetColumnFamilySet()->GetColumnFamily(column_family_id);
+    if (cfd) {
+      hotness_tracker = cfd->hotness_tracker();
+    }
 
     auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
       assert(value.file_number() == uint64_t(-1));
       Status status;
 
-      ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(column_family_id);
-      auto hotness_tracker = cfd ? cfd->hotness_tracker() : nullptr;
-      Slice user_key = ExtractUserKey(key);
       auto route = HotnessTracker::FlushRoute::kWarm;
       if (hotness_tracker) {
+        Slice user_key = ExtractUserKey(key);
         route = hotness_tracker->ClassifyForFlush(user_key);
       }
       int hot_idx = static_cast<int>(route);

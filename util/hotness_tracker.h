@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 
@@ -130,7 +131,9 @@ class HotnessTracker {
     return writes_.load(std::memory_order_relaxed);
   }
 
-  void TEST_ForceDecay() { Decay(); }
+  void TEST_ForceDecay() {
+    Decay(DecayEnabled() ? decay_interval_ : 1);
+  }
 
   bool TEST_RecentWindowContains(const Slice& key) const {
     if (window_cache_ == nullptr) {
@@ -197,19 +200,39 @@ class HotnessTracker {
     }
     uint64_t now = writes_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (now % decay_interval_ == 0) {
-      Decay();
+      Decay(decay_interval_);
     }
   }
 
-  // First version: halve every counter. Future versions may use
-  // counter *= 2^(-D/T_half) for a smoother decay.
-  void Decay() {
+  uint32_t DecayedValue(uint32_t value, uint64_t elapsed_writes) const {
+    if (value == 0) {
+      return 0;
+    }
+    if (!DecayEnabled()) {
+      return value / 2;
+    }
+    const double exponent =
+        -static_cast<double>(elapsed_writes) /
+        static_cast<double>(half_life_writes_);
+    const double factor = std::exp2(exponent);
+    return static_cast<uint32_t>(static_cast<double>(value) * factor);
+  }
+
+  // Apply half-life decay: counter *= 2^(-elapsed_writes / half_life_writes).
+  void Decay(uint64_t elapsed_writes) {
     if (table_ == nullptr) {
       return;
     }
     for (size_t i = 0; i < TableSize(); ++i) {
       uint32_t value = table_[i].load(std::memory_order_relaxed);
-      table_[i].store(value / 2, std::memory_order_relaxed);
+      while (true) {
+        uint32_t decayed = DecayedValue(value, elapsed_writes);
+        if (table_[i].compare_exchange_weak(value, decayed,
+                                            std::memory_order_relaxed,
+                                            std::memory_order_relaxed)) {
+          break;
+        }
+      }
     }
   }
 
