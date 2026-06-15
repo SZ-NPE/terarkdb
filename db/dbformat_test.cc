@@ -235,6 +235,16 @@ std::string BuildBlockAwareIndex(uint64_t file_number, const Slice& meta,
   return out;
 }
 
+// Build a v2 block-aware value-index slice that additionally carries the
+// in-block slot ordinal.
+std::string BuildBlockAwareIndexV2(uint64_t file_number, const Slice& meta,
+                                   uint64_t block_id, uint64_t layout_id,
+                                   uint64_t slot_id) {
+  std::string out = BuildLegacyIndex(file_number, meta);
+  SeparateHelper::EncodeBlockIdTrailer(&out, block_id, layout_id, slot_id);
+  return out;
+}
+
 }  // namespace
 
 // Test 1: Legacy format (no trailer) encodes and decodes correctly, and
@@ -339,10 +349,65 @@ TEST_F(FormatTest, ValueIndexEncodeDecode_NewFormatWithBlockId) {
   }
 }
 
-// Test 3: Mixed readers must treat non-trailer slices as legacy even when
-// the meta tail accidentally contains bytes that look similar to the
-// trailer encoding. Readers unaware of the trailer must continue to see a
-// usable meta view.
+// Test 2b: v2 trailer round-trips block_id + layout_id + slot_id, strips
+// the (longer) v2 trailer correctly, and DecodeValueLocation reports a
+// fully valid ValueLocation only for v2.
+TEST_F(FormatTest, ValueIndexEncodeDecode_NewFormatWithSlot) {
+  const uint64_t file_number = 42ULL;
+  const std::string meta_str = "meta";
+  const Slice meta(meta_str);
+
+  struct Case {
+    uint64_t block_id, layout_id, slot_id;
+  };
+  const Case cases[] = {
+      {0ULL, 1ULL, 0ULL},
+      {3ULL, 100ULL, 17ULL},
+      {(1ULL << 35), (1ULL << 40) + 3, 4095ULL},
+  };
+  for (const Case& c : cases) {
+    std::string encoded = BuildBlockAwareIndexV2(file_number, meta, c.block_id,
+                                                 c.layout_id, c.slot_id);
+    Slice slice(encoded);
+    ASSERT_EQ(file_number, SeparateHelper::DecodeFileNumber(slice));
+    ASSERT_TRUE(SeparateHelper::HasBlockId(slice));
+    ASSERT_EQ(c.block_id, SeparateHelper::DecodeBlockId(slice));
+    ASSERT_EQ(c.layout_id, SeparateHelper::DecodeBlockLayoutId(slice));
+    ASSERT_EQ(c.slot_id, SeparateHelper::DecodeSlotId(slice));
+    // Meta strips the longer v2 trailer exactly.
+    ASSERT_EQ(meta_str,
+              SeparateHelper::DecodeValueMetaStripBlockId(slice).ToString());
+    // Full location decodes and is valid.
+    ValueLocation loc;
+    ASSERT_TRUE(SeparateHelper::DecodeValueLocation(slice, &loc));
+    ASSERT_TRUE(loc.valid());
+    ASSERT_EQ(file_number, loc.file_number);
+    ASSERT_EQ(c.block_id, loc.block_id);
+    ASSERT_EQ(c.layout_id, loc.layout_id);
+    ASSERT_EQ(c.slot_id, loc.slot_id);
+  }
+
+  // A v1 trailer (no slot) yields kNoSlotId and an INVALID ValueLocation,
+  // so the death log conservatively falls back for it.
+  {
+    std::string encoded = BuildBlockAwareIndex(file_number, meta, 5ULL, 6ULL);
+    Slice slice(encoded);
+    ASSERT_EQ(SeparateHelper::kNoSlotId, SeparateHelper::DecodeSlotId(slice));
+    ValueLocation loc;
+    ASSERT_FALSE(SeparateHelper::DecodeValueLocation(slice, &loc));
+    ASSERT_FALSE(loc.valid());
+  }
+
+  // A legacy index (no trailer) yields an INVALID ValueLocation.
+  {
+    std::string encoded = BuildLegacyIndex(file_number, meta);
+    Slice slice(encoded);
+    ValueLocation loc;
+    ASSERT_FALSE(SeparateHelper::DecodeValueLocation(slice, &loc));
+    ASSERT_FALSE(loc.valid());
+  }
+}
+
 TEST_F(FormatTest, ValueIndexDecode_BackwardCompatible) {
   const uint64_t file_number = 7ULL;
 

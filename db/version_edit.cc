@@ -233,29 +233,19 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
                           f.prop.raw_value_size);
       PutVarint64(&encode_property_cache, f.prop.earliest_time_begin_compact);
       PutVarint64(&encode_property_cache, f.prop.latest_time_end_compact);
-      // persist per-dependence block bitmaps in manifest so
-      // that DB reopen can restore the live-block view without
-      // rereading every SST. The payload is append-only and self
-      // delimiting, so older manifests that predate this field remain
-      // decodable (the decoder simply sees `field.empty()` at this
-      // point and leaves `dependence_block_bitmaps` empty, which is
-      // the "bitmap unavailable" sentinel for GC fallback).
-      // Only emit when the producer actually has a well-formed,
-      // aligned bitmap vector. Writing an empty 0-count payload here
-      // would be indistinguishable from absence, so we just skip the
-      // whole block in that case.
-      if (!f.prop.dependence_block_bitmaps.empty() &&
-          f.prop.dependence_block_bitmaps.size() ==
-              f.prop.dependence.size()) {
+      // persist per-data-block entry counts in the manifest so the GC
+      // death-map fast path can decide "entirely dead" data blocks after
+      // a DB reopen without rereading every SST. The payload is
+      // append-only and self delimiting, so older manifests that predate
+      // this field remain decodable (the decoder simply sees
+      // `field.empty()` here and leaves `data_block_entry_counts` empty,
+      // disabling the fast path).
+      if (!f.prop.data_block_entry_counts.empty()) {
         PutVarint64(
             &encode_property_cache,
-            static_cast<uint64_t>(f.prop.dependence_block_bitmaps.size()));
-        for (const auto& bm : f.prop.dependence_block_bitmaps) {
-          std::string serialized;
-          bm.Serialize(&serialized);
-          PutVarint64(&encode_property_cache,
-                      static_cast<uint64_t>(serialized.size()));
-          encode_property_cache.append(serialized);
+            static_cast<uint64_t>(f.prop.data_block_entry_counts.size()));
+        for (uint32_t cnt : f.prop.data_block_entry_counts) {
+          PutVarint64(&encode_property_cache, static_cast<uint64_t>(cnt));
         }
       }
       PutLengthPrefixedSlice(dst, encode_property_cache);
@@ -448,32 +438,23 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               }
             }
             if (!field.empty()) {
-              // append-only block-bitmap payload. Older
+              // append-only per-data-block entry-count payload. Older
               // manifests will have `field.empty()` here and we leave
-              // `dependence_block_bitmaps` empty, which signals
-              // "bitmap unavailable" to the GC fallback.
-              uint64_t n_bitmaps = 0;
-              if (!GetVarint64(&field, &n_bitmaps)) {
+              // `data_block_entry_counts` empty, which disables the GC
+              // death-map fast path for that file.
+              uint64_t n_counts = 0;
+              if (!GetVarint64(&field, &n_counts)) {
                 return error_msg;
               }
-              f.prop.dependence_block_bitmaps.clear();
-              f.prop.dependence_block_bitmaps.resize(n_bitmaps);
-              for (uint64_t i = 0; i < n_bitmaps; ++i) {
-                uint64_t blen = 0;
-                if (!GetVarint64(&field, &blen) || field.size() < blen) {
-                  // Structural framing error: cannot trust the rest of
-                  // the manifest record. Reject.
+              f.prop.data_block_entry_counts.clear();
+              f.prop.data_block_entry_counts.reserve(n_counts);
+              for (uint64_t i = 0; i < n_counts; ++i) {
+                uint64_t cnt = 0;
+                if (!GetVarint64(&field, &cnt)) {
                   return error_msg;
                 }
-                if (blen > 0) {
-                  Slice bm_slice(field.data(), blen);
-                  // A malformed inner row must NOT fail the whole
-                  // manifest. DependenceBlockBitmap::Deserialize() resets
-                  // the row to the safe unavailable state on failure, so
-                  // GC simply falls back for that dependence.
-                  f.prop.dependence_block_bitmaps[i].Deserialize(&bm_slice);
-                }
-                field.remove_prefix(blen);
+                f.prop.data_block_entry_counts.push_back(
+                    static_cast<uint32_t>(cnt));
               }
             }
             if (f.prop.num_entries > 0 || f.prop.raw_key_size > 0 ||

@@ -434,6 +434,10 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
   // r->props.num_data_blocks, so the in-progress block's 0-based
   // ordinal equals the current num_data_blocks value.
   last_added_data_block_id_ = r->props.num_data_blocks;
+  // In-block slot ordinal: the entry index within the current
+  // in-progress data block. Flush() resets next_slot_id_ to 0 when it
+  // seals a block, so the first entry of every block gets slot 0.
+  last_added_slot_id_ = next_slot_id_++;
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
@@ -483,6 +487,14 @@ void BlockBasedTableBuilder::Flush() {
   }
   r->props.data_size = r->offset;
   ++r->props.num_data_blocks;
+  // A data block was just sealed. Record how many entries it held so
+  // the GC death-map fast path can decide when the block is entirely
+  // dead, then reset the in-block slot counter for the next block.
+  // Gated on the feature switch so default-off builds are unchanged.
+  if (r->moptions.enable_blob_death_log) {
+    data_block_entry_counts_.push_back(static_cast<uint32_t>(next_slot_id_));
+  }
+  next_slot_id_ = 0;
 }
 
 void BlockBasedTableBuilder::WriteBlock(BlockBuilder* block,
@@ -895,24 +907,11 @@ Status BlockBasedTableBuilder::Finish(
     r->props.max_read_amp = prop->max_read_amp;
     r->props.read_amp = prop->read_amp;
     r->props.dependence = prop->dependence;
-    // Carry block bitmaps from TablePropertyCache (internal runtime
-    // form) into TableProperties (serializable form) so that the
-    // property block can persist them. Each row is a layout-aware
-    // DependenceBlockBitmap serialized to an opaque byte string.
-    // Preserve the "bitmap unavailable" regime by leaving the vector
-    // empty when the producer did not populate it.
-    if (!prop->dependence_block_bitmaps.empty() &&
-        prop->dependence_block_bitmaps.size() == prop->dependence.size()) {
-      r->props.dependence_block_bitmaps.clear();
-      r->props.dependence_block_bitmaps.reserve(
-          prop->dependence_block_bitmaps.size());
-      for (const auto& row : prop->dependence_block_bitmaps) {
-        std::string s;
-        row.Serialize(&s);
-        r->props.dependence_block_bitmaps.emplace_back(std::move(s));
-      }
-    }
   }
+  // Hand the per-data-block entry counts collected during Flush() to
+  // TableProperties so they get persisted. Empty when the feature is
+  // off, leaving the property block bit-for-bit identical to before.
+  r->props.data_block_entry_counts = std::move(data_block_entry_counts_);
   if (snapshots != nullptr) {
     r->props.snapshots = *snapshots;
   }

@@ -68,13 +68,12 @@ struct TablePropertiesNames {
   static const std::string kDependence;
   static const std::string kDependenceEntryCount;
   static const std::string kDependenceByteCount;
-  // When present, the value is a length-prefixed concatenation of N
-  // serialized BlobBlockBitmap blobs, strictly aligned by index to the
-  // dependence vector. Each bit is indexed by the vSST data block
-  // ordinal (block_id). When absent (old SSTs produced before the
-  // block-aware format), readers treat the whole SST as "bitmap
-  // unavailable" and fall back to the legacy GC lookup path.
-  static const std::string kDependenceBlockBitmaps;
+  // When present, the value is a varint-count followed by N varint32
+  // entry counts, one per BlockBasedTable data block (indexed by the
+  // data block ordinal). Populated for blob (vSST) BlockBasedTables when
+  // the blob death log feature is enabled. When absent, the GC death-map
+  // fast path falls back to the legacy lookup path for that file.
+  static const std::string kDataBlockEntryCounts;
   static const std::string kInheritanceChain;
   static const std::string kInheritanceTree;
   static const std::string kEarliestTimeBeginCompact;
@@ -262,17 +261,12 @@ struct TablePropertiesBase {
   // Make these sst hidden
   std::vector<Dependence> dependence;
 
-  // When non-empty, size() must equal dependence.size() and
-  // element i corresponds to dependence[i]. Each element is the raw
-  // byte payload produced by DependenceBlockBitmap::Serialize(), i.e.
-  // it carries an explicit `available` flag, the `layout_id` (physical
-  // vSST file number the block ids were stamped against), and the
-  // block bitmap. An overall empty vector means "bitmap unavailable
-  // for this SST", which forces legacy GC fallback on the reader side.
-  // A present row that deserializes with available=false is a
-  // per-dependence fallback signal. The field is kept as opaque byte
-  // strings so this public header need not pull internal headers.
-  std::vector<std::string> dependence_block_bitmaps;
+  // Number of entries in each BlockBasedTable data block, indexed by the
+  // data block ordinal. Populated for blob (vSST) BlockBasedTables when
+  // the blob death log feature is enabled, and consumed by the GC
+  // death-map fast path to decide when a data block is entirely dead.
+  // Empty for legacy/map SSTs and when the feature is off.
+  std::vector<uint32_t> data_block_entry_counts;
 
   // Inheritance tree
   std::vector<uint64_t> inheritance_tree;

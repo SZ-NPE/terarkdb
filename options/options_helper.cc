@@ -189,19 +189,17 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
   cf_opts.precise_gc = mutable_cf_options.precise_gc;
-  cf_opts.enable_blob_block_bitmap = mutable_cf_options.enable_blob_block_bitmap;
-  cf_opts.enable_blob_block_bitmap_gc_fast_path =
-      mutable_cf_options.enable_blob_block_bitmap_gc_fast_path;
-  cf_opts.enable_blob_block_skip = mutable_cf_options.enable_blob_block_skip;
-  cf_opts.blob_block_index_version =
-      mutable_cf_options.blob_block_index_version;
-  cf_opts.blob_block_bitmap_strict_fallback =
-      mutable_cf_options.blob_block_bitmap_strict_fallback;
-  cf_opts.blob_block_bitmap_debug =
-      mutable_cf_options.blob_block_bitmap_debug;
-  cf_opts.enable_blob_validity_bitmap =
-      mutable_cf_options.enable_blob_validity_bitmap;
-  cf_opts.blob_gc_chunk_size = mutable_cf_options.blob_gc_chunk_size;
+  cf_opts.enable_blob_death_log = mutable_cf_options.enable_blob_death_log;
+  cf_opts.blob_death_log_persist = mutable_cf_options.blob_death_log_persist;
+  cf_opts.blob_death_log_buffer_size =
+      mutable_cf_options.blob_death_log_buffer_size;
+  cf_opts.blob_gc_skip_dead_blocks =
+      mutable_cf_options.blob_gc_skip_dead_blocks;
+  cf_opts.blob_gc_skip_getkey_with_deathmap =
+      mutable_cf_options.blob_gc_skip_getkey_with_deathmap;
+  cf_opts.blob_death_log_debug_check =
+      mutable_cf_options.blob_death_log_debug_check;
+  cf_opts.blob_death_log_stats = mutable_cf_options.blob_death_log_stats;
   cf_opts.target_blob_file_size = mutable_cf_options.target_blob_file_size;
   cf_opts.blob_file_defragment_size =
       mutable_cf_options.blob_file_defragment_size;
@@ -2006,41 +2004,32 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::precise_gc), OptionType::kBoolean,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, precise_gc)}},
-        {"enable_blob_block_bitmap",
-         {offset_of(&ColumnFamilyOptions::enable_blob_block_bitmap),
+        {"enable_blob_death_log",
+         {offset_of(&ColumnFamilyOptions::enable_blob_death_log),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"blob_death_log_persist",
+         {offset_of(&ColumnFamilyOptions::blob_death_log_persist),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"blob_death_log_buffer_size",
+         {offset_of(&ColumnFamilyOptions::blob_death_log_buffer_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, false, 0}},
+        {"blob_gc_skip_dead_blocks",
+         {offset_of(&ColumnFamilyOptions::blob_gc_skip_dead_blocks),
           OptionType::kBoolean, OptionVerificationType::kNormal, true,
-          offsetof(struct MutableCFOptions, enable_blob_block_bitmap)}},
-        {"enable_blob_block_bitmap_gc_fast_path",
-         {offset_of(
-              &ColumnFamilyOptions::enable_blob_block_bitmap_gc_fast_path),
-          OptionType::kBoolean, OptionVerificationType::kNormal, true,
-          offsetof(struct MutableCFOptions,
-                   enable_blob_block_bitmap_gc_fast_path)}},
-        {"enable_blob_block_skip",
-         {offset_of(&ColumnFamilyOptions::enable_blob_block_skip),
-          OptionType::kBoolean, OptionVerificationType::kNormal, true,
-          offsetof(struct MutableCFOptions, enable_blob_block_skip)}},
-        {"blob_block_index_version",
-         {offset_of(&ColumnFamilyOptions::blob_block_index_version),
-          OptionType::kUInt32T, OptionVerificationType::kNormal, true,
-          offsetof(struct MutableCFOptions, blob_block_index_version)}},
-        {"blob_block_bitmap_strict_fallback",
-         {offset_of(&ColumnFamilyOptions::blob_block_bitmap_strict_fallback),
+          offsetof(struct MutableCFOptions, blob_gc_skip_dead_blocks)}},
+        {"blob_gc_skip_getkey_with_deathmap",
+         {offset_of(&ColumnFamilyOptions::blob_gc_skip_getkey_with_deathmap),
           OptionType::kBoolean, OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions,
-                   blob_block_bitmap_strict_fallback)}},
-        {"blob_block_bitmap_debug",
-         {offset_of(&ColumnFamilyOptions::blob_block_bitmap_debug),
+                   blob_gc_skip_getkey_with_deathmap)}},
+        {"blob_death_log_debug_check",
+         {offset_of(&ColumnFamilyOptions::blob_death_log_debug_check),
           OptionType::kBoolean, OptionVerificationType::kNormal, true,
-          offsetof(struct MutableCFOptions, blob_block_bitmap_debug)}},
-        {"enable_blob_validity_bitmap",
-         {offset_of(&ColumnFamilyOptions::enable_blob_validity_bitmap),
+          offsetof(struct MutableCFOptions, blob_death_log_debug_check)}},
+        {"blob_death_log_stats",
+         {offset_of(&ColumnFamilyOptions::blob_death_log_stats),
           OptionType::kBoolean, OptionVerificationType::kNormal, true,
-          offsetof(struct MutableCFOptions, enable_blob_validity_bitmap)}},
-        {"blob_gc_chunk_size",
-         {offset_of(&ColumnFamilyOptions::blob_gc_chunk_size),
-          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
-          offsetof(struct MutableCFOptions, blob_gc_chunk_size)}},
+          offsetof(struct MutableCFOptions, blob_death_log_stats)}},
         {"target_blob_file_size",
          {offset_of(&ColumnFamilyOptions::target_blob_file_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal, true,

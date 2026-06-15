@@ -2185,9 +2185,10 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToFirst() {
     ResetDataIter();
     return;
   }
-  if (GcBlockSkipEnabled()) {
+  if (GcBlockSkipEnabled() || GcValueSkipEnabled()) {
     current_data_block_id_ = 0;
     current_data_block_id_valid_ = true;
+    current_slot_id_ = 0;
     gc_forward_scan_mode_ = true;
   } else {
     DisableGcBlockSkip();
@@ -2215,6 +2216,13 @@ template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::Next() {
   assert(block_iter_points_to_real_block_);
   block_iter_.Next();
+  // Advanced one entry within the current data block. Keep the in-block
+  // slot ordinal in lock-step so the death-map value filter stays aligned
+  // with the builder's per-Add slot ids. FindKeyForward() resets the slot
+  // to 0 whenever it steps to a new block.
+  if (current_data_block_id_valid_) {
+    ++current_slot_id_;
+  }
   FindKeyForward();
 }
 
@@ -2309,6 +2317,22 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyForward() {
   while (true) {
     if (block_iter_points_to_real_block_) {
       if (block_iter_.Valid()) {
+        // Death-map value filter: inside a partially-live data block,
+        // skip individual entries that the death map proves are dead so
+        // GC never relocates them. Only active during a GC forward scan;
+        // user-facing iteration leaves block contents untouched.
+        if (gc_forward_scan_mode_ && current_data_block_id_valid_ &&
+            GcValueSkipEnabled() &&
+            gc_block_skip_ctx_.is_value_dead(
+                gc_block_skip_ctx_.arg, gc_block_skip_ctx_.file_number,
+                current_data_block_id_, current_slot_id_)) {
+          if (gc_block_skip_ctx_.skipped_slots != nullptr) {
+            ++*gc_block_skip_ctx_.skipped_slots;
+          }
+          block_iter_.Next();
+          ++current_slot_id_;
+          continue;
+        }
         break;
       }
       if (!block_iter_.status().ok()) {
@@ -2322,6 +2346,7 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyForward() {
       index_iter_->Next();
       if (current_data_block_id_valid_) {
         ++current_data_block_id_;
+        current_slot_id_ = 0;
       }
     }
 
@@ -2337,10 +2362,15 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyForward() {
       index_iter_->Next();
       if (current_data_block_id_valid_) {
         ++current_data_block_id_;
+        current_slot_id_ = 0;
       }
       continue;
     }
     block_iter_.SeekToFirst();
+    // First entry of a freshly loaded data block: slot ordinal resets.
+    if (current_data_block_id_valid_) {
+      current_slot_id_ = 0;
+    }
   }
 
   // Check upper bound on the current key

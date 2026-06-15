@@ -729,18 +729,6 @@ Status TerarkZipTableBuilder::Finish(
     properties_.purpose = prop->purpose;
     properties_.read_amp = prop->read_amp;
     properties_.dependence = prop->dependence;
-    // mirror the layout-aware block bitmap rows into serializable form.
-    if (!prop->dependence_block_bitmaps.empty() &&
-        prop->dependence_block_bitmaps.size() == prop->dependence.size()) {
-      properties_.dependence_block_bitmaps.clear();
-      properties_.dependence_block_bitmaps.reserve(
-          prop->dependence_block_bitmaps.size());
-      for (const auto& row : prop->dependence_block_bitmaps) {
-        std::string s;
-        row.Serialize(&s);
-        properties_.dependence_block_bitmaps.emplace_back(std::move(s));
-      }
-    }
   }
   if (snapshots != nullptr) {
     properties_.snapshots = *snapshots;

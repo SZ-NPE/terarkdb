@@ -1024,26 +1024,26 @@ DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
 DEFINE_bool(precise_gc, false,
             "Enable byte-precise garbage ratio calculation for blob GC");
 
-DEFINE_bool(enable_blob_block_bitmap, false,
-            "Enable vSST data-block-level live bitmap for blob GC fast path");
+DEFINE_bool(enable_blob_death_log, false,
+            "Master switch for the blob death log / death-map GC fast path");
 
-DEFINE_bool(enable_blob_block_bitmap_gc_fast_path, true,
-            "Use block bitmap to skip GetKey() reverse lookups during GC");
+DEFINE_bool(blob_death_log_persist, false,
+            "Persist the death log (reserved; in-memory only in the POC)");
 
-DEFINE_bool(enable_blob_block_skip, false,
-            "RESERVED / NO-OP: physical skip of dead vSST data blocks "
-            "(Phase 6) is not implemented yet. Setting this flag does NOT "
-            "reduce vSST read bandwidth and must not be used to draw "
-            "experimental conclusions about block-skip savings.");
+DEFINE_uint64(blob_death_log_buffer_size, 64 << 20,
+              "Soft memory budget (bytes) for the in-memory death buffer");
 
-DEFINE_uint32(blob_block_index_version, 1,
-              "ValueIndex block-id trailer format version");
+DEFINE_bool(blob_gc_skip_dead_blocks, false,
+            "Skip reading vSST data blocks proven entirely dead during GC");
 
-DEFINE_bool(blob_block_bitmap_strict_fallback, true,
-            "Force fallback on legacy/malformed/missing block-id index");
+DEFINE_bool(blob_gc_skip_getkey_with_deathmap, false,
+            "Skip GetKey() reverse lookups when a complete death map exists");
 
-DEFINE_bool(blob_block_bitmap_debug, false,
-            "Print block bitmap aggregation and GC skip diagnostics");
+DEFINE_bool(blob_death_log_debug_check, false,
+            "Cross-check death-map verdicts against GetKey() (debug only)");
+
+DEFINE_bool(blob_death_log_stats, false,
+            "Print death-log / death-map GC statistics to the info log");
 
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
@@ -3662,21 +3662,14 @@ class Benchmark {
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;
-    options.enable_blob_block_bitmap = FLAGS_enable_blob_block_bitmap;
-    options.enable_blob_block_bitmap_gc_fast_path =
-        FLAGS_enable_blob_block_bitmap_gc_fast_path;
-    options.enable_blob_block_skip = FLAGS_enable_blob_block_skip;
-    if (FLAGS_enable_blob_block_skip) {
-      fprintf(stderr,
-              "WARNING: --enable_blob_block_skip is a NO-OP. Physical vSST "
-              "data-block skip is not implemented; this flag does not reduce "
-              "read bandwidth and must not be used for block-skip experiments."
-              "\n");
-    }
-    options.blob_block_index_version = FLAGS_blob_block_index_version;
-    options.blob_block_bitmap_strict_fallback =
-        FLAGS_blob_block_bitmap_strict_fallback;
-    options.blob_block_bitmap_debug = FLAGS_blob_block_bitmap_debug;
+    options.enable_blob_death_log = FLAGS_enable_blob_death_log;
+    options.blob_death_log_persist = FLAGS_blob_death_log_persist;
+    options.blob_death_log_buffer_size = FLAGS_blob_death_log_buffer_size;
+    options.blob_gc_skip_dead_blocks = FLAGS_blob_gc_skip_dead_blocks;
+    options.blob_gc_skip_getkey_with_deathmap =
+        FLAGS_blob_gc_skip_getkey_with_deathmap;
+    options.blob_death_log_debug_check = FLAGS_blob_death_log_debug_check;
+    options.blob_death_log_stats = FLAGS_blob_death_log_stats;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;

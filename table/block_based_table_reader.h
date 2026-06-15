@@ -646,6 +646,14 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
            gc_block_skip_ctx_.is_block_dead != nullptr;
   }
 
+  // Whether per-value (slot-level) skipping inside partially-live blocks
+  // is available. Independent of is_block_dead so a death map can support
+  // value skipping even when whole-block skipping is disabled.
+  bool GcValueSkipEnabled() const {
+    return gc_block_skip_ctx_.enabled &&
+           gc_block_skip_ctx_.is_value_dead != nullptr;
+  }
+
   InitDataBlockResult InitDataBlock();
   void FindKeyForward();
   void FindKeyBackward();
@@ -674,6 +682,11 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   uint64_t current_data_block_id_ = 0;
   bool current_data_block_id_valid_ = false;
   bool gc_forward_scan_mode_ = false;
+  // In-block slot ordinal of the entry the block iterator currently
+  // points at, tracked during a GC forward scan so the death-map
+  // is_value_dead() callback can filter individual dead values inside a
+  // partially-live data block. Reset to 0 at every new data block.
+  uint64_t current_slot_id_ = 0;
 
   static const size_t kInitReadaheadSize = 8 * 1024;
   // Found that 256 KB readahead size provides the best performance, based on

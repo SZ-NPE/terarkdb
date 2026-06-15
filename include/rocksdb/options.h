@@ -355,53 +355,44 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Use byte-precise garbage ratio when metadata is available.
   bool precise_gc = false;
 
-  // Enable vSST data-block-level live bitmap materialization for Blob GC.
-  // When true, flush/compaction output SSTs maintain a per-dependence
-  // bitmap keyed by the real BlockBasedTable data block ordinal of the
-  // referenced vSST. Blob GC can then use a bitmap fast path and skip
-  // dead data blocks without per-key reverse lookup. When false, the
-  // system fully degrades to the legacy GetKey()-based GC path.
+  // Enable the blob death log / death-map GC fast path. When true, old
+  // ValueIndex entries that are dropped/overwritten during compaction have
+  // their physical vSST death location (block_id + slot_id) recorded into an
+  // in-memory BlobDeathLog. Blob GC then builds a per-vSST death map to skip
+  // fully-dead data blocks and avoid GetKey() reverse lookups for records
+  // proven dead. When false the system fully degrades to the legacy
+  // GetKey()-based GC path and writes legacy value indexes.
   // Default: false
-  bool enable_blob_block_bitmap = false;
+  bool enable_blob_death_log = false;
 
-  // Whether GC uses the block bitmap to skip GetKey() reverse lookups
-  // for records that live in a vSST data block proven dead (bit == 0).
-  // Only meaningful when enable_blob_block_bitmap is true.
-  // Default: true
-  bool enable_blob_block_bitmap_gc_fast_path = true;
-
-  // Whether GC attempts to physically skip reading dead vSST data
-  // blocks at the table-iterator layer. Only data blocks proven dead by
-  // the aggregated live-block bitmap are skipped; unknown/unavailable
-  // bitmap state falls back to reading the block and per-record GetKey().
+  // Whether to persist the death log (per-vSST append-only sidecar). The
+  // POC keeps the death log in memory only; this is reserved for the
+  // persistence work and currently has no effect.
   // Default: false
-  bool enable_blob_block_skip = false;
+  bool blob_death_log_persist = false;
 
-  // ValueIndex block-id trailer format version. Writers stamp this
-  // version into the trailer; readers reject trailers whose version
-  // they do not understand and fall back to the legacy path.
-  // Default: 1
-  uint32_t blob_block_index_version = 1;
+  // Soft memory budget (bytes) for the in-memory death record buffer.
+  // Default: 64MB
+  uint64_t blob_death_log_buffer_size = 64 << 20;
 
-  // When a legacy / malformed / missing block-id index is encountered,
-  // whether to force a fallback to the exact GetKey() reverse lookup.
-  // Must remain true to avoid ever dropping a live value.
-  // Default: true
-  bool blob_block_bitmap_strict_fallback = true;
+  // Whether GC physically skips reading vSST data blocks that the death
+  // map proves are entirely dead. Only meaningful when enable_blob_death_log
+  // is true. Default: false (follows the master switch in db_bench).
+  bool blob_gc_skip_dead_blocks = false;
 
-  // Whether to print block bitmap aggregation and GC skip diagnostics
-  // to the info log. Statistics/debugging only.
+  // Whether GC skips the GetKey() reverse lookup for records whose liveness
+  // can be decided directly from a complete death map. Only meaningful when
+  // enable_blob_death_log is true. Default: false.
+  bool blob_gc_skip_getkey_with_deathmap = false;
+
+  // Debug mode: when true GC also runs the GetKey() lookup alongside the
+  // death-map verdict and asserts they agree, to validate correctness.
   // Default: false
-  bool blob_block_bitmap_debug = false;
+  bool blob_death_log_debug_check = false;
 
-  // Deprecated: superseded by enable_blob_block_bitmap. Retained only
-  // so that old option strings still parse; not used by any new logic.
-  bool enable_blob_validity_bitmap = false;
-
-  // Deprecated: the chunk-size granularization scheme has been replaced
-  // by real data-block-level bitmaps. Retained only so that old option
-  // strings still parse; not used by any new logic.
-  uint64_t blob_gc_chunk_size = 64 * 1024;
+  // Whether to print death-log / death-map GC statistics to the info log.
+  // Default: false
+  bool blob_death_log_stats = false;
 
   // Blob file size
   // Default : same as bottommost level sst file size

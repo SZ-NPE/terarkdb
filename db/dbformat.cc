@@ -231,11 +231,11 @@ Status SeparateHelper::TransToSeparate(
     const Slice& internal_key, LazyBuffer& value, uint64_t file_number,
     const Slice& meta, bool is_merge, bool is_index,
     const ValueExtractor* value_meta_extractor, uint64_t block_id,
-    uint64_t layout_id) {
+    uint64_t layout_id, uint64_t slot_id) {
   // Fast path: caller has no usable block_id/layout_id to stamp.
   // Delegate to the legacy overload so behavior is bit-for-bit
   // identical to pre-block-aware code. This is the path exercised
-  // whenever the CF option `enable_blob_block_bitmap` is off, or when
+  // whenever the CF option `enable_blob_death_log` is off, or when
   // the builder does not support data block ids.
   if (block_id == kNoBlockId || layout_id == kNoBlockLayoutId) {
     return TransToSeparate(internal_key, value, file_number, meta, is_merge,
@@ -250,13 +250,16 @@ Status SeparateHelper::TransToSeparate(
   //   [ meta(M bytes, optional) ]
   //   [ block_id(fixed64) ]
   //   [ layout_id(fixed64) ]
+  //   [ slot_id(fixed64) ]    (only when slot_id != kNoSlotId, v2)
   //   [ version(1B) ]
   //   [ kBlockIdTrailerMagic(1B) ]
   //
   // `is_merge` callers never carry meta (see the legacy overload),
   // so we mirror the exact meta-presence policy used there.
+  const size_t trailer_len =
+      slot_id == kNoSlotId ? kBlockIdTrailerLength : kBlockIdTrailerLengthV2;
   std::string buf;
-  buf.reserve(sizeof(uint64_t) + meta.size() + kBlockIdTrailerLength);
+  buf.reserve(sizeof(uint64_t) + meta.size() + trailer_len);
 
   // file_number head.
   uint64_t fn = file_number;
@@ -265,7 +268,7 @@ Status SeparateHelper::TransToSeparate(
 
   if (value_meta_extractor == nullptr || is_merge) {
     // No meta region. Append trailer directly after file_number.
-    EncodeBlockIdTrailer(&buf, block_id, layout_id);
+    EncodeBlockIdTrailer(&buf, block_id, layout_id, slot_id);
     value.reset(Slice(buf), true, file_number);
     // reset() with copy=true internally copies the bytes, so `buf`
     // can safely go out of scope after this call.
@@ -275,7 +278,7 @@ Status SeparateHelper::TransToSeparate(
   if (is_index) {
     // Caller already supplies meta as a raw Slice.
     buf.append(meta.data(), meta.size());
-    EncodeBlockIdTrailer(&buf, block_id, layout_id);
+    EncodeBlockIdTrailer(&buf, block_id, layout_id, slot_id);
     value.reset(Slice(buf), true, file_number);
     return Status::OK();
   }
@@ -292,7 +295,7 @@ Status SeparateHelper::TransToSeparate(
     return s;
   }
   buf.append(value_meta.data(), value_meta.size());
-  EncodeBlockIdTrailer(&buf, block_id, layout_id);
+  EncodeBlockIdTrailer(&buf, block_id, layout_id, slot_id);
   value.reset(Slice(buf), true, file_number);
   return Status::OK();
 }
@@ -303,35 +306,45 @@ Status SeparateHelper::TransToSeparate(
 // are implicitly inline.
 constexpr uint64_t SeparateHelper::kNoBlockId;
 constexpr uint64_t SeparateHelper::kNoBlockLayoutId;
+constexpr uint64_t SeparateHelper::kNoSlotId;
 constexpr uint8_t SeparateHelper::kBlockIdTrailerMagic;
 constexpr uint8_t SeparateHelper::kBlockIndexVersion;
+constexpr uint8_t SeparateHelper::kBlockIndexVersionWithSlot;
 constexpr size_t SeparateHelper::kBlockIdTrailerLength;
+constexpr size_t SeparateHelper::kBlockIdTrailerLengthV2;
 
 void SeparateHelper::EncodeBlockIdTrailer(std::string* dst, uint64_t block_id,
-                                          uint64_t layout_id) {
+                                          uint64_t layout_id,
+                                          uint64_t slot_id) {
   assert(dst != nullptr);
   assert(dst->size() >= sizeof(uint64_t));
-  // Fixed-length trailer: fixed64(block_id) + fixed64(layout_id) +
-  // version(1B) + magic(1B). No varint, no reverse scan.
+  // Fixed-length trailer. No varint, no reverse scan. v1 carries
+  // block_id + layout_id; v2 additionally carries slot_id.
   PutFixed64(dst, block_id);
   PutFixed64(dst, layout_id);
-  dst->push_back(static_cast<char>(kBlockIndexVersion));
+  if (slot_id == kNoSlotId) {
+    dst->push_back(static_cast<char>(kBlockIndexVersion));
+  } else {
+    PutFixed64(dst, slot_id);
+    dst->push_back(static_cast<char>(kBlockIndexVersionWithSlot));
+  }
   dst->push_back(static_cast<char>(kBlockIdTrailerMagic));
 }
 
 // Attempt to validate and decode a fixed-length block-id trailer at the
 // tail of slice. On success, returns true and writes the decoded
-// block_id / layout_id to the provided out-params. On failure (slice
-// too short / wrong magic / wrong version / sentinel values), returns
-// false and leaves outputs unspecified.
+// block_id / layout_id (and slot_id, kNoSlotId for v1) to the provided
+// out-params. On failure (slice too short / wrong magic / wrong version
+// / sentinel values), returns false and leaves outputs unspecified.
 //
 // Validity is decided purely by the fixed size + magic + version +
 // non-sentinel checks. There is NO backwards varint scan: this is the
-// whole point of the new format.
+// whole point of the new format. The version byte selects the layout.
 static bool ParseBlockIdTrailer(const Slice& slice, uint64_t* block_id,
-                                uint64_t* layout_id) {
-  // Minimum payload: 8B file_number head + fixed trailer.
-  if (slice.size() < sizeof(uint64_t) + SeparateHelper::kBlockIdTrailerLength) {
+                                uint64_t* layout_id, uint64_t* slot_id) {
+  // Need at least the file_number head plus version+magic to read
+  // the version byte that selects the layout.
+  if (slice.size() < sizeof(uint64_t) + 2) {
     return false;
   }
   const char* data = slice.data();
@@ -344,16 +357,35 @@ static bool ParseBlockIdTrailer(const Slice& slice, uint64_t* block_id,
   }
   // version is the byte before magic.
   const uint8_t version = static_cast<uint8_t>(data[n - 2]);
-  if (version != SeparateHelper::kBlockIndexVersion) {
+
+  size_t trailer_len = 0;
+  bool has_slot = false;
+  if (version == SeparateHelper::kBlockIndexVersion) {
+    trailer_len = SeparateHelper::kBlockIdTrailerLength;
+  } else if (version == SeparateHelper::kBlockIndexVersionWithSlot) {
+    trailer_len = SeparateHelper::kBlockIdTrailerLengthV2;
+    has_slot = true;
+  } else {
     // Unknown trailer version: treat as legacy and fall back.
     return false;
   }
+  if (n < sizeof(uint64_t) + trailer_len) {
+    return false;
+  }
 
-  // Decode the two fixed64 fields located right before version+magic.
-  const size_t trailer_start = n - SeparateHelper::kBlockIdTrailerLength;
+  // Decode the fixed64 fields located right before version+magic.
+  const size_t trailer_start = n - trailer_len;
   const uint64_t decoded_block_id = DecodeFixed64(data + trailer_start);
   const uint64_t decoded_layout_id =
       DecodeFixed64(data + trailer_start + sizeof(uint64_t));
+  uint64_t decoded_slot_id = SeparateHelper::kNoSlotId;
+  if (has_slot) {
+    decoded_slot_id =
+        DecodeFixed64(data + trailer_start + 2 * sizeof(uint64_t));
+    if (decoded_slot_id == SeparateHelper::kNoSlotId) {
+      return false;
+    }
+  }
 
   // Reject sentinels so kNoBlockId / kNoBlockLayoutId stay unambiguous.
   if (decoded_block_id == SeparateHelper::kNoBlockId ||
@@ -363,41 +395,67 @@ static bool ParseBlockIdTrailer(const Slice& slice, uint64_t* block_id,
 
   *block_id = decoded_block_id;
   *layout_id = decoded_layout_id;
+  *slot_id = decoded_slot_id;
   return true;
 }
 
 bool SeparateHelper::HasBlockId(const Slice& slice) {
-  uint64_t unused_block_id = 0;
-  uint64_t unused_layout_id = 0;
-  return ParseBlockIdTrailer(slice, &unused_block_id, &unused_layout_id);
+  uint64_t b = 0, l = 0, s = 0;
+  return ParseBlockIdTrailer(slice, &b, &l, &s);
 }
 
 uint64_t SeparateHelper::DecodeBlockId(const Slice& slice) {
-  uint64_t block_id = 0;
-  uint64_t unused_layout_id = 0;
-  if (!ParseBlockIdTrailer(slice, &block_id, &unused_layout_id)) {
+  uint64_t block_id = 0, l = 0, s = 0;
+  if (!ParseBlockIdTrailer(slice, &block_id, &l, &s)) {
     return kNoBlockId;
   }
   return block_id;
 }
 
 uint64_t SeparateHelper::DecodeBlockLayoutId(const Slice& slice) {
-  uint64_t unused_block_id = 0;
-  uint64_t layout_id = 0;
-  if (!ParseBlockIdTrailer(slice, &unused_block_id, &layout_id)) {
+  uint64_t b = 0, layout_id = 0, s = 0;
+  if (!ParseBlockIdTrailer(slice, &b, &layout_id, &s)) {
     return kNoBlockLayoutId;
   }
   return layout_id;
 }
 
+uint64_t SeparateHelper::DecodeSlotId(const Slice& slice) {
+  uint64_t b = 0, l = 0, slot_id = 0;
+  if (!ParseBlockIdTrailer(slice, &b, &l, &slot_id)) {
+    return kNoSlotId;
+  }
+  return slot_id;
+}
+
+bool SeparateHelper::DecodeValueLocation(const Slice& slice,
+                                         ValueLocation* out) {
+  assert(out != nullptr);
+  out->file_number = DecodeFileNumber(slice);
+  uint64_t block_id = 0, layout_id = 0, slot_id = 0;
+  if (!ParseBlockIdTrailer(slice, &block_id, &layout_id, &slot_id)) {
+    out->block_id = kNoBlockId;
+    out->layout_id = kNoBlockLayoutId;
+    out->slot_id = kNoSlotId;
+    return false;
+  }
+  out->block_id = block_id;
+  out->layout_id = layout_id;
+  out->slot_id = slot_id;
+  // A v1 trailer leaves slot_id == kNoSlotId, so valid() is false and
+  // the death log conservatively falls back for this record.
+  return out->valid();
+}
+
 Slice SeparateHelper::DecodeValueMetaStripBlockId(const Slice& slice) {
   assert(slice.size() >= sizeof(uint64_t));
-  uint64_t unused_block_id = 0;
-  uint64_t unused_layout_id = 0;
-  if (ParseBlockIdTrailer(slice, &unused_block_id, &unused_layout_id)) {
-    // Strip exactly the fixed trailer bytes.
+  uint64_t b = 0, l = 0, s = 0;
+  if (ParseBlockIdTrailer(slice, &b, &l, &s)) {
+    // Strip exactly the trailer bytes for the detected version.
+    const size_t trailer_len =
+        s == kNoSlotId ? kBlockIdTrailerLength : kBlockIdTrailerLengthV2;
     return Slice(slice.data() + sizeof(uint64_t),
-                 slice.size() - sizeof(uint64_t) - kBlockIdTrailerLength);
+                 slice.size() - sizeof(uint64_t) - trailer_len);
   }
   // Legacy meta view (no trailer / malformed): never strip.
   return Slice(slice.data() + sizeof(uint64_t),

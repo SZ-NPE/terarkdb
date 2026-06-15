@@ -178,6 +178,15 @@ class TableBuilder {
     return static_cast<uint64_t>(-1);
   }
 
+  // Returns the 0-based in-block slot ordinal (entry index within the
+  // current data block) of the entry written by the most recent
+  // successful Add(). Returns kNoSlotId (= uint64_t(-1)) when
+  // unsupported or before any Add(). Together with LastAddedDataBlockId()
+  // this gives the full physical location used by the blob death log.
+  virtual uint64_t LastAddedSlotId() const {
+    return static_cast<uint64_t>(-1);
+  }
+
   virtual Status AddTombstone(const Slice& /*key*/,
                               const LazyBuffer& /*value*/) {
     return Status::NotSupported();

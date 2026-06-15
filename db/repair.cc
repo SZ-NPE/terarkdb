@@ -673,22 +673,10 @@ class Repairer {
       t->meta.prop.max_read_amp = props->max_read_amp;
       t->meta.prop.read_amp = props->read_amp;
       t->meta.prop.dependence = props->dependence;
-      // reinflate per-dependence block bitmaps from the SST
-      // property block when present. Empty payload means the legacy
-      // "bitmap unavailable" regime.
-      if (!props->dependence_block_bitmaps.empty() &&
-          props->dependence_block_bitmaps.size() == props->dependence.size()) {
-        t->meta.prop.dependence_block_bitmaps.clear();
-        t->meta.prop.dependence_block_bitmaps.resize(
-            props->dependence_block_bitmaps.size());
-        for (size_t i = 0; i < props->dependence_block_bitmaps.size(); ++i) {
-          const std::string& payload = props->dependence_block_bitmaps[i];
-          if (!payload.empty()) {
-            Slice in(payload);
-            t->meta.prop.dependence_block_bitmaps[i].Deserialize(&in);
-          }
-        }
-      }
+      // reinflate per-data-block entry counts from the SST property
+      // block when present. Empty means the GC death-map fast path
+      // falls back for this file.
+      t->meta.prop.data_block_entry_counts = props->data_block_entry_counts;
       t->meta.prop.inheritance = InheritanceTreeToSet(props->inheritance_tree);
     }
     return status;

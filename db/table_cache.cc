@@ -350,7 +350,8 @@ InternalIterator* TableCache::NewIterator(
         const BlobGcBlockSkipContext* table_gc_block_skip_context = nullptr;
         if (blob_gc_block_skip_context != nullptr &&
             blob_gc_block_skip_context->enabled &&
-            blob_gc_block_skip_context->is_block_dead != nullptr) {
+            (blob_gc_block_skip_context->is_block_dead != nullptr ||
+             blob_gc_block_skip_context->is_value_dead != nullptr)) {
           per_file_gc_block_skip_context = *blob_gc_block_skip_context;
           per_file_gc_block_skip_context.file_number = fd.GetNumber();
           if (per_file_gc_block_skip_context.is_file_skippable == nullptr ||

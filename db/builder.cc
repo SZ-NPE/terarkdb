@@ -38,7 +38,6 @@
 #include "util/filename.h"
 #include "util/stop_watch.h"
 #include "util/sync_point.h"
-#include "util/blob_block_bitmap.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -175,10 +174,10 @@ Status BuildTable(
       Status (*trans_to_separate_callback)(void* args, const Slice& key,
                                            LazyBuffer& value) = nullptr;
       void* trans_to_separate_callback_args = nullptr;
-      // per-SST block-reference collector. Disabled-by-default
-      // constructor so that when the CF option is off this is a zero-cost
-      // no-op on the flush hot path.
-      FlushBlockBitmapCollector block_bitmap_collector{false};
+      // When true, the flush writer stamps the block-aware value-index
+      // (v2 trailer with block_id + layout_id + slot_id) so blob GC can
+      // build a death map. Off-by-default keeps the legacy format.
+      bool death_log_enabled = false;
 
       Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                              const Slice& meta, bool is_merge,
@@ -209,31 +208,26 @@ Status BuildTable(
       separate_helper.value_meta_extractor =
           ioptions.value_meta_extractor_factory->CreateValueExtractor(context);
     }
-    // initialize block-reference collector from CF options.
-    // Safe even when the feature is off: collector becomes a no-op.
-    //
-    // BlockBasedTable-only gate: the block-aware value-index format
-    // and its SST-property/manifest plumbing require a builder that can
-    // report data block ordinals. When the CF is configured to use a
-    // different table factory (e.g. TerarkZipTable), we force-disable
-    // the collector so that the legacy GC path is always used.
+    // Enable the block-aware value-index format only when the death log
+    // feature is on AND the blob table factory can report data block
+    // ordinals (BlockBasedTable). Other factories (e.g. TerarkZipTable)
+    // force the legacy format so GC always uses the safe fallback path.
     const bool is_block_based_table =
         ioptions.table_factory != nullptr &&
         ioptions.table_factory->Name() == BlockBasedTableFactory::kName;
-    const bool block_bitmap_enabled =
-        mutable_cf_options.enable_blob_block_bitmap && is_block_based_table;
-    if (mutable_cf_options.enable_blob_block_bitmap && !is_block_based_table) {
+    const bool death_log_enabled =
+        mutable_cf_options.enable_blob_death_log && is_block_based_table;
+    if (mutable_cf_options.enable_blob_death_log && !is_block_based_table) {
       ROCKS_LOG_INFO(
           ioptions.info_log,
-          "[Flush] enable_blob_block_bitmap is set but table_factory is "
+          "[Flush] enable_blob_death_log is set but table_factory is "
           "'%s' (not BlockBasedTable); block-aware value-index is disabled "
           "for this CF.",
           ioptions.table_factory != nullptr
               ? ioptions.table_factory->Name()
               : "<null>");
     }
-    separate_helper.block_bitmap_collector =
-        FlushBlockBitmapCollector(block_bitmap_enabled);
+    separate_helper.death_log_enabled = death_log_enabled;
 
     auto flush_route_hint = [](HotnessTracker::FlushRoute route) {
       switch (route) {
@@ -284,8 +278,10 @@ Status BuildTable(
     std::shared_ptr<HotnessTracker> hotness_tracker;
     ColumnFamilyData* cfd =
         versions_->GetColumnFamilySet()->GetColumnFamily(column_family_id);
+    BlobDeathLog* blob_death_log = nullptr;
     if (cfd) {
       hotness_tracker = cfd->hotness_tracker();
+      blob_death_log = cfd->blob_death_log();
     }
 
     auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
@@ -328,6 +324,12 @@ Status BuildTable(
         }
         blob_meta->fd = FileDescriptor(versions_->NewFileNumber(),
                                        sst_meta()->fd.GetPathId(), 0);
+        // Track this freshly-created vSST in the death log from empty so
+        // its death map can become `complete` (the only state under which
+        // GC may skip GetKey()).
+        if (blob_death_log != nullptr) {
+          blob_death_log->OnVsstCreated(blob_meta->fd.GetNumber());
+        }
         bstate.fname =
             TableFileName(ioptions.cf_paths, blob_meta->fd.GetNumber(),
                           blob_meta->fd.GetPathId());
@@ -358,36 +360,30 @@ Status BuildTable(
       }
       if (status.ok()) {
         blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
-        // Obtain the real vSST data block ordinal this value was just
-        // written into. When the builder cannot supply one (non
-        // BlockBasedTable), mark the blob's bitmap unavailable so GC
-        // falls back to the legacy GetKey() path.
-        //
-        // layout_id binds the block_id to the *physical* vSST file the
-        // value was written into. A reader must reject the block_id when
-        // the blob's current physical file number no longer matches
-        // (e.g. after a vSST GC rewrite).
-        const uint64_t layout_id = blob_meta->fd.GetNumber();
-        uint64_t block_id = kNoBlockId;
-        if (separate_helper.block_bitmap_collector.enabled()) {
-          if (blob_builder->SupportsDataBlockId()) {
-            block_id = blob_builder->LastAddedDataBlockId();
-          }
-          if (block_id == kNoBlockId) {
-            separate_helper.block_bitmap_collector.MarkUnavailable(layout_id);
-          } else {
-            separate_helper.block_bitmap_collector.ObserveBlockId(
-                layout_id, layout_id, block_id);
-          }
+        // Obtain the real vSST data block ordinal and in-block slot
+        // ordinal this value was just written into. layout_id binds them
+        // to the *physical* vSST file; a reader rejects them when the
+        // blob's current physical file number no longer matches (e.g.
+        // after a vSST GC rewrite). When the death log feature is off,
+        // both stay at their sentinels and TransToSeparate writes the
+        // bit-for-bit legacy index.
+        uint64_t block_id = SeparateHelper::kNoBlockId;
+        uint64_t slot_id = SeparateHelper::kNoSlotId;
+        uint64_t layout_id = SeparateHelper::kNoBlockLayoutId;
+        if (separate_helper.death_log_enabled &&
+            blob_builder->SupportsDataBlockId()) {
+          block_id = blob_builder->LastAddedDataBlockId();
+          slot_id = blob_builder->LastAddedSlotId();
+          layout_id = blob_meta->fd.GetNumber();
         }
-        // When the block-aware value-index is enabled for this CF,
-        // stamp the resolved block_id + layout_id onto the outgoing
-        // index value so that downstream compaction/GC readers can
-        // decode it without re-deriving the data block.
+        // Stamp the resolved block_id + layout_id + slot_id onto the
+        // outgoing index value so blob GC can decode the physical death
+        // location without re-deriving it.
         status = SeparateHelper::TransToSeparate(
             key, value, blob_meta->fd.GetNumber(), Slice(),
             GetInternalKeyType(key) == kTypeMerge, false,
-            separate_helper.value_meta_extractor.get(), block_id, layout_id);
+            separate_helper.value_meta_extractor.get(), block_id, layout_id,
+            slot_id);
       }
       return status;
     };
@@ -513,13 +509,6 @@ Status BuildTable(
         sst_meta()->prop.dependence.emplace_back(Dependence{
             blob.fd.GetNumber(), blob.prop.num_entries, blob.fd.GetFileSize()});
       }
-      // freeze the per-dependence data-block reference bitmaps.
-      // When the CF option is off the collector is a no-op and this
-      // call clears the target vector to empty, which is the explicit
-      // "bitmap unavailable" sentinel expected by later phases.
-      separate_helper.block_bitmap_collector.Materialize(
-          sst_meta()->prop.dependence,
-          &sst_meta()->prop.dependence_block_bitmaps);
       auto shrinked_snapshots = sst_meta()->ShrinkSnapshot(snapshots);
       s = builder->Finish(&sst_meta()->prop, &shrinked_snapshots);
 

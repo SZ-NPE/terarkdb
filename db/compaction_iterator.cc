@@ -118,7 +118,7 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
     const chash_set<uint64_t>* need_rebuild_blobs,
-    HotnessTracker* hotness_tracker)
+    HotnessTracker* hotness_tracker, BlobDeathLog* blob_death_log)
     : CompactionIterator(
           input, separate_helper, end, cmp, merge_helper, last_sequence,
           snapshots, earliest_write_conflict_snapshot, snapshot_checker, env,
@@ -126,7 +126,8 @@ CompactionIterator::CompactionIterator(
           std::unique_ptr<CompactionProxy>(
               compaction ? new CompactionProxy(compaction) : nullptr),
           blob_config, compaction_filter, shutting_down,
-          preserve_deletes_seqnum, need_rebuild_blobs, hotness_tracker) {}
+          preserve_deletes_seqnum, need_rebuild_blobs, hotness_tracker,
+          blob_death_log) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, SeparateHelper* separate_helper, const Slice* end,
@@ -141,7 +142,7 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
     const chash_set<uint64_t>* need_rebuild_blobs,
-    HotnessTracker* hotness_tracker)
+    HotnessTracker* hotness_tracker, BlobDeathLog* blob_death_log)
     : input_(input, separate_helper),
       end_(end),
       cmp_(cmp),
@@ -165,7 +166,8 @@ CompactionIterator::CompactionIterator(
       merge_out_iter_(merge_helper_),
       current_key_committed_(false),
       rebuild_blob_set_(need_rebuild_blobs),
-      hotness_tracker_(hotness_tracker) {
+      hotness_tracker_(hotness_tracker),
+      blob_death_log_(blob_death_log) {
   assert(compaction_filter_ == nullptr || compaction_ != nullptr);
   bottommost_level_ =
       compaction_ == nullptr ? false : compaction_->bottommost_level();
@@ -210,6 +212,28 @@ CompactionIterator::CompactionIterator(
 }
 
 CompactionIterator::~CompactionIterator() {}
+
+void CompactionIterator::MaybeRecordBlobDeath() {
+  if (blob_death_log_ == nullptr) {
+    return;
+  }
+  // Only separated values (value-index entries) can have a vSST death
+  // location. Small inline values are never recorded.
+  if (ikey_.type != kTypeValueIndex && ikey_.type != kTypeMergeIndex) {
+    return;
+  }
+  if (!value_.fetch().ok()) {
+    return;
+  }
+  ValueLocation loc;
+  // DecodeValueLocation returns true only for a well-formed v2 trailer
+  // (block_id + layout_id + slot_id all present). Legacy/v1 indexes are
+  // skipped, so GC conservatively falls back to GetKey() for them.
+  if (SeparateHelper::DecodeValueLocation(value_.slice(), &loc) &&
+      loc.valid()) {
+    blob_death_log_->RecordDeath(loc);
+  }
+}
 
 void CompactionIterator::ResetRecordCounts() {
   iter_stats_.num_record_drop_user = 0;
@@ -617,6 +641,9 @@ void CompactionIterator::NextFromInput() {
       if (hotness_tracker_ != nullptr) {
         hotness_tracker_->RecordCompactionFeedback(ikey_.user_key);
       }
+      // This old version is confirmed dead (hidden by a newer version):
+      // record its physical vSST death location for the blob GC fast path.
+      MaybeRecordBlobDeath();
       value_.reset();
       input_->Next();
     } else if (compaction_ != nullptr && ikey_.type == kTypeDeletion &&

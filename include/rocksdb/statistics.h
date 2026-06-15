@@ -265,47 +265,39 @@ enum Tickers : uint32_t {
   GC_WHOLE_FILE_DELETE_BYTES,
   GC_REWRITE_BLOB_BYTES,
 
-  // GC_BLOCK_BITMAP_FAST_PATH_SKIPS  - # records skipped by the
-  //                                    aggregated live-block bitmap fast
-  //                                    path (block dead), never issued a
-  //                                    GetKey().
-  // GC_BLOCK_BITMAP_FALLBACK_GETKEY  - # records GC processed under
-  //                                    legacy / bitmap-unavailable /
-  //                                    block-id-unavailable regime
-  //                                    (i.e. had to issue a GetKey()).
-  // GC_BLOCK_BITMAP_SKIPPED_RECORDS  - # records skipped thanks to a
-  //                                    dead-block verdict (same event as
-  //                                    FAST_PATH_SKIPS, kept distinct for
-  //                                    forward compatibility).
-  // GC_BLOCK_BITMAP_SKIPPED_BYTES    - bytes of record payload skipped
-  //                                    thanks to the fast-path gate.
-  // GC_BLOCK_BITMAP_LIVE_BLOCKS      - # data blocks judged live by the
-  //                                    aggregated bitmap during GC.
-  // GC_BLOCK_BITMAP_DEAD_BLOCKS      - # data blocks judged dead by the
-  //                                    aggregated bitmap during GC.
-  // GC_BLOCK_BITMAP_BLOCK_SKIP_BYTES - bytes of vSST data block reads
-  //                                    avoided by iterator-level physical
-  //                                    block skip (phase 2 / optional).
-  GC_BLOCK_BITMAP_FAST_PATH_SKIPS,
-  GC_BLOCK_BITMAP_FALLBACK_GETKEY,
-  GC_BLOCK_BITMAP_SKIPPED_RECORDS,
-  GC_BLOCK_BITMAP_SKIPPED_BYTES,
-  GC_BLOCK_BITMAP_LIVE_BLOCKS,
-  GC_BLOCK_BITMAP_DEAD_BLOCKS,
-  GC_BLOCK_BITMAP_BLOCK_SKIP_BYTES,
-
-  // Per-Version live-block aggregation observability.
-  // BLOB_BLOCK_BITMAP_AGGREGATE_RUNS    - # times Version::PrepareApply()
-  //                                       actually invoked
-  //                                       AggregateBlobLiveBlockBitmaps().
-  // BLOB_BLOCK_BITMAP_AGGREGATE_BLOBS   - cumulative # of blobs whose
-  //                                       live view was produced.
-  // BLOB_BLOCK_BITMAP_UNAVAILABLE_BLOBS - cumulative # of blobs whose
-  //                                       `bitmap_available` was sticky-
-  //                                       cleared during aggregation.
-  BLOB_BLOCK_BITMAP_AGGREGATE_RUNS,
-  BLOB_BLOCK_BITMAP_AGGREGATE_BLOBS,
-  BLOB_BLOCK_BITMAP_UNAVAILABLE_BLOBS,
+  // Blob death-log / death-map GC fast path observability.
+  // BLOB_DEATH_RECORDS_EMITTED          - # death records recorded when an
+  //                                       old ValueIndex was dropped /
+  //                                       overwritten during compaction.
+  // BLOB_DEATH_RECORDS_APPLIED          - # GC records judged dead via an
+  //                                       explicit death-map hit (no GetKey).
+  // GC_DEATHMAP_CANDIDATE_VSST          - # candidate vSST files for which a
+  //                                       death map was built during GC.
+  // GC_DEATHMAP_SKIPPED_DEAD_BLOCKS     - # vSST data blocks physically
+  //                                       skipped because every value was
+  //                                       proven dead.
+  // GC_DEATHMAP_SKIPPED_DEAD_BLOCK_BYTES- bytes of vSST data-block reads
+  //                                       avoided by the dead-block skip.
+  // GC_DEATHMAP_PARTIAL_LIVE_BLOCK_BYTES- bytes read from partially-live
+  //                                       blocks (sequentially scanned).
+  // GC_DEATHMAP_GETKEY_AVOIDED          - # GetKey() reverse lookups avoided
+  //                                       because the death map was complete.
+  // GC_DEATHMAP_FALLBACK_GETKEY         - # records that fell back to the
+  //                                       legacy per-record GetKey() path.
+  // GC_DEATHMAP_UNAVAILABLE_FALLBACK    - # blobs that fell back because the
+  //                                       death map was unavailable/incomplete.
+  // GC_DEATHMAP_LAYOUT_MISMATCH_FALLBACK- # blobs that fell back because the
+  //                                       layout id did not match.
+  BLOB_DEATH_RECORDS_EMITTED,
+  BLOB_DEATH_RECORDS_APPLIED,
+  GC_DEATHMAP_CANDIDATE_VSST,
+  GC_DEATHMAP_SKIPPED_DEAD_BLOCKS,
+  GC_DEATHMAP_SKIPPED_DEAD_BLOCK_BYTES,
+  GC_DEATHMAP_PARTIAL_LIVE_BLOCK_BYTES,
+  GC_DEATHMAP_GETKEY_AVOIDED,
+  GC_DEATHMAP_FALLBACK_GETKEY,
+  GC_DEATHMAP_UNAVAILABLE_FALLBACK,
+  GC_DEATHMAP_LAYOUT_MISMATCH_FALLBACK,
 
   TICKER_ENUM_MAX
 };

@@ -129,32 +129,18 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
     }
     Add(TablePropertiesNames::kDependenceByteCount, val);
   }
-  // Phase 5: persist per-dependence chunk bitmaps when they are
-  // available and correctly aligned with `dependence`. The payload is
-  // self-delimiting so that readers that have never heard of this
-  // property can safely ignore it (it will land in
-  // user_collected_properties). Only emit when the producer actually
-  // has bitmaps, otherwise older readers and the "bitmap unavailable"
-  // regime would see an unexpected empty key.
-  if (!props.dependence.empty() &&
-      props.dependence_block_bitmaps.size() == props.dependence.size()) {
-    bool any_non_empty = false;
-    for (const auto& b : props.dependence_block_bitmaps) {
-      if (!b.empty()) {
-        any_non_empty = true;
-        break;
-      }
+  // Persist per-data-block entry counts for blob (vSST) BlockBasedTables
+  // when the blob death log feature populated them. The payload is
+  // self-delimiting so readers that have never heard of this property
+  // can safely ignore it (it will land in user_collected_properties).
+  if (!props.data_block_entry_counts.empty()) {
+    std::string payload;
+    PutVarint64(&payload,
+                static_cast<uint64_t>(props.data_block_entry_counts.size()));
+    for (uint32_t cnt : props.data_block_entry_counts) {
+      PutVarint64(&payload, static_cast<uint64_t>(cnt));
     }
-    if (any_non_empty) {
-      std::string payload;
-      PutVarint64(&payload,
-                  static_cast<uint64_t>(props.dependence_block_bitmaps.size()));
-      for (const auto& b : props.dependence_block_bitmaps) {
-        PutVarint64(&payload, static_cast<uint64_t>(b.size()));
-        payload.append(b);
-      }
-      Add(TablePropertiesNames::kDependenceBlockBitmaps, payload);
-    }
+    Add(TablePropertiesNames::kDataBlockEntryCounts, payload);
   }
   if (!props.inheritance_tree.empty()) {
     Add(TablePropertiesNames::kInheritanceTree, props.inheritance_tree);
@@ -458,33 +444,32 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       for (size_t i = 0; i < val.size(); ++i) {
         new_table_properties->dependence[i].byte_count = val[i];
       }
-    } else if (key == TablePropertiesNames::kDependenceBlockBitmaps) {
-      // Decode per-dependence block bitmaps. Legacy SSTs that predate
-      // the block-aware format will not carry this key, in which case
-      // `dependence_block_bitmaps` stays empty (the explicit
-      // "bitmap unavailable" sentinel consumed by the GC fallback).
-      uint64_t n_bitmaps = 0;
-      if (!GetVarint64(&raw_val, &n_bitmaps)) {
+    } else if (key == TablePropertiesNames::kDataBlockEntryCounts) {
+      // Decode per-data-block entry counts. SSTs that predate this
+      // format (or were produced with the feature off) will not carry
+      // this key, in which case `data_block_entry_counts` stays empty
+      // and the GC death-map fast path falls back for that file.
+      uint64_t n_counts = 0;
+      if (!GetVarint64(&raw_val, &n_counts)) {
         log_error();
         continue;
       }
-      std::vector<std::string> parsed;
-      parsed.reserve(n_bitmaps);
+      std::vector<uint32_t> parsed;
+      parsed.reserve(n_counts);
       bool ok = true;
-      for (uint64_t i = 0; i < n_bitmaps; ++i) {
-        uint64_t blen = 0;
-        if (!GetVarint64(&raw_val, &blen) || raw_val.size() < blen) {
+      for (uint64_t i = 0; i < n_counts; ++i) {
+        uint64_t cnt = 0;
+        if (!GetVarint64(&raw_val, &cnt)) {
           ok = false;
           break;
         }
-        parsed.emplace_back(raw_val.data(), blen);
-        raw_val.remove_prefix(blen);
+        parsed.push_back(static_cast<uint32_t>(cnt));
       }
       if (!ok) {
         log_error();
         continue;
       }
-      new_table_properties->dependence_block_bitmaps = std::move(parsed);
+      new_table_properties->data_block_entry_counts = std::move(parsed);
     } else if (key == TablePropertiesNames::kInheritanceChain) {
       std::vector<uint64_t> val;
       GetUint64Vector(key, &raw_val, val);

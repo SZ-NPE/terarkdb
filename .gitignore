@@ -81,6 +81,7 @@ vs2017
 terark-core.got
 
 cmake-build-debug
+cmake-build-dbbench
 pkg
 .DS_Store
 .clangd/

@@ -27,6 +27,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/chash_set.h"
+#include "db/blob_death_log.h"
 #include "util/hotness_tracker.h"
 #include "util/thread_local.h"
 
@@ -418,6 +419,11 @@ class ColumnFamilyData {
     return hotness_tracker_;
   }
 
+  // In-memory blob death log for the GC death-map fast path. nullptr
+  // when enable_blob_death_log is off (default), so hot paths only pay
+  // a null-pointer check.
+  BlobDeathLog* blob_death_log() const { return blob_death_log_.get(); }
+
   Env::WriteLifeTimeHint CalculateSSTWriteHint(int level);
 
   Status AddDirectories();
@@ -509,6 +515,9 @@ class ColumnFamilyData {
   std::atomic<uint64_t> last_memtable_id_;
 
   std::shared_ptr<HotnessTracker> hotness_tracker_;
+
+  // In-memory blob death log; non-null only when enable_blob_death_log.
+  std::unique_ptr<BlobDeathLog> blob_death_log_;
 
   // Directories corresponding to cf_paths.
   std::vector<std::unique_ptr<Directory>> data_dirs_;

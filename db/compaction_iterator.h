@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "db/compaction.h"
+#include "db/blob_death_log.h"
 #include "db/compaction_iteration_stats.h"
 #include "db/merge_helper.h"
 #include "db/range_del_aggregator.h"
@@ -80,7 +81,8 @@ class CompactionIterator {
                      const std::atomic<bool>* shutting_down = nullptr,
                      const SequenceNumber preserve_deletes_seqnum = 0,
                      const chash_set<uint64_t>* b = nullptr,
-                     HotnessTracker* hotness_tracker = nullptr);
+                     HotnessTracker* hotness_tracker = nullptr,
+                     BlobDeathLog* blob_death_log = nullptr);
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(InternalIterator* input, SeparateHelper* separate_helper,
@@ -97,7 +99,8 @@ class CompactionIterator {
                      const std::atomic<bool>* shutting_down = nullptr,
                      const SequenceNumber preserve_deletes_seqnum = 0,
                      const chash_set<uint64_t>* b = nullptr,
-                     HotnessTracker* hotness_tracker = nullptr);
+                     HotnessTracker* hotness_tracker = nullptr,
+                     BlobDeathLog* blob_death_log = nullptr);
 
   ~CompactionIterator();
 
@@ -236,6 +239,19 @@ class CompactionIterator {
   // that it confirms are dead so that overwrite-heavy keys are routed to the
   // hot vSST on the next flush. This never affects compaction output.
   HotnessTracker* hotness_tracker_;
+
+  // Optional blob death log. When set, the iterator records the physical
+  // death location (vSST file/block/slot) of separated values it drops
+  // (overwrite/obsolete), so blob GC can later skip them without GetKey.
+  // Never affects compaction output. nullptr keeps the hot path at one
+  // null check.
+  BlobDeathLog* blob_death_log_;
+
+  // Records the death of the current entry's value when it is a v2
+  // block-aware value-index. No-op when blob_death_log_ is null or the
+  // value carries no usable location. Called just before the value is
+  // reset at a drop site.
+  void MaybeRecordBlobDeath();
 
  public:
   bool IsShuttingDown() {
