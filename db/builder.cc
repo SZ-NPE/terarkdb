@@ -9,6 +9,12 @@
 
 #include "db/builder.h"
 
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS
+#endif
+
+#include <inttypes.h>
+
 #include <algorithm>
 #include <deque>
 #include <vector>
@@ -22,6 +28,7 @@
 #include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "monitoring/iostats_context_imp.h"
+#include "monitoring/statistics.h"
 #include "monitoring/thread_status_util.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
@@ -215,6 +222,19 @@ Status BuildTable(
       }
       return Env::WLTH_MEDIUM;
     };
+      auto flush_route_name = [](int route) {
+        switch (static_cast<HotnessTracker::FlushRoute>(route)) {
+          case HotnessTracker::FlushRoute::kWarm:
+            return "warm";
+          case HotnessTracker::FlushRoute::kEphemeral:
+            return "hot";
+          case HotnessTracker::FlushRoute::kStable:
+            return "stable";
+        }
+        return "unknown";
+      };
+      uint64_t flush_route_keys[3] = {0, 0, 0};
+      uint64_t flush_route_bytes[3] = {0, 0, 0};
 
     auto finish_output_blob_sst = [&](int hot_idx) {
       Status status;
@@ -238,6 +258,13 @@ Status BuildTable(
       if (status.ok()) {
         status = bstate.file_writer->Close();
       }
+        ROCKS_LOG_INFO(
+            ioptions.info_log,
+            "[%s] [JOB %d] [HOTNESS_FLUSH_ROUTE] route:%s file:%" PRIu64
+            " entries:%" PRIu64 " bytes:%" PRIu64,
+            column_family_name.c_str(), job_id, flush_route_name(hot_idx),
+            blob_meta->fd.GetNumber(), flush_route_keys[hot_idx],
+            flush_route_bytes[hot_idx]);
       bstate.file_writer.reset();
       EventHelpers::LogAndNotifyTableFileCreationFinished(
           event_logger, ioptions.listeners, dbname, column_family_name,
@@ -326,6 +353,18 @@ Status BuildTable(
         status = blob_builder->Add(key, value);
       }
       if (status.ok()) {
+          const uint64_t route_record_bytes = key.size() + value.size();
+          ++flush_route_keys[hot_idx];
+          flush_route_bytes[hot_idx] += route_record_bytes;
+          if (route == HotnessTracker::FlushRoute::kEphemeral) {
+            RecordTick(ioptions.statistics, HOTNESS_FLUSH_HOT_KEYS);
+            RecordTick(ioptions.statistics, HOTNESS_FLUSH_HOT_BYTES,
+                       route_record_bytes);
+          } else if (route == HotnessTracker::FlushRoute::kWarm) {
+            RecordTick(ioptions.statistics, HOTNESS_FLUSH_WARM_KEYS);
+            RecordTick(ioptions.statistics, HOTNESS_FLUSH_WARM_BYTES,
+                       route_record_bytes);
+          }
         blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
         status = SeparateHelper::TransToSeparate(
             key, value, blob_meta->fd.GetNumber(), Slice(),

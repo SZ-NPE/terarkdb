@@ -322,6 +322,11 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Enable compaction obsolete-version feedback for HotnessTracker.
   bool hotness_enable_compaction_feedback = true;
 
+  // Enable exact drop-key sequence cache for blob GC GetKey() short-circuiting.
+  // This is independent from hotness_enable_compaction_feedback so experiments
+  // can evaluate drop-key cache without promoting keys to the hot flush route.
+  bool hotness_enable_drop_key_cache = true;
+
   // Don't separate Value if key.size > value.size * blob_large_key_ratio
   // valid [0 , 1]
   double blob_large_key_ratio = 0.25;

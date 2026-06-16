@@ -417,6 +417,7 @@ HotnessTracker::Options MakeHotnessTrackerOptions(
   options.enable_write_window = cf_options.hotness_enable_write_window;
   options.enable_compaction_feedback =
       cf_options.hotness_enable_compaction_feedback;
+  options.enable_drop_key_cache = cf_options.hotness_enable_drop_key_cache;
   return options;
 }
 }  // anonymous namespace

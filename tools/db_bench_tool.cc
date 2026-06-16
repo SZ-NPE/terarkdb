@@ -990,6 +990,8 @@ DEFINE_bool(hotness_enable_write_window, true,
             "Enable write-window repeated-write feedback for HotnessTracker");
 DEFINE_bool(hotness_enable_compaction_feedback, true,
             "Enable compaction obsolete-version feedback for HotnessTracker");
+DEFINE_bool(hotness_enable_drop_key_cache, true,
+            "Enable compaction drop-key cache for blob GC GetKey avoidance");
 
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
@@ -3602,6 +3604,7 @@ class Benchmark {
         FLAGS_hotness_enable_write_window;
     options.hotness_enable_compaction_feedback =
         FLAGS_hotness_enable_compaction_feedback;
+    options.hotness_enable_drop_key_cache = FLAGS_hotness_enable_drop_key_cache;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;

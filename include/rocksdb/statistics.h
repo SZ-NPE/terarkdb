@@ -264,6 +264,31 @@ enum Tickers : uint32_t {
   GC_WHOLE_FILE_DELETE,
   GC_WHOLE_FILE_DELETE_BYTES,
   GC_REWRITE_BLOB_BYTES,
+    // Blob GC drop-key cache probes. A hit means GetKey() reverse lookup was
+    // skipped because compaction had already confirmed the exact
+    // (user_key, sequence) dead. A miss falls back to GetKey().
+    GC_DROP_KEY_CACHE_HIT,
+    GC_DROP_KEY_CACHE_MISS,
+    GC_GET_KEY_AVOIDED,
+
+    // Hotness routing final counters for experiments.
+    HOTNESS_FLUSH_HOT_KEYS,
+    HOTNESS_FLUSH_WARM_KEYS,
+    HOTNESS_FLUSH_HOT_BYTES,
+    HOTNESS_FLUSH_WARM_BYTES,
+
+    // Blob GC final counters for file selection and bandwidth breakdown.
+    GC_PICK_CANDIDATE_FILES,
+    GC_PICK_SELECTED_FILES,
+    GC_PICK_SELECTED_BYTES,
+    GC_PICK_SELECTED_GARBAGE_BYTES,
+    GC_PICK_SELECTED_LIVE_BYTES,
+    GC_VSST_READ_BYTES,
+    GC_KSST_READ_BYTES,
+    GC_INVALID_READ_BYTES,
+    GC_RELOCATION_WRITE_BYTES,
+    GC_BLOCK_TOTAL,
+    GC_BLOCK_INVALID_100,
 
   TICKER_ENUM_MAX
 };

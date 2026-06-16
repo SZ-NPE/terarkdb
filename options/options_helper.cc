@@ -175,6 +175,8 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
       mutable_cf_options.hotness_enable_write_window;
   cf_opts.hotness_enable_compaction_feedback =
       mutable_cf_options.hotness_enable_compaction_feedback;
+  cf_opts.hotness_enable_drop_key_cache =
+      mutable_cf_options.hotness_enable_drop_key_cache;
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
   cf_opts.precise_gc = mutable_cf_options.precise_gc;
@@ -1948,6 +1950,9 @@ std::unordered_map<std::string, OptionTypeInfo>
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"hotness_enable_compaction_feedback",
          {offset_of(&ColumnFamilyOptions::hotness_enable_compaction_feedback),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"hotness_enable_drop_key_cache",
+         {offset_of(&ColumnFamilyOptions::hotness_enable_drop_key_cache),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"blob_large_key_ratio",
          {offset_of(&ColumnFamilyOptions::blob_large_key_ratio),

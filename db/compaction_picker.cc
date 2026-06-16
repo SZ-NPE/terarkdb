@@ -15,6 +15,7 @@
 
 #include <inttypes.h>
 
+#include <algorithm>
 #include <limits>
 #include <string>
 #include <utility>
@@ -22,6 +23,7 @@
 
 #include "db/column_family.h"
 #include "db/map_builder.h"
+#include "monitoring/statistics.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/c_style_callback.h"
 #include "util/chash_set.h"
@@ -1012,6 +1014,14 @@ Compaction* CompactionPicker::PickGarbageCollection(
       params.inputs, CompactionReason::kGarbageCollection);
 
   Compaction* c = RegisterCompaction(new Compaction(std::move(params)));
+    RecordTick(ioptions_.statistics, GC_PICK_CANDIDATE_FILES, permitted_blobs);
+    RecordTick(ioptions_.statistics, GC_PICK_SELECTED_FILES, input.files.size());
+    RecordTick(ioptions_.statistics, GC_PICK_SELECTED_BYTES,
+               total_estimate_size);
+    RecordTick(ioptions_.statistics, GC_PICK_SELECTED_GARBAGE_BYTES,
+               num_antiquation);
+    RecordTick(ioptions_.statistics, GC_PICK_SELECTED_LIVE_BYTES,
+               total_estimate_size - std::min(total_estimate_size, num_antiquation));
   ROCKS_LOG_INFO(
       ioptions_.info_log,
       "[%s] GC_PICK scanned=%" PRIu64 " permitted=%" PRIu64

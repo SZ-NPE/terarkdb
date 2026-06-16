@@ -2156,6 +2156,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   // duration of GC so the raw pointer stays valid.
   std::shared_ptr<HotnessTracker> hotness_tracker_holder = cfd->hotness_tracker();
   HotnessTracker* hotness_tracker = hotness_tracker_holder.get();
+  const bool drop_key_cache_enabled =
+      hotness_tracker != nullptr && hotness_tracker->DropKeyCacheEnabled();
 
   std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
       sub_compact->compaction, nullptr, env_options_for_read_));
@@ -2321,14 +2323,14 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       // relocation. A miss falls back to the legacy GetKey() path below, so
       // correctness never depends on the cache (misses are allowed, false
       // hits are not). Both the user key and the sequence must match.
-      if (hotness_tracker != nullptr &&
+      if (drop_key_cache_enabled &&
           (ikey.type == kTypeValue || ikey.type == kTypeMerge) &&
           hotness_tracker->IsDropped(ikey.user_key, ikey.sequence)) {
         ++counter.dropped_key_cache_hit;
         gc_invalid_read_bytes_ += record_bytes;
         break;
       }
-      if (hotness_tracker != nullptr) {
+      if (drop_key_cache_enabled) {
         ++counter.dropped_key_cache_miss;
       }
       iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kValueTypeForSeek);
@@ -2339,6 +2341,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       const uint64_t lookup_begin_ts = env_->NowMicros();
       const uint64_t s4 = env_->NowNanos();
       const uint64_t ksst_io_before = IOSTATS(bytes_read);
+        RecordTick(db_options_.statistics.get(), GC_GET_KEYS);
       input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
                             &seq, &value, *blob_meta);
       gc_t_lookup_ += (env_->NowNanos() - s4);
@@ -2462,6 +2465,35 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
                sub_compact->blob_outputs.front().meta.fd.GetFileSize());
   }
   if (status.ok()) {
+      if (counter.dropped_key_cache_hit > 0) {
+        RecordTick(db_options_.statistics.get(), GC_DROP_KEY_CACHE_HIT,
+                   counter.dropped_key_cache_hit);
+        RecordTick(db_options_.statistics.get(), GC_GET_KEY_AVOIDED,
+                   counter.dropped_key_cache_hit);
+      }
+      if (counter.dropped_key_cache_miss > 0) {
+        RecordTick(db_options_.statistics.get(), GC_DROP_KEY_CACHE_MISS,
+                   counter.dropped_key_cache_miss);
+      }
+      RecordTick(db_options_.statistics.get(), GC_VSST_READ_BYTES,
+                 gc_vsst_read_bytes_);
+      RecordTick(db_options_.statistics.get(), GC_KSST_READ_BYTES,
+                 gc_ksst_read_bytes_);
+      RecordTick(db_options_.statistics.get(), GC_INVALID_READ_BYTES,
+                 gc_invalid_read_bytes_);
+      RecordTick(db_options_.statistics.get(), GC_RELOCATION_WRITE_BYTES,
+                 gc_relocation_write_bytes_);
+      RecordTick(db_options_.statistics.get(), GC_BLOCK_TOTAL, gc_block_total_);
+      RecordTick(db_options_.statistics.get(), GC_BLOCK_INVALID_100,
+                 gc_block_invalid_100_);
+      ROCKS_LOG_INFO(db_options_.info_log,
+                     "[%s] [JOB %d] [BLOB_GC_DROP_KEY_CACHE] input:%" PRIu64
+                     " hit:%" PRIu64 " miss:%" PRIu64
+                     " avoided_get_key:%" PRIu64,
+                     cfd->GetName().c_str(), job_id_, counter.input,
+                     counter.dropped_key_cache_hit,
+                     counter.dropped_key_cache_miss,
+                     counter.dropped_key_cache_hit);
     if (counter.has_run && counter.run_live) {
       counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
     }

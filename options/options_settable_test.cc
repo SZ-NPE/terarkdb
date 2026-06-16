@@ -479,6 +479,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "hotness_hot_capacity=654321;"
       "hotness_enable_write_window=true;"
       "hotness_enable_compaction_feedback=true;"
+      "hotness_enable_drop_key_cache=true;"
       "blob_gc_ratio=0.05;"
       "precise_gc=false;"
       "target_blob_file_size=0;"
