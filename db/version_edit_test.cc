@@ -292,26 +292,6 @@ TEST_F(VersionEditTest, DependenceByteCountDefaultsToZero) {
   ASSERT_EQ(0U, dep[1].byte_count);
 }
 
-// A VersionEdit produced before the data_block_entry_counts feature
-// (no per-block entry counts at all, i.e. the vector is empty and its
-// payload is omitted) must decode cleanly, with
-// `data_block_entry_counts` staying empty. This pins down the
-// backward-compatible decode path for legacy manifests.
-TEST_F(VersionEditTest, DecodeBackwardCompatibleWithoutBlockBitmap) {
-  static const uint64_t kBig = 1ull << 50;
-  VersionEdit edit;
-  edit.AddFile(3, 300, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
-               InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500,
-               kBig + 600, false, GetPropCache(1, {21U, 22U}, {}));
-  std::string encoded;
-  ASSERT_TRUE(edit.EncodeTo(&encoded));
-  VersionEdit parsed;
-  ASSERT_OK(parsed.DecodeFrom(encoded));
-  auto& p = parsed.GetNewFiles()[0].second.prop;
-  ASSERT_EQ(2U, p.dependence.size());
-  ASSERT_TRUE(p.data_block_entry_counts.empty());
-}
-
 }  // namespace TERARKDB_NAMESPACE
 
 int main(int argc, char** argv) {

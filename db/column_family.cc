@@ -461,10 +461,7 @@ ColumnFamilyData::ColumnFamilyData(
       hotness_tracker_(cf_options.enable_hotness_tracker
                            ? std::make_shared<HotnessTracker>(
                                  MakeHotnessTrackerOptions(cf_options))
-                           : nullptr),
-      blob_death_log_(cf_options.enable_blob_death_log
-                          ? new BlobDeathLog(cf_options.blob_death_log_buffer_size)
-                          : nullptr) {
+                           : nullptr) {
   Ref();
 
   // if _dummy_versions is nullptr, then this is a dummy column family.

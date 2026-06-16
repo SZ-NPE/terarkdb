@@ -174,10 +174,6 @@ Status BuildTable(
       Status (*trans_to_separate_callback)(void* args, const Slice& key,
                                            LazyBuffer& value) = nullptr;
       void* trans_to_separate_callback_args = nullptr;
-      // When true, the flush writer stamps the block-aware value-index
-      // (v2 trailer with block_id + layout_id + slot_id) so blob GC can
-      // build a death map. Off-by-default keeps the legacy format.
-      bool death_log_enabled = false;
 
       Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                              const Slice& meta, bool is_merge,
@@ -208,27 +204,6 @@ Status BuildTable(
       separate_helper.value_meta_extractor =
           ioptions.value_meta_extractor_factory->CreateValueExtractor(context);
     }
-    // Enable the block-aware value-index format only when the death log
-    // feature is on AND the blob table factory can report data block
-    // ordinals (BlockBasedTable). Other factories (e.g. TerarkZipTable)
-    // force the legacy format so GC always uses the safe fallback path.
-    const bool is_block_based_table =
-        ioptions.table_factory != nullptr &&
-        ioptions.table_factory->Name() == BlockBasedTableFactory::kName;
-    const bool death_log_enabled =
-        mutable_cf_options.enable_blob_death_log && is_block_based_table;
-    if (mutable_cf_options.enable_blob_death_log && !is_block_based_table) {
-      ROCKS_LOG_INFO(
-          ioptions.info_log,
-          "[Flush] enable_blob_death_log is set but table_factory is "
-          "'%s' (not BlockBasedTable); block-aware value-index is disabled "
-          "for this CF.",
-          ioptions.table_factory != nullptr
-              ? ioptions.table_factory->Name()
-              : "<null>");
-    }
-    separate_helper.death_log_enabled = death_log_enabled;
-
     auto flush_route_hint = [](HotnessTracker::FlushRoute route) {
       switch (route) {
         case HotnessTracker::FlushRoute::kWarm:
@@ -278,10 +253,8 @@ Status BuildTable(
     std::shared_ptr<HotnessTracker> hotness_tracker;
     ColumnFamilyData* cfd =
         versions_->GetColumnFamilySet()->GetColumnFamily(column_family_id);
-    BlobDeathLog* blob_death_log = nullptr;
     if (cfd) {
       hotness_tracker = cfd->hotness_tracker();
-      blob_death_log = cfd->blob_death_log();
     }
 
     auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
@@ -324,12 +297,6 @@ Status BuildTable(
         }
         blob_meta->fd = FileDescriptor(versions_->NewFileNumber(),
                                        sst_meta()->fd.GetPathId(), 0);
-        // Track this freshly-created vSST in the death log from empty so
-        // its death map can become `complete` (the only state under which
-        // GC may skip GetKey()).
-        if (blob_death_log != nullptr) {
-          blob_death_log->OnVsstCreated(blob_meta->fd.GetNumber());
-        }
         bstate.fname =
             TableFileName(ioptions.cf_paths, blob_meta->fd.GetNumber(),
                           blob_meta->fd.GetPathId());
@@ -360,30 +327,10 @@ Status BuildTable(
       }
       if (status.ok()) {
         blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
-        // Obtain the real vSST data block ordinal and in-block slot
-        // ordinal this value was just written into. layout_id binds them
-        // to the *physical* vSST file; a reader rejects them when the
-        // blob's current physical file number no longer matches (e.g.
-        // after a vSST GC rewrite). When the death log feature is off,
-        // both stay at their sentinels and TransToSeparate writes the
-        // bit-for-bit legacy index.
-        uint64_t block_id = SeparateHelper::kNoBlockId;
-        uint64_t slot_id = SeparateHelper::kNoSlotId;
-        uint64_t layout_id = SeparateHelper::kNoBlockLayoutId;
-        if (separate_helper.death_log_enabled &&
-            blob_builder->SupportsDataBlockId()) {
-          block_id = blob_builder->LastAddedDataBlockId();
-          slot_id = blob_builder->LastAddedSlotId();
-          layout_id = blob_meta->fd.GetNumber();
-        }
-        // Stamp the resolved block_id + layout_id + slot_id onto the
-        // outgoing index value so blob GC can decode the physical death
-        // location without re-deriving it.
         status = SeparateHelper::TransToSeparate(
             key, value, blob_meta->fd.GetNumber(), Slice(),
             GetInternalKeyType(key) == kTypeMerge, false,
-            separate_helper.value_meta_extractor.get(), block_id, layout_id,
-            slot_id);
+              separate_helper.value_meta_extractor.get());
       }
       return status;
     };

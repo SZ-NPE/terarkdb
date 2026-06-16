@@ -129,19 +129,6 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
     }
     Add(TablePropertiesNames::kDependenceByteCount, val);
   }
-  // Persist per-data-block entry counts for blob (vSST) BlockBasedTables
-  // when the blob death log feature populated them. The payload is
-  // self-delimiting so readers that have never heard of this property
-  // can safely ignore it (it will land in user_collected_properties).
-  if (!props.data_block_entry_counts.empty()) {
-    std::string payload;
-    PutVarint64(&payload,
-                static_cast<uint64_t>(props.data_block_entry_counts.size()));
-    for (uint32_t cnt : props.data_block_entry_counts) {
-      PutVarint64(&payload, static_cast<uint64_t>(cnt));
-    }
-    Add(TablePropertiesNames::kDataBlockEntryCounts, payload);
-  }
   if (!props.inheritance_tree.empty()) {
     Add(TablePropertiesNames::kInheritanceTree, props.inheritance_tree);
   }
@@ -444,32 +431,6 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       for (size_t i = 0; i < val.size(); ++i) {
         new_table_properties->dependence[i].byte_count = val[i];
       }
-    } else if (key == TablePropertiesNames::kDataBlockEntryCounts) {
-      // Decode per-data-block entry counts. SSTs that predate this
-      // format (or were produced with the feature off) will not carry
-      // this key, in which case `data_block_entry_counts` stays empty
-      // and the GC death-map fast path falls back for that file.
-      uint64_t n_counts = 0;
-      if (!GetVarint64(&raw_val, &n_counts)) {
-        log_error();
-        continue;
-      }
-      std::vector<uint32_t> parsed;
-      parsed.reserve(n_counts);
-      bool ok = true;
-      for (uint64_t i = 0; i < n_counts; ++i) {
-        uint64_t cnt = 0;
-        if (!GetVarint64(&raw_val, &cnt)) {
-          ok = false;
-          break;
-        }
-        parsed.push_back(static_cast<uint32_t>(cnt));
-      }
-      if (!ok) {
-        log_error();
-        continue;
-      }
-      new_table_properties->data_block_entry_counts = std::move(parsed);
     } else if (key == TablePropertiesNames::kInheritanceChain) {
       std::vector<uint64_t> val;
       GetUint64Vector(key, &raw_val, val);

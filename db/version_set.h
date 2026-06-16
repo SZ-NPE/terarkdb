@@ -1082,8 +1082,7 @@ class VersionSet {
   // The caller should delete the iterator when no longer needed.
   InternalIterator* MakeInputIterator(
       const Compaction* c, RangeDelAggregator* range_del_agg,
-      const EnvOptions& env_options_compactions,
-      const BlobGcBlockSkipContext* blob_gc_block_skip_context = nullptr);
+      const EnvOptions& env_options_compactions);
 
   // Add all files listed in any live version to *live.
   void AddLiveFiles(std::vector<FileDescriptor>* live_list);

@@ -229,8 +229,6 @@ const std::string TablePropertiesNames::kDependenceEntryCount =
     "rocksdb.sst.dependence.entry-count";
 const std::string TablePropertiesNames::kDependenceByteCount =
     "rocksdb.sst.dependence.byte-count";
-const std::string TablePropertiesNames::kDataBlockEntryCounts =
-    "rocksdb.sst.data-block-entry-counts";
 const std::string TablePropertiesNames::kInheritanceChain =
     "rocksdb.sst.inheritance-chain";
 const std::string TablePropertiesNames::kInheritanceTree =

@@ -164,13 +164,6 @@ struct MutableCFOptions {
         blob_large_key_ratio(0),
         blob_gc_ratio(0),
         precise_gc(false),
-        enable_blob_death_log(false),
-        blob_death_log_persist(false),
-        blob_death_log_buffer_size(64 << 20),
-        blob_gc_skip_dead_blocks(false),
-        blob_gc_skip_getkey_with_deathmap(false),
-        blob_death_log_debug_check(false),
-        blob_death_log_stats(false),
         target_blob_file_size(0),
         blob_file_defragment_size(0),
         max_dependence_blob_overlap(0),
@@ -237,13 +230,6 @@ struct MutableCFOptions {
   double blob_large_key_ratio;
   double blob_gc_ratio;
   bool precise_gc;
-  bool enable_blob_death_log;
-  bool blob_death_log_persist;
-  uint64_t blob_death_log_buffer_size;
-  bool blob_gc_skip_dead_blocks;
-  bool blob_gc_skip_getkey_with_deathmap;
-  bool blob_death_log_debug_check;
-  bool blob_death_log_stats;
   uint64_t target_blob_file_size;
   uint64_t blob_file_defragment_size;
   size_t max_dependence_blob_overlap;

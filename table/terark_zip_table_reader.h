@@ -99,9 +99,7 @@ class TerarkEmptyTableReader : public TerarkZipTableReaderBase {
   InternalIterator* NewIterator(const ReadOptions& /*ro*/,
                                 const SliceTransform* /*prefix_extractor*/,
                                 Arena* a, bool /*skip_filters*/,
-                                bool /*for_compaction*/,
-                                const BlobGcBlockSkipContext*
-                                    /*blob_gc_block_skip_context*/ = nullptr)
+                                bool /*for_compaction*/)
       override {
     return a ? new (a->AllocateAligned(sizeof(Iter))) Iter() : new Iter();
   }
@@ -174,9 +172,7 @@ class TerarkZipTableReader : public TerarkZipTableReaderBase {
   InternalIterator* NewIterator(const ReadOptions&,
                                 const SliceTransform* prefix_extractor,
                                 Arena* a, bool skip_filters,
-                                bool for_compaction,
-                                const BlobGcBlockSkipContext*
-                                    blob_gc_block_skip_context = nullptr)
+                                bool for_compaction)
       override;
 
   template <bool reverse, bool ZipOffset>
@@ -223,9 +219,7 @@ class TerarkZipTableMultiReader : public TerarkZipTableReaderBase {
   InternalIterator* NewIterator(const ReadOptions&,
                                 const SliceTransform* prefix_extractor,
                                 Arena* a, bool skip_filters,
-                                bool for_compaction,
-                                const BlobGcBlockSkipContext*
-                                    blob_gc_block_skip_context = nullptr)
+                                bool for_compaction)
       override;
 
   template <bool reverse, bool ZipOffset>

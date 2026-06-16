@@ -164,13 +164,7 @@ class TtlIntTblPropCollector : public IntTblPropCollector {
       Slice user_key = ExtractUserKey(key);
       Slice value_or_meta = value;
       if (entry_type == kEntryMergeIndex || entry_type == kEntryValueIndex) {
-        // Strip the optional block-id trailer so that TTL extractors
-        // receive exactly the raw meta emitted by the user-provided
-        // ValueExtractor, regardless of whether the block-aware
-        // value-index format is enabled for this CF. For legacy
-        // value-indices this call is bit-for-bit identical to
-        // DecodeValueMeta().
-        value_or_meta = SeparateHelper::DecodeValueMetaStripBlockId(value);
+        value_or_meta = SeparateHelper::DecodeValueMeta(value);
       }
       Status s = ttl_extractor_->Extract(entry_type, user_key, value_or_meta,
                                          &has_ttl, &ttl_time_point);

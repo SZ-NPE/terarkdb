@@ -114,9 +114,7 @@ class BlockBasedTable : public TableReader {
                                 const SliceTransform* prefix_extractor,
                                 Arena* arena = nullptr,
                                 bool skip_filters = false,
-                                bool for_compaction = false,
-                                const BlobGcBlockSkipContext*
-                                    blob_gc_block_skip_context = nullptr)
+                                bool for_compaction = false)
       override;
 
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
@@ -557,9 +555,7 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
                               const SliceTransform* prefix_extractor,
                               bool is_index, bool key_includes_seq = true,
                               bool index_key_is_full = true,
-                              bool for_compaction = false,
-                              const BlobGcBlockSkipContext*
-                                  blob_gc_block_skip_context = nullptr)
+                              bool for_compaction = false)
       : table_(table),
         read_options_(read_options),
         icomp_(icomp),
@@ -571,11 +567,7 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
         is_index_(is_index),
         key_includes_seq_(key_includes_seq),
         index_key_is_full_(index_key_is_full),
-        for_compaction_(for_compaction) {
-    if (blob_gc_block_skip_context != nullptr) {
-      gc_block_skip_ctx_ = *blob_gc_block_skip_context;
-    }
-  }
+        for_compaction_(for_compaction) {}
 
   ~BlockBasedTableIteratorBase() { delete index_iter_; }
 
@@ -634,25 +626,7 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
     }
   }
 
-  enum class InitDataBlockResult { kLoaded, kSkipped, kInvalid };
-
-  void DisableGcBlockSkip() {
-    current_data_block_id_valid_ = false;
-    gc_forward_scan_mode_ = false;
-  }
-
-  bool GcBlockSkipEnabled() const {
-    return gc_block_skip_ctx_.enabled &&
-           gc_block_skip_ctx_.is_block_dead != nullptr;
-  }
-
-  // Whether per-value (slot-level) skipping inside partially-live blocks
-  // is available. Independent of is_block_dead so a death map can support
-  // value skipping even when whole-block skipping is disabled.
-  bool GcValueSkipEnabled() const {
-    return gc_block_skip_ctx_.enabled &&
-           gc_block_skip_ctx_.is_value_dead != nullptr;
-  }
+  enum class InitDataBlockResult { kLoaded, kInvalid };
 
   InitDataBlockResult InitDataBlock();
   void FindKeyForward();
@@ -678,15 +652,6 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   // If this iterator is created for compaction
   bool for_compaction_;
   BlockHandle prev_index_value_;
-  BlobGcBlockSkipContext gc_block_skip_ctx_;
-  uint64_t current_data_block_id_ = 0;
-  bool current_data_block_id_valid_ = false;
-  bool gc_forward_scan_mode_ = false;
-  // In-block slot ordinal of the entry the block iterator currently
-  // points at, tracked during a GC forward scan so the death-map
-  // is_value_dead() callback can filter individual dead values inside a
-  // partially-live data block. Reset to 0 at every new data block.
-  uint64_t current_slot_id_ = 0;
 
   static const size_t kInitReadaheadSize = 8 * 1024;
   // Found that 256 KB readahead size provides the best performance, based on

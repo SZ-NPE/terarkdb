@@ -210,20 +210,6 @@ void MutableCFOptions::Dump(Logger* log) const {
                  blob_gc_ratio);
   ROCKS_LOG_INFO(log, "                               precise_gc: %d",
                  precise_gc);
-  ROCKS_LOG_INFO(log, "                     enable_blob_death_log: %d",
-                 enable_blob_death_log);
-  ROCKS_LOG_INFO(log, "                   blob_death_log_persist: %d",
-                 blob_death_log_persist);
-  ROCKS_LOG_INFO(log, "              blob_death_log_buffer_size: %" PRIu64,
-                 blob_death_log_buffer_size);
-  ROCKS_LOG_INFO(log, "                 blob_gc_skip_dead_blocks: %d",
-                 blob_gc_skip_dead_blocks);
-  ROCKS_LOG_INFO(log, "        blob_gc_skip_getkey_with_deathmap: %d",
-                 blob_gc_skip_getkey_with_deathmap);
-  ROCKS_LOG_INFO(log, "                blob_death_log_debug_check: %d",
-                 blob_death_log_debug_check);
-  ROCKS_LOG_INFO(log, "                      blob_death_log_stats: %d",
-                 blob_death_log_stats);
   ROCKS_LOG_INFO(log, "                    target_blob_file_size: %" PRIu64,
                  target_blob_file_size);
   ROCKS_LOG_INFO(log, "                blob_file_defragment_size: %" PRIu64,
@@ -325,14 +311,6 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       blob_large_key_ratio(options.blob_large_key_ratio),
       blob_gc_ratio(options.blob_gc_ratio),
       precise_gc(options.precise_gc),
-      enable_blob_death_log(options.enable_blob_death_log),
-      blob_death_log_persist(options.blob_death_log_persist),
-      blob_death_log_buffer_size(options.blob_death_log_buffer_size),
-      blob_gc_skip_dead_blocks(options.blob_gc_skip_dead_blocks),
-      blob_gc_skip_getkey_with_deathmap(
-          options.blob_gc_skip_getkey_with_deathmap),
-      blob_death_log_debug_check(options.blob_death_log_debug_check),
-      blob_death_log_stats(options.blob_death_log_stats),
       target_blob_file_size(options.target_blob_file_size),
       blob_file_defragment_size(options.blob_file_defragment_size),
       max_dependence_blob_overlap(options.max_dependence_blob_overlap),

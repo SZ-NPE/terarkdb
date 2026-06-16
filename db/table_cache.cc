@@ -280,8 +280,7 @@ InternalIterator* TableCache::NewIterator(
     const FileMetaData& file_meta, const DependenceMap& dependence_map,
     RangeDelAggregator* range_del_agg, const SliceTransform* prefix_extractor,
     TableReader** table_reader_ptr, HistogramImpl* file_read_hist,
-    bool for_compaction, Arena* arena, bool skip_filters, int level,
-    const BlobGcBlockSkipContext* blob_gc_block_skip_context) {
+    bool for_compaction, Arena* arena, bool skip_filters, int level) {
   PERF_TIMER_GUARD(new_table_iterator_nanos);
 
   Status s;
@@ -346,23 +345,8 @@ InternalIterator* TableCache::NewIterator(
           !options.table_filter(*table_reader->GetTableProperties())) {
         result = NewEmptyInternalIterator<LazyBuffer>(arena);
       } else {
-        BlobGcBlockSkipContext per_file_gc_block_skip_context;
-        const BlobGcBlockSkipContext* table_gc_block_skip_context = nullptr;
-        if (blob_gc_block_skip_context != nullptr &&
-            blob_gc_block_skip_context->enabled &&
-            (blob_gc_block_skip_context->is_block_dead != nullptr ||
-             blob_gc_block_skip_context->is_value_dead != nullptr)) {
-          per_file_gc_block_skip_context = *blob_gc_block_skip_context;
-          per_file_gc_block_skip_context.file_number = fd.GetNumber();
-          if (per_file_gc_block_skip_context.is_file_skippable == nullptr ||
-              per_file_gc_block_skip_context.is_file_skippable(
-                  per_file_gc_block_skip_context.arg, fd.GetNumber())) {
-            table_gc_block_skip_context = &per_file_gc_block_skip_context;
-          }
-        }
         result = table_reader->NewIterator(options, prefix_extractor, arena,
-                                           skip_filters, for_compaction,
-                                           table_gc_block_skip_context);
+                                           skip_filters, for_compaction);
       }
     } else {
       ReadOptions map_options = options;

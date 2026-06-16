@@ -568,7 +568,6 @@ set(SOURCES
         cache/lru_cache.cc
         cache/sharded_cache.cc
         db/builder.cc
-        db/blob_death_log.cc
         db/c.cc
         db/column_family.cc
         db/compacted_db_impl.cc
@@ -1025,7 +1024,6 @@ if(WITH_TESTS)
         db/db_wal_test.cc
         db/db_write_test.cc
         db/dbformat_test.cc
-        db/blob_death_log_test.cc
         db/deletefile_test.cc
         db/error_handler_test.cc
         db/obsolete_files_test.cc

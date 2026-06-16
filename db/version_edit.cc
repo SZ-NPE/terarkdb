@@ -233,21 +233,6 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
                           f.prop.raw_value_size);
       PutVarint64(&encode_property_cache, f.prop.earliest_time_begin_compact);
       PutVarint64(&encode_property_cache, f.prop.latest_time_end_compact);
-      // persist per-data-block entry counts in the manifest so the GC
-      // death-map fast path can decide "entirely dead" data blocks after
-      // a DB reopen without rereading every SST. The payload is
-      // append-only and self delimiting, so older manifests that predate
-      // this field remain decodable (the decoder simply sees
-      // `field.empty()` here and leaves `data_block_entry_counts` empty,
-      // disabling the fast path).
-      if (!f.prop.data_block_entry_counts.empty()) {
-        PutVarint64(
-            &encode_property_cache,
-            static_cast<uint64_t>(f.prop.data_block_entry_counts.size()));
-        for (uint32_t cnt : f.prop.data_block_entry_counts) {
-          PutVarint64(&encode_property_cache, static_cast<uint64_t>(cnt));
-        }
-      }
       PutLengthPrefixedSlice(dst, encode_property_cache);
     }
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
@@ -435,26 +420,6 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &f.prop.earliest_time_begin_compact) ||
                   !GetVarint64(&field, &f.prop.latest_time_end_compact)) {
                 return error_msg;
-              }
-            }
-            if (!field.empty()) {
-              // append-only per-data-block entry-count payload. Older
-              // manifests will have `field.empty()` here and we leave
-              // `data_block_entry_counts` empty, which disables the GC
-              // death-map fast path for that file.
-              uint64_t n_counts = 0;
-              if (!GetVarint64(&field, &n_counts)) {
-                return error_msg;
-              }
-              f.prop.data_block_entry_counts.clear();
-              f.prop.data_block_entry_counts.reserve(n_counts);
-              for (uint64_t i = 0; i < n_counts; ++i) {
-                uint64_t cnt = 0;
-                if (!GetVarint64(&field, &cnt)) {
-                  return error_msg;
-                }
-                f.prop.data_block_entry_counts.push_back(
-                    static_cast<uint32_t>(cnt));
               }
             }
             if (f.prop.num_entries > 0 || f.prop.raw_key_size > 0 ||

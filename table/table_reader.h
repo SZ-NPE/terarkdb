@@ -29,25 +29,6 @@ struct ReadOptions;
 struct TableProperties;
 class GetContext;
 
-struct BlobGcBlockSkipContext {
-  bool enabled = false;
-  uint64_t file_number = static_cast<uint64_t>(-1);
-  // Whether the death map for this vSST is usable at all.
-  bool (*is_file_skippable)(void* arg, uint64_t file_number) = nullptr;
-  // Whether every value in data block `block_id` is dead (skip the block).
-  bool (*is_block_dead)(void* arg, uint64_t file_number,
-                        uint64_t block_id) = nullptr;
-  // Whether the value at (block_id, slot_id) within a partially-live
-  // block is dead (skip just this entry during the forward scan).
-  bool (*is_value_dead)(void* arg, uint64_t file_number, uint64_t block_id,
-                        uint64_t slot_id) = nullptr;
-  void* arg = nullptr;
-  uint64_t* skipped_blocks = nullptr;
-  uint64_t* skipped_bytes = nullptr;
-  uint64_t* read_blocks = nullptr;
-  uint64_t* skipped_slots = nullptr;
-};
-
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
 // multiple threads without external synchronization.
@@ -68,10 +49,7 @@ class TableReader {
                                         const SliceTransform* prefix_extractor,
                                         Arena* arena = nullptr,
                                         bool skip_filters = false,
-                                        bool for_compaction = false,
-                                        const BlobGcBlockSkipContext*
-                                            blob_gc_block_skip_context =
-                                                nullptr) = 0;
+                                        bool for_compaction = false) = 0;
 
   virtual FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& /*read_options*/) {

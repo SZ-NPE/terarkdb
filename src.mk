@@ -5,7 +5,6 @@ LIB_SOURCES =                                                   \
   cache/lru_cache.cc                                            \
   cache/sharded_cache.cc                                        \
   db/builder.cc                                                 \
-  db/blob_death_log.cc                                          \
   db/c.cc                                                       \
   db/column_family.cc                                           \
   db/compacted_db_impl.cc                                       \

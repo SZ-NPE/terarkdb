@@ -1281,11 +1281,6 @@ Status CompactionJob::Run() {
           output.meta.prop.max_read_amp = tp->max_read_amp;
           output.meta.prop.read_amp = tp->read_amp;
           output.meta.prop.dependence = tp->dependence;
-          // carry per-data-block entry counts that the TableBuilder
-          // persisted for blob (vSST) files; empty for legacy/non-death
-          // -log files, which keeps the GC death-map fast path off.
-          output.meta.prop.data_block_entry_counts =
-              tp->data_block_entry_counts;
           output.meta.prop.inheritance =
               InheritanceTreeToSet(tp->inheritance_tree);
           if (iopt->ttl_extractor_factory != nullptr) {
@@ -1747,27 +1742,10 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     if (s.ok()) {
       blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
       new_blob_bytes_per_fn[blob_meta->fd.GetNumber()] += raw_value_bytes;
-      // The value is rewritten into a brand new vSST. Stamp the
-      // value-index with the real data-block ordinal + in-block slot id
-      // returned by the BlockBasedTableBuilder so a later blob GC can
-      // build a death map. When the death log feature is off, the
-      // builder is not BlockBasedTable, or it cannot report a block id,
-      // all stay at their sentinels and a bit-for-bit legacy value-index
-      // is emitted.
-      uint64_t block_id = SeparateHelper::kNoBlockId;
-      uint64_t slot_id = SeparateHelper::kNoSlotId;
-      uint64_t layout_id = SeparateHelper::kNoBlockLayoutId;
-      if (mutable_cf_options->enable_blob_death_log &&
-          blob_builder->SupportsDataBlockId()) {
-        block_id = blob_builder->LastAddedDataBlockId();
-        slot_id = blob_builder->LastAddedSlotId();
-        layout_id = blob_meta->fd.GetNumber();
-      }
       s = SeparateHelper::TransToSeparate(
           key, value, blob_meta->fd.GetNumber(), Slice(),
           GetInternalKeyType(key) == kTypeMerge, false,
-          separate_helper.value_meta_extractor.get(), block_id, layout_id,
-          slot_id);
+          separate_helper.value_meta_extractor.get());
     }
     return s;
   };
@@ -1814,15 +1792,9 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       ShouldReportDetailedTime(env_, stats_), false, &range_del_agg,
       sub_compact->compaction, mutable_cf_options->get_blob_config(),
       compaction_filter, shutting_down_, preserve_deletes_seqnum_,
-      &rebuild_blobs_info.blobs, cfd->hotness_tracker().get(),
-      cfd->blob_death_log()));
+      &rebuild_blobs_info.blobs, cfd->hotness_tracker().get()));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
-  // Snapshot the death-log emit counter so we can report how many death
-  // records this compaction contributed (the counter is process-wide).
-  const uint64_t death_records_before =
-      cfd->blob_death_log() != nullptr ? cfd->blob_death_log()->records_emitted()
-                                       : 0;
 
   struct SecondPassIterStorage {
     std::aligned_storage<sizeof(CompactionRangeDelAggregator),
@@ -2097,12 +2069,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
              c_iter_stats.total_filter_time);
   RecordDroppedKeys(c_iter_stats, &sub_compact->compaction_job_stats);
   RecordCompactionIOStats();
-  // Report death records emitted by this compaction's drop sites.
-  if (cfd->blob_death_log() != nullptr) {
-    const uint64_t emitted =
-        cfd->blob_death_log()->records_emitted() - death_records_before;
-    RecordTick(stats_, BLOB_DEATH_RECORDS_EMITTED, emitted);
-  }
 
   if (status.ok() &&
       (shutting_down_->load(std::memory_order_relaxed) || cfd->IsDropped())) {
@@ -2184,8 +2150,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   const MutableCFOptions* mutable_cf_options =
       sub_compact->compaction->mutable_cf_options();
   Version* input_version = sub_compact->compaction->input_version();
-  const VersionStorageInfo* vstorage = input_version->storage_info();
-  BlobDeathLog* blob_death_log = cfd->blob_death_log();
   // Raw view of the optional drop-key cache. When the hotness tracker is
   // enabled, blob GC consults it to skip the GetKey() reverse lookup for
   // versions compaction already confirmed dead. Held as a shared_ptr for the
@@ -2193,131 +2157,14 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   std::shared_ptr<HotnessTracker> hotness_tracker_holder = cfd->hotness_tracker();
   HotnessTracker* hotness_tracker = hotness_tracker_holder.get();
 
-  // Holder for the GC death-map fast path. Owns a per-vSST DeathMap cache
-  // (built lazily from the in-memory BlobDeathLog) plus the per-vSST
-  // total entry counts (from TableProperties) needed to decide when a
-  // whole data block is dead. Passed as the `arg` to the block-skip
-  // callbacks. When the feature is off this stays unused (callbacks see
-  // a disabled context).
-  struct GcDeathMapHolder {
-    BlobDeathLog* log = nullptr;
-    const VersionStorageInfo* vstorage = nullptr;
-    // physical vSST file number -> death map snapshot.
-    std::unordered_map<uint64_t, BlobDeathMap> maps;
-    // physical vSST file number -> per-data-block total entry counts.
-    std::unordered_map<uint64_t, const std::vector<uint32_t>*> block_counts;
-    uint64_t getkey_avoided = 0;
-    uint64_t records_applied = 0;
-    uint64_t unavailable_fallback = 0;
-
-    // Resolve (and cache) the death map for a physical vSST file number.
-    const BlobDeathMap* GetMap(uint64_t fn) {
-      auto it = maps.find(fn);
-      if (it != maps.end()) {
-        return &it->second;
-      }
-      if (log == nullptr) {
-        return nullptr;
-      }
-      auto ins = maps.emplace(fn, log->BuildDeathMap(fn));
-      return &ins.first->second;
-    }
-
-    // Resolve (and cache) the per-block total entry counts for a vSST.
-    const std::vector<uint32_t>* GetBlockCounts(uint64_t fn) {
-      auto it = block_counts.find(fn);
-      if (it != block_counts.end()) {
-        return it->second;
-      }
-      const std::vector<uint32_t>* counts = nullptr;
-      if (vstorage != nullptr) {
-        auto dep_it = vstorage->dependence_map().find(fn);
-        if (dep_it != vstorage->dependence_map().end() &&
-            dep_it->second != nullptr &&
-            !dep_it->second->prop.data_block_entry_counts.empty()) {
-          counts = &dep_it->second->prop.data_block_entry_counts;
-        }
-      }
-      block_counts.emplace(fn, counts);
-      return counts;
-    }
-  } death_holder;
-  death_holder.log = blob_death_log;
-  death_holder.vstorage = vstorage;
-
-  uint64_t bitmap_block_skip_blocks = 0;
-  uint64_t bitmap_block_skip_bytes = 0;
-  uint64_t bitmap_block_read_blocks = 0;
-  uint64_t bitmap_skipped_slots = 0;
-  BlobGcBlockSkipContext gc_block_skip_context;
-  // Master gate: feature on, GC has a death log, and at least one of the
-  // physical-skip toggles is set. Block-skip and value-skip can be
-  // toggled independently for experimentation.
-  const bool death_log_on =
-      mutable_cf_options->enable_blob_death_log && blob_death_log != nullptr &&
-      vstorage != nullptr;
-  gc_block_skip_context.enabled =
-      death_log_on && (mutable_cf_options->blob_gc_skip_dead_blocks ||
-                       mutable_cf_options->blob_gc_skip_getkey_with_deathmap);
-  gc_block_skip_context.arg = &death_holder;
-  // A vSST is skippable only when its death map is complete (every live
-  // value is decidable). Incomplete maps fall back entirely.
-  gc_block_skip_context.is_file_skippable = [](void* arg, uint64_t fn) {
-    auto* h = static_cast<GcDeathMapHolder*>(arg);
-    const BlobDeathMap* m = h->GetMap(fn);
-    return m != nullptr && m->complete;
-  };
-  // A data block is dead iff every entry it holds is in the death map.
-  // Requires the persisted per-block total entry count.
-  gc_block_skip_context.is_block_dead = [](void* arg, uint64_t fn,
-                                           uint64_t block_id) {
-    auto* h = static_cast<GcDeathMapHolder*>(arg);
-    const BlobDeathMap* m = h->GetMap(fn);
-    if (m == nullptr || !m->complete) {
-      return false;
-    }
-    const std::vector<uint32_t>* counts = h->GetBlockCounts(fn);
-    if (counts == nullptr || block_id >= counts->size()) {
-      return false;
-    }
-    auto it = m->dead_count_per_block.find(block_id);
-    if (it == m->dead_count_per_block.end()) {
-      return false;
-    }
-    return it->second >= (*counts)[block_id];
-  };
-  // A value is dead iff its (block_id, slot_id) is explicitly recorded.
-  gc_block_skip_context.is_value_dead = [](void* arg, uint64_t fn,
-                                           uint64_t block_id,
-                                           uint64_t slot_id) {
-    auto* h = static_cast<GcDeathMapHolder*>(arg);
-    const BlobDeathMap* m = h->GetMap(fn);
-    return m != nullptr && m->complete && m->IsValueDead(block_id, slot_id);
-  };
-  gc_block_skip_context.skipped_blocks = &bitmap_block_skip_blocks;
-  gc_block_skip_context.skipped_bytes = &bitmap_block_skip_bytes;
-  gc_block_skip_context.read_blocks = &bitmap_block_read_blocks;
-  gc_block_skip_context.skipped_slots = &bitmap_skipped_slots;
-  // Honor the independent experimentation toggles by nulling the
-  // callback a disabled feature would otherwise drive.
-  if (!mutable_cf_options->blob_gc_skip_dead_blocks) {
-    gc_block_skip_context.is_block_dead = nullptr;
-  }
-  if (!mutable_cf_options->blob_gc_skip_getkey_with_deathmap) {
-    gc_block_skip_context.is_value_dead = nullptr;
-  }
-  const BlobGcBlockSkipContext* gc_block_skip_context_ptr =
-      gc_block_skip_context.enabled ? &gc_block_skip_context : nullptr;
   std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
-      sub_compact->compaction, nullptr, env_options_for_read_,
-      gc_block_skip_context_ptr));
+      sub_compact->compaction, nullptr, env_options_for_read_));
 
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
 
   // I/O measurement variables
   PerfLevel prev_perf_level = PerfLevel::kEnableTime;
-  uint64_t prev_read_bytes = 0, prev_write_bytes = 0;
   uint64_t prev_write_nanos = 0;
   uint64_t prev_fsync_nanos = 0;
   uint64_t prev_range_sync_nanos = 0;
@@ -2326,8 +2173,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   if (measure_io_stats_) {
     prev_perf_level = GetPerfLevel();
     SetPerfLevel(PerfLevel::kEnableTime);
-    prev_read_bytes = IOSTATS(bytes_read);
-    prev_write_bytes = IOSTATS(bytes_written);
     prev_write_nanos = IOSTATS(write_nanos);
     prev_fsync_nanos = IOSTATS(fsync_nanos);
     prev_range_sync_nanos = IOSTATS(range_sync_nanos);
@@ -2347,8 +2192,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
 
   auto create_iter = [&](Arena* /* arena */) {
     return versions_->MakeInputIterator(sub_compact->compaction, nullptr,
-                                        env_options_for_read_,
-                                        gc_block_skip_context_ptr);
+                                          env_options_for_read_);
   };
   auto filter_conflict = [&](const Slice& ikey, const LazyBuffer& value) {
     std::lock_guard<std::mutex> lock(conflict_map_mutex);
@@ -2379,25 +2223,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t live = 0, dead = 0, live_runs = 0, dead_runs = 0;
     uint64_t max_live_run = 0, curr_run = 0;
     bool has_run = false, run_live = false;
-    // death-map fast-path counters.
-    //   bitmap_aware_blobs    : distinct blobs whose death map was
-    //                           complete (GetKey could be skipped).
-    //   bitmap_fallback_blobs : distinct blobs whose death map was
-    //                           incomplete/absent (GetKey fallback).
-    //   bitmap_fallback_getkey: records that went through the legacy
-    //                           per-record GetKey() reverse lookup.
-    uint64_t bitmap_fast_path_skips = 0;
-    uint64_t bitmap_aware_blobs = 0;
-    uint64_t bitmap_fallback_blobs = 0;
-    uint64_t bitmap_entirely_dead_blobs = 0;
-    uint64_t bitmap_fallback_getkey = 0;
-    uint64_t bitmap_live_blocks = 0;
-    uint64_t bitmap_dead_blocks = 0;
-    uint64_t bitmap_skipped_bytes = 0;
-    uint64_t bitmap_live_bytes = 0;
-    uint64_t bitmap_block_skip_bytes = 0;
-    uint64_t bitmap_block_skip_blocks = 0;
-    uint64_t bitmap_block_read_blocks = 0;
     // drop-key cache (HotnessTracker) fast-path counters.
     //   dropped_key_cache_hit : records whose (user_key, sequence) was found
     //                           in the in-memory drop-key cache, so the
@@ -2408,13 +2233,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t dropped_key_cache_hit = 0;
     uint64_t dropped_key_cache_miss = 0;
   } counter;
-  // cache resolves (blob_file_number -> (meta, skip_getkey)) once per
-  // blob. `entirely_dead == true` here means "death map complete -> we
-  // may relocate every live record without a GetKey() reverse lookup".
+  // Cache blob_file_number -> metadata once per blob during GC.
   struct BlobGcCacheEntry {
     uint64_t blob_file_number;
     FileMetaData* meta;
-    bool entirely_dead;
   };
   std::vector<BlobGcCacheEntry> blob_meta_cache;
   assert(!sub_compact->compaction->inputs()->empty());
@@ -2468,7 +2290,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     }
     uint64_t blob_file_number = input->value().file_number();
     FileMetaData* blob_meta;
-    bool blob_entirely_dead = false;
     auto find_cache = std::find_if(
         blob_meta_cache.begin(), blob_meta_cache.end(),
         [blob_file_number](const BlobGcCacheEntry& e) {
@@ -2476,7 +2297,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         });
     if (find_cache != blob_meta_cache.end()) {
       blob_meta = find_cache->meta;
-      blob_entirely_dead = find_cache->entirely_dead;
     } else {
       auto find_dependence_map = dependence_map.find(blob_file_number);
       if (find_dependence_map == dependence_map.end()) {
@@ -2485,88 +2305,13 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         break;
       }
       blob_meta = find_dependence_map->second;
-      // Consult the death map once per blob. When the death map is
-      // complete (this process tracked the vSST from empty with no layout
-      // conflict), every value reaching this loop has already survived
-      // the reader-layer dead-block / dead-value filters, so it is
-      // provably live and we may relocate it without the GetKey() reverse
-      // lookup. An incomplete/absent death map (feature off, restart,
-      // legacy file) forces the legacy GetKey() fallback for safety --
-      // a missing death record is always treated as live.
-      const uint64_t physical_fn = blob_meta->fd.GetNumber();
-      bool death_map_complete = false;
-      if (death_log_on &&
-          mutable_cf_options->blob_gc_skip_getkey_with_deathmap) {
-        const BlobDeathMap* m = death_holder.GetMap(physical_fn);
-        if (m != nullptr && m->complete) {
-          death_map_complete = true;
-          ++counter.bitmap_aware_blobs;
-        } else {
-          ++counter.bitmap_fallback_blobs;
-        }
-      } else {
-        ++counter.bitmap_fallback_blobs;
-      }
-      // Reuse the cache's `entirely_dead` slot to carry the
-      // "death map complete -> skip GetKey" decision for this blob.
-      blob_entirely_dead = death_map_complete;
-      blob_meta_cache.emplace_back(
-          BlobGcCacheEntry{blob_file_number, blob_meta, blob_entirely_dead});
+      blob_meta_cache.emplace_back(BlobGcCacheEntry{blob_file_number, blob_meta});
       assert(blob_meta->fd.GetNumber() == blob_file_number);
     }
-    // `blob_entirely_dead` here means "death map complete -> relocate
-    // without GetKey". Renamed for readability at the use sites below.
-    const bool skip_getkey_for_blob = blob_entirely_dead;
     do {
       if (ikey.type != kTypeValue && ikey.type != kTypeMerge) {
         ++counter.garbage_type;
         gc_invalid_read_bytes_ += record_bytes;
-        break;
-      }
-      // Death-map fast path: when the death map is complete, dead values
-      // were already dropped at the reader layer, so any record that
-      // reaches here is live. Relocate it directly, skipping the
-      // per-record GetKey() reverse lookup. `input->value()` is the real
-      // vSST user value (no trailer); we never decode a trailer on it.
-      if (skip_getkey_for_blob) {
-        LazyBuffer fast_value = input->value();
-        status = fast_value.fetch();
-        if (!status.ok()) {
-          break;
-        }
-        // Optional debug cross-check: verify the death-map verdict (live)
-        // against GetKey() and assert they agree.
-        if (mutable_cf_options->blob_death_log_debug_check) {
-          iter_key.SetInternalKey(ikey.user_key, ikey.sequence,
-                                  kValueTypeForSeek);
-          Status cs;
-          ValueType ctype = kTypeDeletion;
-          SequenceNumber cseq = kMaxSequenceNumber;
-          LazyBuffer cval;
-          input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &cs,
-                                &ctype, &cseq, &cval, *blob_meta);
-          const bool getkey_live =
-              cs.ok() && cseq == ikey.sequence &&
-              (ctype == kTypeValueIndex || ctype == kTypeMergeIndex);
-          assert(getkey_live &&
-                 "death-map said live but GetKey() disagrees");
-          (void)getkey_live;
-        }
-        curr_file_number = fast_value.file_number();
-        assert(sub_compact->blob_builder != nullptr);
-        assert(sub_compact->current_blob_output() != nullptr);
-        const uint64_t s5 = env_->NowNanos();
-        status = sub_compact->blob_builder->Add(curr_key, fast_value);
-        gc_t_write_ += (env_->NowNanos() - s5);
-        if (!status.ok()) {
-          break;
-        }
-        sub_compact->current_blob_output()->meta.UpdateBoundaries(
-            curr_key, ikey.sequence);
-        sub_compact->num_output_records++;
-        gc_relocation_write_bytes_ += record_bytes;
-        ++death_holder.getkey_avoided;
-        is_live = true;
         break;
       }
       // Drop-key cache fast path: when compaction has already confirmed this
@@ -2586,19 +2331,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       if (hotness_tracker != nullptr) {
         ++counter.dropped_key_cache_miss;
       }
-      // NOTE: `input->value()` here is the *real vSST user value*, not a
-      // kSST ValueIndex. It does NOT carry a block-id trailer, so we must
-      // never call SeparateHelper::DecodeBlockId() on it. Physical
-      // data-block skip, when enabled, has already happened in the table
-      // iterator before the data block was read. Anything that reaches this
-      // loop and is not provably dead still falls through to the legacy
-      // GetKey() lookup.
-
-      // record bytes that will flow through the legacy per-record
-      // GetKey() path so observers can compute the fast-path savings
-      // ratio as skipped / (skipped + live).
-      ++counter.bitmap_fallback_getkey;
-      counter.bitmap_live_bytes += curr_key.size() + input->value().size();
       iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kValueTypeForSeek);
       Status s;
       ValueType type = kTypeDeletion;
@@ -2733,64 +2465,11 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     if (counter.has_run && counter.run_live) {
       counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
     }
-    counter.bitmap_block_skip_bytes = bitmap_block_skip_bytes;
-    counter.bitmap_block_skip_blocks = bitmap_block_skip_blocks;
-    counter.bitmap_block_read_blocks = bitmap_block_read_blocks;
-    const uint64_t gc_read_bytes =
-        measure_io_stats_ ? IOSTATS(bytes_read) - prev_read_bytes : 0;
-    const uint64_t gc_write_bytes =
-        measure_io_stats_ ? IOSTATS(bytes_written) - prev_write_bytes : 0;
     auto& meta = sub_compact->blob_outputs.front().meta;
     auto& inputs = *sub_compact->compaction->inputs();
     assert(inputs.size() == 1 && inputs.front().level == -1);
     auto& files = inputs.front().files;
-    if (mutable_cf_options->blob_death_log_stats) {
-      ROCKS_LOG_INFO(
-          db_options_.info_log,
-          "[%s] [JOB %d] Table #%" PRIu64 " GC summary: in=%" PRIu64
-          ", files=%zd, clear=%" PRIu64 ", est=%.2f%%, dead=[type=%" PRIu64
-          ", not_found=%" PRIu64 ", mismatch=%" PRIu64 "]"
-          ", layout=[live=%" PRIu64 ", dead=%" PRIu64
-          ", live_runs=%" PRIu64 ", dead_runs=%" PRIu64
-          ", max_live_run=%" PRIu64 "]"
-          ", lookup_micros=%" PRIu64 ", run_micros=%" PRIu64
-          ", read_bytes=%" PRIu64 ", write_bytes=%" PRIu64
-          ", death_map=[complete_blobs=%" PRIu64 ", fallback_blobs=%" PRIu64
-          ", getkey_avoided=%" PRIu64 ", fallback_getkey=%" PRIu64
-          ", skip_dead_blocks=%" PRIu64 ", skip_dead_block_bytes=%" PRIu64
-          ", read_blocks=%" PRIu64 ", skipped_slots=%" PRIu64 "]"
-          ", drop_key_cache=[hit=%" PRIu64 ", miss=%" PRIu64 "]"
-          ", inheritance=%zd->%zd",
-          cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
-          files.size(), counter.input - meta.prop.num_entries,
-          sub_compact->compaction->num_antiquation() * 100. / counter.input,
-          counter.garbage_type, counter.get_not_found,
-          counter.file_number_mismatch, counter.live, counter.dead,
-          counter.live_runs, counter.dead_runs, counter.max_live_run,
-          counter.lookup_micros, env_->NowMicros() - gc_begin_ts,
-          gc_read_bytes, gc_write_bytes,
-          counter.bitmap_aware_blobs, counter.bitmap_fallback_blobs,
-          death_holder.getkey_avoided, counter.bitmap_fallback_getkey,
-          bitmap_block_skip_blocks, bitmap_block_skip_bytes,
-          bitmap_block_read_blocks, bitmap_skipped_slots,
-          counter.dropped_key_cache_hit, counter.dropped_key_cache_miss,
-          meta.prop.inheritance.size() + inheritance_tree_pruge_count,
-          meta.prop.inheritance.size());
-    }
-    // emit death-map fast-path observability tickers. These are
-    // counters (not gauges), so every GC sub-compaction accumulates
-    // into the CF-level Statistics handle exposed via DBOptions.
-    auto* stats = db_options_.statistics.get();
-    RecordTick(stats, GC_DEATHMAP_CANDIDATE_VSST, counter.bitmap_aware_blobs);
-    RecordTick(stats, GC_DEATHMAP_GETKEY_AVOIDED, death_holder.getkey_avoided);
-    RecordTick(stats, GC_DEATHMAP_FALLBACK_GETKEY,
-               counter.bitmap_fallback_getkey);
-    RecordTick(stats, GC_DEATHMAP_UNAVAILABLE_FALLBACK,
-               counter.bitmap_fallback_blobs);
-    RecordTick(stats, GC_DEATHMAP_SKIPPED_DEAD_BLOCKS, bitmap_block_skip_blocks);
-    RecordTick(stats, GC_DEATHMAP_SKIPPED_DEAD_BLOCK_BYTES,
-               bitmap_block_skip_bytes);
-    RecordTick(stats, BLOB_DEATH_RECORDS_APPLIED, bitmap_skipped_slots);
+      TERARK_UNUSED_VAR(inheritance_tree_pruge_count);
     if ((std::find_if(files.begin(), files.end(),
                       [](FileMetaData* f) {
                         return f->marked_for_compaction;
@@ -3569,11 +3248,6 @@ Status CompactionJob::OpenCompactionOutputBlob(
                     file_number, sub_compact->compaction->output_path_id());
   // Fire events.
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
-  // Track this freshly-created compaction-output vSST in the death log
-  // from empty so its death map can become `complete`.
-  if (cfd->blob_death_log() != nullptr) {
-    cfd->blob_death_log()->OnVsstCreated(file_number);
-  }
 #ifndef ROCKSDB_LITE
   EventHelpers::NotifyTableFileCreationStarted(
       std::vector<std::shared_ptr<EventListener>>(), dbname_, cfd->GetName(),

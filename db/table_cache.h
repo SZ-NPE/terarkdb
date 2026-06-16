@@ -59,8 +59,7 @@ class TableCache {
       const SliceTransform* prefix_extractor = nullptr,
       TableReader** table_reader_ptr = nullptr,
       HistogramImpl* file_read_hist = nullptr, bool for_compaction = false,
-      Arena* arena = nullptr, bool skip_filters = false, int level = -1,
-      const BlobGcBlockSkipContext* blob_gc_block_skip_context = nullptr);
+      Arena* arena = nullptr, bool skip_filters = false, int level = -1);
 
   // If a seek to internal key "k" in specified file finds an entry,
   // call (*handle_result)(arg, found_key, found_value) repeatedly until

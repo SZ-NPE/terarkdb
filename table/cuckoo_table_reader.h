@@ -49,9 +49,7 @@ class CuckooTableReader : public TableReader {
                                 const SliceTransform* prefix_extractor,
                                 Arena* arena = nullptr,
                                 bool skip_filters = false,
-                                bool for_compaction = false,
-                                const BlobGcBlockSkipContext*
-                                    blob_gc_block_skip_context = nullptr)
+                                bool for_compaction = false)
       override;
   void Prepare(const Slice& target) override;
 

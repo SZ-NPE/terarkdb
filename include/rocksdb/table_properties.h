@@ -68,12 +68,6 @@ struct TablePropertiesNames {
   static const std::string kDependence;
   static const std::string kDependenceEntryCount;
   static const std::string kDependenceByteCount;
-  // When present, the value is a varint-count followed by N varint32
-  // entry counts, one per BlockBasedTable data block (indexed by the
-  // data block ordinal). Populated for blob (vSST) BlockBasedTables when
-  // the blob death log feature is enabled. When absent, the GC death-map
-  // fast path falls back to the legacy lookup path for that file.
-  static const std::string kDataBlockEntryCounts;
   static const std::string kInheritanceChain;
   static const std::string kInheritanceTree;
   static const std::string kEarliestTimeBeginCompact;
@@ -260,13 +254,6 @@ struct TablePropertiesBase {
 
   // Make these sst hidden
   std::vector<Dependence> dependence;
-
-  // Number of entries in each BlockBasedTable data block, indexed by the
-  // data block ordinal. Populated for blob (vSST) BlockBasedTables when
-  // the blob death log feature is enabled, and consumed by the GC
-  // death-map fast path to decide when a data block is entirely dead.
-  // Empty for legacy/map SSTs and when the feature is off.
-  std::vector<uint32_t> data_block_entry_counts;
 
   // Inheritance tree
   std::vector<uint64_t> inheritance_tree;

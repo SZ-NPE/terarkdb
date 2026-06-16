@@ -29,8 +29,7 @@ stl_wrappers::KVMap MakeMockFile(
 
 InternalIterator* MockTableReader::NewIterator(
     const ReadOptions&, const SliceTransform* /* prefix_extractor */,
-    Arena* arena, bool /*skip_filters*/, bool /*for_compaction*/,
-    const BlobGcBlockSkipContext* /*blob_gc_block_skip_context*/) {
+    Arena* arena, bool /*skip_filters*/, bool /*for_compaction*/) {
   using IterType = MockTableIterator<LazyBuffer>;
   if (arena == nullptr) {
     return new IterType(file_data_.table);

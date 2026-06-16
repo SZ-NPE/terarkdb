@@ -2103,7 +2103,6 @@ template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::Seek(
     const Slice& target) {
   is_out_of_bound_ = false;
-  DisableGcBlockSkip();
   if (!CheckPrefixMayMatch(target)) {
     ResetDataIter();
     return;
@@ -2135,7 +2134,6 @@ template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekForPrev(
     const Slice& target) {
   is_out_of_bound_ = false;
-  DisableGcBlockSkip();
   if (!CheckPrefixMayMatch(target)) {
     ResetDataIter();
     return;
@@ -2185,14 +2183,6 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToFirst() {
     ResetDataIter();
     return;
   }
-  if (GcBlockSkipEnabled() || GcValueSkipEnabled()) {
-    current_data_block_id_ = 0;
-    current_data_block_id_valid_ = true;
-    current_slot_id_ = 0;
-    gc_forward_scan_mode_ = true;
-  } else {
-    DisableGcBlockSkip();
-  }
   ResetDataIter();
   FindKeyForward();
 }
@@ -2200,7 +2190,6 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToFirst() {
 template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToLast() {
   is_out_of_bound_ = false;
-  DisableGcBlockSkip();
   SavePrevIndexValue();
   index_iter_->SeekToLast();
   if (!index_iter_->Valid()) {
@@ -2216,20 +2205,12 @@ template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::Next() {
   assert(block_iter_points_to_real_block_);
   block_iter_.Next();
-  // Advanced one entry within the current data block. Keep the in-block
-  // slot ordinal in lock-step so the death-map value filter stays aligned
-  // with the builder's per-Add slot ids. FindKeyForward() resets the slot
-  // to 0 whenever it steps to a new block.
-  if (current_data_block_id_valid_) {
-    ++current_slot_id_;
-  }
   FindKeyForward();
 }
 
 template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::Prev() {
   assert(block_iter_points_to_real_block_);
-  DisableGcBlockSkip();
   block_iter_.Prev();
   FindKeyBackward();
 }
@@ -2250,21 +2231,6 @@ BlockBasedTableIteratorBase<TBlockIter, TValue>::InitDataBlock() {
       ResetDataIter();
     }
     auto* rep = table_->get_rep();
-
-    if (gc_forward_scan_mode_ && current_data_block_id_valid_ &&
-        GcBlockSkipEnabled() &&
-        gc_block_skip_ctx_.is_block_dead(gc_block_skip_ctx_.arg,
-                                         gc_block_skip_ctx_.file_number,
-                                         current_data_block_id_)) {
-      if (gc_block_skip_ctx_.skipped_blocks != nullptr) {
-        ++*gc_block_skip_ctx_.skipped_blocks;
-      }
-      if (gc_block_skip_ctx_.skipped_bytes != nullptr) {
-        *gc_block_skip_ctx_.skipped_bytes +=
-            data_block_handle.size() + kBlockTrailerSize;
-      }
-      return InitDataBlockResult::kSkipped;
-    }
 
     // Automatically prefetch additional data when a range scan (iterator) does
     // more than 2 sequential IOs. This is enabled only for user reads and when
@@ -2301,10 +2267,6 @@ BlockBasedTableIteratorBase<TBlockIter, TValue>::InitDataBlock() {
         key_includes_seq_, index_key_is_full_,
         /* get_context */ nullptr, s, prefetch_buffer_.get());
     block_iter_points_to_real_block_ = true;
-    if (gc_forward_scan_mode_ && GcBlockSkipEnabled() &&
-        gc_block_skip_ctx_.read_blocks != nullptr) {
-      ++*gc_block_skip_ctx_.read_blocks;
-    }
   }
   return InitDataBlockResult::kLoaded;
 }
@@ -2317,22 +2279,6 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyForward() {
   while (true) {
     if (block_iter_points_to_real_block_) {
       if (block_iter_.Valid()) {
-        // Death-map value filter: inside a partially-live data block,
-        // skip individual entries that the death map proves are dead so
-        // GC never relocates them. Only active during a GC forward scan;
-        // user-facing iteration leaves block contents untouched.
-        if (gc_forward_scan_mode_ && current_data_block_id_valid_ &&
-            GcValueSkipEnabled() &&
-            gc_block_skip_ctx_.is_value_dead(
-                gc_block_skip_ctx_.arg, gc_block_skip_ctx_.file_number,
-                current_data_block_id_, current_slot_id_)) {
-          if (gc_block_skip_ctx_.skipped_slots != nullptr) {
-            ++*gc_block_skip_ctx_.skipped_slots;
-          }
-          block_iter_.Next();
-          ++current_slot_id_;
-          continue;
-        }
         break;
       }
       if (!block_iter_.status().ok()) {
@@ -2344,10 +2290,6 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyForward() {
       // so for code simplicity, we removed it. We can add it back if there is
       // a significant performance regression.
       index_iter_->Next();
-      if (current_data_block_id_valid_) {
-        ++current_data_block_id_;
-        current_slot_id_ = 0;
-      }
     }
 
     if (!index_iter_->Valid()) {
@@ -2358,19 +2300,7 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyForward() {
     if (r == InitDataBlockResult::kInvalid) {
       return;
     }
-    if (r == InitDataBlockResult::kSkipped) {
-      index_iter_->Next();
-      if (current_data_block_id_valid_) {
-        ++current_data_block_id_;
-        current_slot_id_ = 0;
-      }
-      continue;
-    }
     block_iter_.SeekToFirst();
-    // First entry of a freshly loaded data block: slot ordinal resets.
-    if (current_data_block_id_valid_) {
-      current_slot_id_ = 0;
-    }
   }
 
   // Check upper bound on the current key
@@ -2414,8 +2344,7 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyBackward() {
 
 InternalIterator* BlockBasedTable::NewIterator(
     const ReadOptions& read_options, const SliceTransform* prefix_extractor,
-    Arena* arena, bool skip_filters, bool for_compaction,
-    const BlobGcBlockSkipContext* blob_gc_block_skip_context) {
+    Arena* arena, bool skip_filters, bool for_compaction) {
   bool need_upper_bound_check =
       PrefixExtractorChanged(&rep_->table_properties_base, prefix_extractor);
   const bool kIsNotIndex = false;
@@ -2430,7 +2359,7 @@ InternalIterator* BlockBasedTable::NewIterator(
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
         true /*key_includes_seq*/, true /*index_key_is_full*/,
-        for_compaction, blob_gc_block_skip_context);
+        for_compaction);
   } else {
     auto* mem = arena->AllocateAligned(
         sizeof(BlockBasedTableIterator<DataBlockIter, LazyBuffer>));
@@ -2441,7 +2370,7 @@ InternalIterator* BlockBasedTable::NewIterator(
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
         true /*key_includes_seq*/, true /*index_key_is_full*/,
-        for_compaction, blob_gc_block_skip_context);
+        for_compaction);
   }
 }
 

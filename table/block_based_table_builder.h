@@ -57,14 +57,6 @@ class BlockBasedTableBuilder : public TableBuilder {
   // REQUIRES: Finish(), Abandon() have not been called
   Status Add(const Slice& key, const LazyBuffer& value) override;
 
-  // vSST data-block-level live bitmap support: BlockBasedTableBuilder
-  // tracks the data block ordinal each entry is appended to.
-  bool SupportsDataBlockId() const override { return true; }
-  uint64_t LastAddedDataBlockId() const override {
-    return last_added_data_block_id_;
-  }
-  uint64_t LastAddedSlotId() const override { return last_added_slot_id_; }
-
   Status AddTombstone(const Slice& key, const LazyBuffer& value) override;
 
   // Finish building the table.  Stops using the file passed to the
@@ -124,22 +116,6 @@ class BlockBasedTableBuilder : public TableBuilder {
   class BlockBasedTablePropertiesCollectorFactory;
   class BlockBasedTablePropertiesCollector;
   Rep* rep_;
-
-  // 0-based data block ordinal that the entry written by the most
-  // recent Add() was appended to. kNoBlockId before any Add().
-  uint64_t last_added_data_block_id_ = static_cast<uint64_t>(-1);
-
-  // 0-based in-block slot ordinal (entry index within the current data
-  // block) of the entry written by the most recent Add(). Reset to 0
-  // when a data block is sealed by Flush(). kNoSlotId before any Add().
-  uint64_t last_added_slot_id_ = static_cast<uint64_t>(-1);
-  uint64_t next_slot_id_ = 0;
-
-  // Number of entries in each sealed data block, indexed by data block
-  // ordinal. Populated only when the blob death log feature is on for
-  // this CF. Carried into TableProperties::data_block_entry_counts in
-  // Finish(). Empty otherwise (feature off / not a death-log SST).
-  std::vector<uint32_t> data_block_entry_counts_;
 
   // Advanced operation: flush any buffered key/value pairs to file.
   // Can be used to ensure that two adjacent entries never live in

@@ -96,14 +96,6 @@ struct TablePropertyCache {
   float read_amp = 1;                  // expt read amp from sst
   std::vector<Dependence> dependence;  // make these sst hidden
   std::vector<uint64_t> inheritance;   // inheritance set
-  // Number of entries in each BlockBasedTable data block, indexed by the
-  // data block ordinal. Populated only for blob (vSST) BlockBasedTables
-  // when the blob death log feature is enabled; used by the GC death-map
-  // fast path to decide when a data block is entirely dead. Empty for
-  // legacy/map SSTs and when the feature is off. Persisted in the SST
-  // property block and the manifest; decodes as empty for old manifests,
-  // which transparently disables the fast path.
-  std::vector<uint32_t> data_block_entry_counts;
   uint64_t earliest_time_begin_compact = port::kMaxUint64;
   uint64_t latest_time_end_compact = port::kMaxUint64;
 

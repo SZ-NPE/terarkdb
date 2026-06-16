@@ -144,21 +144,6 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_WHOLE_FILE_DELETE, "rocksdb.num.gc.whole_file_delete"},
     {GC_WHOLE_FILE_DELETE_BYTES, "rocksdb.bytes.gc.whole_file_delete"},
     {GC_REWRITE_BLOB_BYTES, "rocksdb.bytes.gc.rewrite_blob"},
-    {BLOB_DEATH_RECORDS_EMITTED, "rocksdb.num.blob_death.records_emitted"},
-    {BLOB_DEATH_RECORDS_APPLIED, "rocksdb.num.blob_death.records_applied"},
-    {GC_DEATHMAP_CANDIDATE_VSST, "rocksdb.num.gc.deathmap_candidate_vsst"},
-    {GC_DEATHMAP_SKIPPED_DEAD_BLOCKS,
-     "rocksdb.num.gc.deathmap_skipped_dead_blocks"},
-    {GC_DEATHMAP_SKIPPED_DEAD_BLOCK_BYTES,
-     "rocksdb.bytes.gc.deathmap_skipped_dead_block"},
-    {GC_DEATHMAP_PARTIAL_LIVE_BLOCK_BYTES,
-     "rocksdb.bytes.gc.deathmap_partial_live_block"},
-    {GC_DEATHMAP_GETKEY_AVOIDED, "rocksdb.num.gc.deathmap_getkey_avoided"},
-    {GC_DEATHMAP_FALLBACK_GETKEY, "rocksdb.num.gc.deathmap_fallback_getkey"},
-    {GC_DEATHMAP_UNAVAILABLE_FALLBACK,
-     "rocksdb.num.gc.deathmap_unavailable_fallback"},
-    {GC_DEATHMAP_LAYOUT_MISMATCH_FALLBACK,
-     "rocksdb.num.gc.deathmap_layout_mismatch_fallback"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

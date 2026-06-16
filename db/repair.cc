@@ -673,10 +673,6 @@ class Repairer {
       t->meta.prop.max_read_amp = props->max_read_amp;
       t->meta.prop.read_amp = props->read_amp;
       t->meta.prop.dependence = props->dependence;
-      // reinflate per-data-block entry counts from the SST property
-      // block when present. Empty means the GC death-map fast path
-      // falls back for this file.
-      t->meta.prop.data_block_entry_counts = props->data_block_entry_counts;
       t->meta.prop.inheritance = InheritanceTreeToSet(props->inheritance_tree);
     }
     return status;

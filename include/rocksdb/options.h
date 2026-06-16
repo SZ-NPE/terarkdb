@@ -334,45 +334,6 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Use byte-precise garbage ratio when metadata is available.
   bool precise_gc = false;
 
-  // Enable the blob death log / death-map GC fast path. When true, old
-  // ValueIndex entries that are dropped/overwritten during compaction have
-  // their physical vSST death location (block_id + slot_id) recorded into an
-  // in-memory BlobDeathLog. Blob GC then builds a per-vSST death map to skip
-  // fully-dead data blocks and avoid GetKey() reverse lookups for records
-  // proven dead. When false the system fully degrades to the legacy
-  // GetKey()-based GC path and writes legacy value indexes.
-  // Default: false
-  bool enable_blob_death_log = false;
-
-  // Whether to persist the death log (per-vSST append-only sidecar). The
-  // POC keeps the death log in memory only; this is reserved for the
-  // persistence work and currently has no effect.
-  // Default: false
-  bool blob_death_log_persist = false;
-
-  // Soft memory budget (bytes) for the in-memory death record buffer.
-  // Default: 64MB
-  uint64_t blob_death_log_buffer_size = 64 << 20;
-
-  // Whether GC physically skips reading vSST data blocks that the death
-  // map proves are entirely dead. Only meaningful when enable_blob_death_log
-  // is true. Default: false (follows the master switch in db_bench).
-  bool blob_gc_skip_dead_blocks = false;
-
-  // Whether GC skips the GetKey() reverse lookup for records whose liveness
-  // can be decided directly from a complete death map. Only meaningful when
-  // enable_blob_death_log is true. Default: false.
-  bool blob_gc_skip_getkey_with_deathmap = false;
-
-  // Debug mode: when true GC also runs the GetKey() lookup alongside the
-  // death-map verdict and asserts they agree, to validate correctness.
-  // Default: false
-  bool blob_death_log_debug_check = false;
-
-  // Whether to print death-log / death-map GC statistics to the info log.
-  // Default: false
-  bool blob_death_log_stats = false;
-
   // Blob file size
   // Default : same as bottommost level sst file size
   uint64_t target_blob_file_size = 0;

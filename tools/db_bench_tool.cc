@@ -998,27 +998,6 @@ DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
 DEFINE_bool(precise_gc, false,
             "Enable byte-precise garbage ratio calculation for blob GC");
 
-DEFINE_bool(enable_blob_death_log, false,
-            "Master switch for the blob death log / death-map GC fast path");
-
-DEFINE_bool(blob_death_log_persist, false,
-            "Persist the death log (reserved; in-memory only in the POC)");
-
-DEFINE_uint64(blob_death_log_buffer_size, 64 << 20,
-              "Soft memory budget (bytes) for the in-memory death buffer");
-
-DEFINE_bool(blob_gc_skip_dead_blocks, false,
-            "Skip reading vSST data blocks proven entirely dead during GC");
-
-DEFINE_bool(blob_gc_skip_getkey_with_deathmap, false,
-            "Skip GetKey() reverse lookups when a complete death map exists");
-
-DEFINE_bool(blob_death_log_debug_check, false,
-            "Cross-check death-map verdicts against GetKey() (debug only)");
-
-DEFINE_bool(blob_death_log_stats, false,
-            "Print death-log / death-map GC statistics to the info log");
-
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
 DEFINE_uint64(blob_file_defragment_size, 0, "Blob file defragment threshold");
@@ -3626,14 +3605,6 @@ class Benchmark {
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;
-    options.enable_blob_death_log = FLAGS_enable_blob_death_log;
-    options.blob_death_log_persist = FLAGS_blob_death_log_persist;
-    options.blob_death_log_buffer_size = FLAGS_blob_death_log_buffer_size;
-    options.blob_gc_skip_dead_blocks = FLAGS_blob_gc_skip_dead_blocks;
-    options.blob_gc_skip_getkey_with_deathmap =
-        FLAGS_blob_gc_skip_getkey_with_deathmap;
-    options.blob_death_log_debug_check = FLAGS_blob_death_log_debug_check;
-    options.blob_death_log_stats = FLAGS_blob_death_log_stats;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;

@@ -784,101 +784,9 @@ struct ParsedInternalKeyComparator {
   const InternalKeyComparator* cmp;
 };
 
-// Physical death/live location of a separated value, decoded from the
-// block-aware value-index trailer. `valid()` is true only when all
-// fields were decoded from a well-formed v2 trailer; otherwise the
-// caller must fall back to the legacy GetKey()-based path. The blob
-// death log records ValueLocation(s) of overwritten/dropped values.
-struct ValueLocation {
-  uint64_t file_number = static_cast<uint64_t>(-1);  // vSST logical fn
-  uint64_t layout_id = static_cast<uint64_t>(-1);    // physical vSST fn
-  uint64_t block_id = static_cast<uint64_t>(-1);     // data block ordinal
-  uint64_t slot_id = static_cast<uint64_t>(-1);      // in-block entry ordinal
-
-  bool valid() const {
-    return file_number != static_cast<uint64_t>(-1) &&
-           layout_id != static_cast<uint64_t>(-1) &&
-           block_id != static_cast<uint64_t>(-1) &&
-           slot_id != static_cast<uint64_t>(-1);
-  }
-};
-
 class SeparateHelper {
  public:
   virtual ~SeparateHelper() = default;
-
-  // ---------------------------------------------------------------
-  // Value-index encoding
-  //
-  // Legacy layout (backward compatible):
-  //   [ file_number(8B, LE) ] [ meta(M bytes, optional) ]
-  //
-  // block-aware layout (opt-in, fixed-length trailer):
-  //   [ file_number(8B, LE) ] [ meta(M bytes, optional) ]
-  //   [ block_id(fixed64) ] [ layout_id(fixed64) ]
-  //   [ version(1B) ] [ kBlockIdTrailerMagic(1B) ]
-  //
-  // The trailer is exactly kBlockIdTrailerLength (18) bytes. There is
-  // NO backwards varint scan: validity is decided purely by the fixed
-  // size + magic + version + non-sentinel checks. This eliminates the
-  // ambiguity of the previous reverse-varint-scan scheme.
-  //
-  // `block_id`   : the BlockBasedTable data block ordinal the value was
-  //                written into, *within the vSST layout identified by
-  //                layout_id*.
-  // `layout_id`  : the physical vSST file number the block_id is bound
-  //                to (i.e. blob_meta->fd.GetNumber() at write time).
-  //                A reader must reject a block_id whose layout_id does
-  //                not match the current physical vSST file, because a
-  //                vSST GC rewrite produces a brand-new layout and the
-  //                old block_id no longer addresses the same bytes.
-  //
-  // Contract:
-  //  - EncodeFileNumber / DecodeFileNumber / DecodeValueMeta behave
-  //    identically for both layouts (they operate on the head only).
-  //  - HasBlockId / DecodeBlockId / DecodeBlockLayoutId are the only
-  //    readers that must know about the new layout. Any slice that does
-  //    not match the new layout is transparently treated as legacy.
-  //  - Writers only emit the trailer when the feature switch is on;
-  //    readers that are unaware of the trailer will see a safe legacy
-  //    view through DecodeValueMeta, because the trailer bytes are
-  //    appended after the original meta and the old callers never
-  //    inspect the tail (they parse meta by a user-owned length).
-  // ---------------------------------------------------------------
-
-  // Sentinel value for DecodeBlockId on slices that do not carry a
-  // block-id trailer. Callers in the GC path treat this as
-  // "block id unavailable" and fall back to the legacy scan/lookup path.
-  static constexpr uint64_t kNoBlockId = static_cast<uint64_t>(-1);
-
-  // Sentinel value for DecodeBlockLayoutId. Same meaning: "no layout id
-  // available", treat the index as legacy.
-  static constexpr uint64_t kNoBlockLayoutId = static_cast<uint64_t>(-1);
-
-  // Sentinel value for DecodeSlotId. "no slot id available".
-  static constexpr uint64_t kNoSlotId = static_cast<uint64_t>(-1);
-
-  // Magic byte appended at the very tail of a block-aware value index.
-  // Chosen as an UTF-8 invalid leading byte to minimize accidental
-  // collision with extractor-produced meta tails. Format correctness
-  // is still finally arbitrated by the fixed length + version checks.
-  static constexpr uint8_t kBlockIdTrailerMagic = 0xC1;
-
-  // Trailer format versions. Readers reject trailers whose version they
-  // do not understand and fall back to the legacy path.
-  //   v1: [ block_id(8) ][ layout_id(8) ][ version(1) ][ magic(1) ]
-  //   v2: [ block_id(8) ][ layout_id(8) ][ slot_id(8) ][ version(1) ][ magic(1) ]
-  // v2 adds the in-block slot ordinal needed by the blob death log.
-  static constexpr uint8_t kBlockIndexVersion = 1;
-  static constexpr uint8_t kBlockIndexVersionWithSlot = 2;
-
-  // Fixed trailer lengths in bytes.
-  //   v1: block_id(8) + layout_id(8) + version(1) + magic(1) = 18.
-  //   v2: block_id(8) + layout_id(8) + slot_id(8) + version(1) + magic(1) = 26.
-  static constexpr size_t kBlockIdTrailerLength =
-      sizeof(uint64_t) + sizeof(uint64_t) + 2;
-  static constexpr size_t kBlockIdTrailerLengthV2 =
-      sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t) + 2;
 
   static Slice EncodeFileNumber(uint64_t& file_number) {
     if (!port::kLittleEndian) {
@@ -901,64 +809,10 @@ class SeparateHelper {
                  slice.size() - sizeof(uint64_t));
   }
 
-  // Append a block-id trailer to an already-encoded value-index slice.
-  // Caller provides the current encoded head in *dst (which must start
-  // with file_number and optional meta). When `slot_id == kNoSlotId` a
-  // v1 trailer is written (block_id + layout_id), otherwise a v2 trailer
-  // that additionally carries the in-block slot ordinal.
-  static void EncodeBlockIdTrailer(std::string* dst, uint64_t block_id,
-                                   uint64_t layout_id,
-                                   uint64_t slot_id = kNoSlotId);
-
-  // Returns true iff slice carries a well-formed (v1 or v2) block-id
-  // trailer. Does NOT mutate slice.
-  static bool HasBlockId(const Slice& slice);
-
-  // Returns the decoded block_id, or kNoBlockId if slice does not
-  // carry a well-formed block-id trailer. A kNoBlockId return value
-  // means the caller must treat this index as "block id unavailable"
-  // and fall back to the legacy GC path.
-  static uint64_t DecodeBlockId(const Slice& slice);
-
-  // Returns the decoded layout_id (the physical vSST file number the
-  // block_id is bound to), or kNoBlockLayoutId if slice does not carry
-  // a well-formed block-id trailer.
-  static uint64_t DecodeBlockLayoutId(const Slice& slice);
-
-  // Returns the decoded slot_id (the in-block entry ordinal), or
-  // kNoSlotId when slice carries no trailer or only a v1 trailer.
-  static uint64_t DecodeSlotId(const Slice& slice);
-
-  // Decode the full physical location of the separated value from the
-  // value-index slice. `out->file_number` is always the decoded head
-  // file number; the trailer fields are filled when present. Returns
-  // true iff the slice carried a well-formed v2 trailer (out->valid()).
-  static bool DecodeValueLocation(const Slice& slice, ValueLocation* out);
-
-  // Helper for readers that want meta without the trailer. Returns the
-  // meta region with the fixed trailer bytes removed when the trailer
-  // is complete and legal; otherwise returns DecodeValueMeta(slice)
-  // unchanged (legacy meta view).
-  static Slice DecodeValueMetaStripBlockId(const Slice& slice);
-
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                 uint64_t file_number, const Slice& meta,
                                 bool is_merge, bool is_index,
                                 const ValueExtractor* value_meta_extractor);
-
-  // Overload that additionally appends a block-id trailer to the
-  // encoded value-index when `block_id != kNoBlockId` and
-  // `layout_id != kNoBlockLayoutId`. When either is its sentinel,
-  // behavior is bit-for-bit identical to the legacy overload above.
-  // When `slot_id != kNoSlotId` a v2 trailer (with slot) is written.
-  // This is the single entry point used by flush/compaction writers
-  // once the block-aware value-index format is enabled.
-  static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
-                                uint64_t file_number, const Slice& meta,
-                                bool is_merge, bool is_index,
-                                const ValueExtractor* value_meta_extractor,
-                                uint64_t block_id, uint64_t layout_id,
-                                uint64_t slot_id = kNoSlotId);
 
   virtual Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                  const Slice& meta, bool is_merge,

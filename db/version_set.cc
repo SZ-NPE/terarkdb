@@ -505,9 +505,7 @@ class LevelIterator final : public InternalIterator, public Snapshot {
                 const SliceTransform* prefix_extractor, bool should_sample,
                 HistogramImpl* file_read_hist, bool for_compaction,
                 bool skip_filters, int level,
-                RangeDelAggregator* range_del_agg,
-                const BlobGcBlockSkipContext* blob_gc_block_skip_context =
-                    nullptr)
+                RangeDelAggregator* range_del_agg)
       : table_cache_(table_cache),
         read_options_(read_options),
         snapshot_(0),
@@ -522,8 +520,7 @@ class LevelIterator final : public InternalIterator, public Snapshot {
         skip_filters_(skip_filters),
         file_index_(flevel_->num_files),
         level_(level),
-        range_del_agg_(range_del_agg),
-        blob_gc_block_skip_context_(blob_gc_block_skip_context) {
+        range_del_agg_(range_del_agg) {
     // Empty level is not supported.
     assert(flevel_ != nullptr && flevel_->num_files > 0);
     if (read_options_.snapshot != nullptr) {
@@ -584,8 +581,7 @@ class LevelIterator final : public InternalIterator, public Snapshot {
         read_options_, env_options_, *file_meta.file_metadata, dependence_map_,
         range_del_agg_, prefix_extractor_,
         nullptr /* don't need reference to table */, file_read_hist_,
-        for_compaction_, nullptr /* arena */, skip_filters_, level_,
-        blob_gc_block_skip_context_);
+        for_compaction_, nullptr /* arena */, skip_filters_, level_);
   }
 
   TableCache* table_cache_;
@@ -605,7 +601,6 @@ class LevelIterator final : public InternalIterator, public Snapshot {
   size_t file_index_;
   int level_;
   RangeDelAggregator* range_del_agg_;
-  const BlobGcBlockSkipContext* blob_gc_block_skip_context_;
   IteratorWrapper file_iter_;  // May be nullptr
 };
 
@@ -4664,8 +4659,7 @@ void VersionSet::AddLiveFiles(std::vector<FileDescriptor>* live_list) {
 
 InternalIterator* VersionSet::MakeInputIterator(
     const Compaction* c, RangeDelAggregator* range_del_agg,
-    const EnvOptions& env_options_compactions,
-    const BlobGcBlockSkipContext* blob_gc_block_skip_context) {
+    const EnvOptions& env_options_compactions) {
   auto cfd = c->column_family_data();
   ReadOptions read_options;
   read_options.verify_checksums = true;
@@ -4697,8 +4691,7 @@ InternalIterator* VersionSet::MakeInputIterator(
               nullptr /* table_reader_ptr */,
               nullptr /* no per level latency histogram */,
               true /* for_compaction */, nullptr /* arena */,
-              false /* skip_filters */, c->level(which) /* level */,
-              blob_gc_block_skip_context);
+              false /* skip_filters */, c->level(which) /* level */);
         }
       } else {
         // Create concatenating iterator for the files from this level
@@ -4709,8 +4702,7 @@ InternalIterator* VersionSet::MakeInputIterator(
             false /* should_sample */,
             nullptr /* no per level latency histogram */,
             true /* for_compaction */, false /* skip_filters */,
-            static_cast<int>(which) /* level */, range_del_agg,
-            blob_gc_block_skip_context);
+            static_cast<int>(which) /* level */, range_del_agg);
       }
     }
   }

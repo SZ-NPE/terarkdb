@@ -429,15 +429,6 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
 
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
-  // The entry was just appended to the currently in-progress data
-  // block. Flushed (sealed) blocks have already incremented
-  // r->props.num_data_blocks, so the in-progress block's 0-based
-  // ordinal equals the current num_data_blocks value.
-  last_added_data_block_id_ = r->props.num_data_blocks;
-  // In-block slot ordinal: the entry index within the current
-  // in-progress data block. Flush() resets next_slot_id_ to 0 when it
-  // seals a block, so the first entry of every block gets slot 0.
-  last_added_slot_id_ = next_slot_id_++;
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
@@ -487,14 +478,6 @@ void BlockBasedTableBuilder::Flush() {
   }
   r->props.data_size = r->offset;
   ++r->props.num_data_blocks;
-  // A data block was just sealed. Record how many entries it held so
-  // the GC death-map fast path can decide when the block is entirely
-  // dead, then reset the in-block slot counter for the next block.
-  // Gated on the feature switch so default-off builds are unchanged.
-  if (r->moptions.enable_blob_death_log) {
-    data_block_entry_counts_.push_back(static_cast<uint32_t>(next_slot_id_));
-  }
-  next_slot_id_ = 0;
 }
 
 void BlockBasedTableBuilder::WriteBlock(BlockBuilder* block,
@@ -908,10 +891,6 @@ Status BlockBasedTableBuilder::Finish(
     r->props.read_amp = prop->read_amp;
     r->props.dependence = prop->dependence;
   }
-  // Hand the per-data-block entry counts collected during Flush() to
-  // TableProperties so they get persisted. Empty when the feature is
-  // off, leaving the property block bit-for-bit identical to before.
-  r->props.data_block_entry_counts = std::move(data_block_entry_counts_);
   if (snapshots != nullptr) {
     r->props.snapshots = *snapshots;
   }
