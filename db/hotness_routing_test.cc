@@ -285,6 +285,28 @@ const Env::WriteLifeTimeHint* FindHintByBasename(
   return nullptr;
 }
 
+std::string BlobValue(const std::string& tag) {
+  return tag + std::string(256, 'x');
+}
+
+void CollectSstHints(TrackHintEnv* track_env, bool* found_short,
+                     bool* found_medium) {
+  *found_short = false;
+  *found_medium = false;
+  MutexLock l(&track_env->mutex_);
+  for (const auto& pair : track_env->file_hints_) {
+    if (pair.first.find(".sst") == std::string::npos) {
+      continue;
+    }
+    if (pair.second == Env::WLTH_SHORT) {
+      *found_short = true;
+    }
+    if (pair.second == Env::WLTH_MEDIUM) {
+      *found_medium = true;
+    }
+  }
+}
+
 void TrackHintWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
   {
     MutexLock l(&env_->mutex_);
@@ -321,14 +343,14 @@ TEST_F(AdaptiveHotnessRoutingTest, RepeatedWritesRouteToHotBlob) {
   // Hot keys: written 3 times each (two overwrites -> score reaches threshold).
   for (int i = 0; i < 8; ++i) {
     std::string key = "hot" + std::to_string(i);
-    ASSERT_OK(Put(key, "v1"));
-    ASSERT_OK(Put(key, "v2"));
-    ASSERT_OK(Put(key, "v3"));
+    ASSERT_OK(Put(key, BlobValue("v1")));
+    ASSERT_OK(Put(key, BlobValue("v2")));
+    ASSERT_OK(Put(key, BlobValue("v3")));
   }
   // Cold keys: written once.
   for (int i = 0; i < 8; ++i) {
     std::string key = "cold" + std::to_string(i);
-    ASSERT_OK(Put(key, "v1"));
+    ASSERT_OK(Put(key, BlobValue("v1")));
   }
 
   {
@@ -340,22 +362,12 @@ TEST_F(AdaptiveHotnessRoutingTest, RepeatedWritesRouteToHotBlob) {
 
   bool found_short = false;
   bool found_medium = false;
-  {
-    MutexLock l(&track_env.mutex_);
-    for (const auto& pair : track_env.file_hints_) {
-      if (pair.first.find(".blob") == std::string::npos) {
-        continue;
-      }
-      if (pair.second == Env::WLTH_SHORT) found_short = true;
-      if (pair.second == Env::WLTH_MEDIUM) found_medium = true;
-    }
-  }
+  CollectSstHints(&track_env, &found_short, &found_medium);
 
   // Hot keys produce a short-lived blob; cold keys produce a medium blob.
+  Close();
   ASSERT_TRUE(found_short);
   ASSERT_TRUE(found_medium);
-
-  Close();
 }
 
 // With the hotness tracker disabled the DB must behave exactly as before:
@@ -372,8 +384,8 @@ TEST_F(AdaptiveHotnessRoutingTest, DisabledTrackerBehavesNormally) {
 
   for (int i = 0; i < 8; ++i) {
     std::string key = "k" + std::to_string(i);
-    ASSERT_OK(Put(key, "v1"));
-    ASSERT_OK(Put(key, "v2"));
+    ASSERT_OK(Put(key, BlobValue("v1")));
+    ASSERT_OK(Put(key, BlobValue("v2")));
   }
 
   Flush();
@@ -382,10 +394,62 @@ TEST_F(AdaptiveHotnessRoutingTest, DisabledTrackerBehavesNormally) {
     std::string key = "k" + std::to_string(i);
     std::string value;
     ASSERT_OK(db_->Get(ReadOptions(), key, &value));
-    ASSERT_EQ(value, "v2");
+    ASSERT_EQ(value, BlobValue("v2"));
   }
 
   Close();
+}
+
+// Compaction feedback should mark overwrite-heavy keys as hot even when the
+// write-window signal is disabled. This proves the hot-key record path in
+// CompactionIterator feeds into the next flush routing decision.
+TEST_F(AdaptiveHotnessRoutingTest, CompactionFeedbackRoutesNextFlushToHotBlob) {
+  TrackHintEnv track_env(env_);
+  Options options = CurrentOptions();
+  options.env = &track_env;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+
+  options.blob_size = 0;
+  options.enable_hotness_tracker = true;
+  options.hotness_window_capacity = 1 << 20;
+  options.hotness_enable_write_window = false;
+  options.hotness_enable_compaction_feedback = true;
+  options.hotness_sketch_width = 4096;
+  options.hotness_sketch_depth = 4;
+  options.hotness_write_repeat_weight = 1;
+  options.hotness_compaction_feedback_weight = 2;
+  options.hotness_threshold = 2;
+  options.hotness_decay_interval = 0;
+  options.hotness_half_life_writes = 0;
+  options.target_blob_file_size = 10 * 1024;
+
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("compaction_hot", BlobValue("old_value")));
+  Flush();
+  ASSERT_OK(Put("compaction_hot", BlobValue("new_value")));
+  Flush();
+
+  CompactRangeOptions compact_options;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  {
+    MutexLock l(&track_env.mutex_);
+    track_env.file_hints_.clear();
+  }
+
+  ASSERT_OK(Put("compaction_hot", BlobValue("after_feedback")));
+  ASSERT_OK(Put("still_cold", BlobValue("single_write")));
+  Flush();
+
+  bool found_short = false;
+  bool found_medium = false;
+  CollectSstHints(&track_env, &found_short, &found_medium);
+
+  Close();
+  ASSERT_TRUE(found_short);
+  ASSERT_TRUE(found_medium);
 }
 
 // fifo_cache.cc 独立单元测试
