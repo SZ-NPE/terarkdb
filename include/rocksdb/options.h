@@ -322,27 +322,6 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Enable compaction obsolete-version feedback for HotnessTracker.
   bool hotness_enable_compaction_feedback = true;
 
-  // Count-min sketch width used by the hotness table.
-  uint64_t hotness_sketch_width = 1ULL << 22;
-
-  // Count-min sketch depth used by the hotness table.
-  uint32_t hotness_sketch_depth = 4;
-
-  // Hotness increment when the write window observes a repeated key.
-  uint32_t hotness_write_repeat_weight = 1;
-
-  // Hotness increment when compaction drops an obsolete version.
-  uint32_t hotness_compaction_feedback_weight = 2;
-
-  // Minimum estimated hotness score for routing a key to hot vSST.
-  uint32_t hotness_threshold = 2;
-
-  // Number of writes between hotness decay operations. 0 disables decay.
-  uint64_t hotness_decay_interval = 1000000;
-
-  // Half-life in writes for decayed hotness scores. 0 disables decay.
-  uint64_t hotness_half_life_writes = 6500000;
-
   // Don't separate Value if key.size > value.size * blob_large_key_ratio
   // valid [0 , 1]
   double blob_large_key_ratio = 0.25;

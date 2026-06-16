@@ -235,6 +235,22 @@ void CompactionIterator::MaybeRecordBlobDeath() {
   }
 }
 
+void CompactionIterator::MaybeRecordDroppedKey() {
+  MaybeRecordDroppedKey(ikey_);
+}
+
+void CompactionIterator::MaybeRecordDroppedKey(const ParsedInternalKey& ikey) {
+  if (hotness_tracker_ == nullptr) {
+    return;
+  }
+  // Only separated values carry a vSST record that blob GC reverse-looks-up
+  // via GetKey(). Inline values are never recorded.
+  if (ikey.type != kTypeValueIndex && ikey.type != kTypeMergeIndex) {
+    return;
+  }
+  hotness_tracker_->RecordCompactionFeedback(ikey.user_key, ikey.sequence);
+}
+
 void CompactionIterator::ResetRecordCounts() {
   iter_stats_.num_record_drop_user = 0;
   iter_stats_.num_record_drop_hidden = 0;
@@ -569,6 +585,7 @@ void CompactionIterator::NextFromInput() {
 
             ++iter_stats_.num_record_drop_hidden;
             ++iter_stats_.num_record_drop_obsolete;
+            MaybeRecordDroppedKey(next_ikey);
             // Already called input_->Next() once.  Call it a second time to
             // skip past the second key.
             input_->Next();
@@ -637,10 +654,10 @@ void CompactionIterator::NextFromInput() {
       // This old version is confirmed dead: it is hidden by a newer version of
       // the same user key. Report it as overwrite feedback so the hotness
       // tracker can route this overwrite-heavy key to the hot vSST on the next
-      // flush. This is purely advisory and does not alter compaction output.
-      if (hotness_tracker_ != nullptr) {
-        hotness_tracker_->RecordCompactionFeedback(ikey_.user_key);
-      }
+      // flush, and record (user_key, sequence) into the drop-key cache so blob
+      // GC can skip the GetKey() reverse lookup for this exact version. This is
+      // purely advisory and does not alter compaction output.
+      MaybeRecordDroppedKey();
       // This old version is confirmed dead (hidden by a newer version):
       // record its physical vSST death location for the blob GC fast path.
       MaybeRecordBlobDeath();
@@ -695,6 +712,7 @@ void CompactionIterator::NextFromInput() {
               (snapshot_checker_ != nullptr &&
                UNLIKELY(!snapshot_checker_->IsInSnapshot(next_ikey.sequence,
                                                          prev_snapshot))))) {
+        MaybeRecordDroppedKey(next_ikey);
         input_->Next();
       }
       // If you find you still need to output a row with this key, we need to
@@ -757,6 +775,7 @@ void CompactionIterator::NextFromInput() {
       if (should_delete) {
         ++iter_stats_.num_record_drop_hidden;
         ++iter_stats_.num_record_drop_range_del;
+        MaybeRecordDroppedKey();
         value_.reset();
         input_->Next();
       } else {

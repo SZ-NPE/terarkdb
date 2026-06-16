@@ -175,17 +175,6 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
       mutable_cf_options.hotness_enable_write_window;
   cf_opts.hotness_enable_compaction_feedback =
       mutable_cf_options.hotness_enable_compaction_feedback;
-  cf_opts.hotness_sketch_width = mutable_cf_options.hotness_sketch_width;
-  cf_opts.hotness_sketch_depth = mutable_cf_options.hotness_sketch_depth;
-  cf_opts.hotness_write_repeat_weight =
-      mutable_cf_options.hotness_write_repeat_weight;
-  cf_opts.hotness_compaction_feedback_weight =
-      mutable_cf_options.hotness_compaction_feedback_weight;
-  cf_opts.hotness_threshold = mutable_cf_options.hotness_threshold;
-  cf_opts.hotness_decay_interval =
-      mutable_cf_options.hotness_decay_interval;
-  cf_opts.hotness_half_life_writes =
-      mutable_cf_options.hotness_half_life_writes;
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
   cf_opts.precise_gc = mutable_cf_options.precise_gc;
@@ -1971,27 +1960,6 @@ std::unordered_map<std::string, OptionTypeInfo>
         {"hotness_enable_compaction_feedback",
          {offset_of(&ColumnFamilyOptions::hotness_enable_compaction_feedback),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_sketch_width",
-         {offset_of(&ColumnFamilyOptions::hotness_sketch_width),
-          OptionType::kUInt64T, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_sketch_depth",
-         {offset_of(&ColumnFamilyOptions::hotness_sketch_depth),
-          OptionType::kUInt32T, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_write_repeat_weight",
-         {offset_of(&ColumnFamilyOptions::hotness_write_repeat_weight),
-          OptionType::kUInt32T, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_compaction_feedback_weight",
-         {offset_of(&ColumnFamilyOptions::hotness_compaction_feedback_weight),
-          OptionType::kUInt32T, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_threshold",
-         {offset_of(&ColumnFamilyOptions::hotness_threshold),
-          OptionType::kUInt32T, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_decay_interval",
-         {offset_of(&ColumnFamilyOptions::hotness_decay_interval),
-          OptionType::kUInt64T, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_half_life_writes",
-         {offset_of(&ColumnFamilyOptions::hotness_half_life_writes),
-          OptionType::kUInt64T, OptionVerificationType::kNormal, false, 0}},
         {"blob_large_key_ratio",
          {offset_of(&ColumnFamilyOptions::blob_large_key_ratio),
           OptionType::kDouble, OptionVerificationType::kNormal, true,

@@ -990,32 +990,6 @@ DEFINE_bool(hotness_enable_write_window, true,
             "Enable write-window repeated-write feedback for HotnessTracker");
 DEFINE_bool(hotness_enable_compaction_feedback, true,
             "Enable compaction obsolete-version feedback for HotnessTracker");
-DEFINE_uint64(hotness_sketch_width, 1ULL << 22,
-              "Count-min sketch width for HotnessTracker");
-DEFINE_uint64(hotness_sketch_depth, 4,
-              "Count-min sketch depth for HotnessTracker");
-DEFINE_uint64(hotness_write_repeat_weight, 1,
-              "Hotness increment for repeated keys observed in write window");
-DEFINE_uint64(hotness_compaction_feedback_weight, 2,
-              "Hotness increment for obsolete versions found in compaction");
-DEFINE_uint64(hotness_threshold, 2,
-              "Minimum estimated hotness score for routing to hot vSST");
-DEFINE_uint64(hotness_decay_interval, 1000000,
-              "Number of writes between hotness decay operations; 0 disables");
-DEFINE_uint64(hotness_half_life_writes, 6500000,
-              "Hotness half-life measured in writes; 0 disables decay");
-static const bool FLAGS_hotness_sketch_depth_dummy
-    __attribute__((__unused__)) = RegisterFlagValidator(
-        &FLAGS_hotness_sketch_depth, &ValidateUint32Range);
-static const bool FLAGS_hotness_write_repeat_weight_dummy
-    __attribute__((__unused__)) = RegisterFlagValidator(
-        &FLAGS_hotness_write_repeat_weight, &ValidateUint32Range);
-static const bool FLAGS_hotness_compaction_feedback_weight_dummy
-    __attribute__((__unused__)) = RegisterFlagValidator(
-        &FLAGS_hotness_compaction_feedback_weight, &ValidateUint32Range);
-static const bool FLAGS_hotness_threshold_dummy
-    __attribute__((__unused__)) = RegisterFlagValidator(
-        &FLAGS_hotness_threshold, &ValidateUint32Range);
 
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
@@ -3649,16 +3623,6 @@ class Benchmark {
         FLAGS_hotness_enable_write_window;
     options.hotness_enable_compaction_feedback =
         FLAGS_hotness_enable_compaction_feedback;
-    options.hotness_sketch_width = FLAGS_hotness_sketch_width;
-    options.hotness_sketch_depth =
-        static_cast<uint32_t>(FLAGS_hotness_sketch_depth);
-    options.hotness_write_repeat_weight =
-        static_cast<uint32_t>(FLAGS_hotness_write_repeat_weight);
-    options.hotness_compaction_feedback_weight =
-        static_cast<uint32_t>(FLAGS_hotness_compaction_feedback_weight);
-    options.hotness_threshold = static_cast<uint32_t>(FLAGS_hotness_threshold);
-    options.hotness_decay_interval = FLAGS_hotness_decay_interval;
-    options.hotness_half_life_writes = FLAGS_hotness_half_life_writes;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;

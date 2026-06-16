@@ -1,31 +1,27 @@
 #pragma once
 
-#include <atomic>
-#include <cmath>
+#include <array>
 #include <cstdint>
 #include <memory>
 
 #include "cache/fifo_cache.h"
 #include "cache/sharded_cache.h"
+#include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/terark_namespace.h"
+#include "rocksdb/types.h"
 #include "util/hash.h"
+#include "util/mutexlock.h"
 
 namespace TERARKDB_NAMESPACE {
 
-// HotnessTracker estimates per-key write hotness so that a flush can route a
-// key to a hot or cold vSST. The estimation is built on three signals:
-//   1. A recent write window (a fixed-capacity FIFO set). A repeated write to a
-//      key that is still inside the window is considered an overwrite and
-//      contributes to the key's hotness.
-//   2. A Count-Min Sketch (CMS) that accumulates the hotness weights. The CMS
-//      keeps memory bounded regardless of the key cardinality.
-//   3. Optional compaction feedback: when a compaction confirms that an old
-//      version of a key was dropped, the key receives an additional weight.
-//
-// Hotness scores decay over time (measured in writes) so that historically hot
-// keys cool down when they stop being written.
+// HotnessTracker estimates per-key update hotness so that a flush can route a
+// key to a hot or cold vSST. The write path uses a FIFO recent-write window only
+// as an observation window. A repeated write inside that window promotes the key
+// into the hot LRU. Compaction feedback is stronger evidence: when compaction
+// drops an obsolete version, the key is promoted directly into the hot LRU.
+// Flush routing only consults the hot LRU.
 class HotnessTracker {
  public:
   enum class FlushRoute {
@@ -34,53 +30,78 @@ class HotnessTracker {
     kStable = 2,     // reserved, currently unused
   };
 
+  // Metadata stored as the value of every hot LRU entry. Membership in the
+  // hot LRU expresses the hot state (an entry is hot iff it is present). The
+  // optional drop-key acceleration data lives inside the entry so it shares
+  // the same user key bytes and the same LRU lifetime: when the entry is
+  // evicted its dropped sequences are dropped too, which is fine because the
+  // cache is purely opportunistic (a miss falls back to GetKey()).
+  struct HotEntry {
+    // Per-key upper bound on retained dropped sequences. Bounded so memory
+    // stays controlled; on overflow the oldest sequence is discarded. This
+    // can only cause a miss (fall back to GetKey()), never a false hit.
+    static constexpr size_t kMaxDroppedSeqs = 8;
+
+    mutable port::Mutex mu;
+    // Sequences of separated-value versions confirmed dead by compaction,
+    // in append order ([0] is oldest). Linear search; deduplicated.
+    std::array<SequenceNumber, kMaxDroppedSeqs> dropped_seqs;
+    size_t num_dropped_seqs = 0;
+
+    void AddDroppedSeq(SequenceNumber seq) {
+      MutexLock l(&mu);
+      for (size_t i = 0; i < num_dropped_seqs; ++i) {
+        if (dropped_seqs[i] == seq) {
+          return;
+        }
+      }
+      if (num_dropped_seqs >= kMaxDroppedSeqs) {
+        for (size_t i = 1; i < num_dropped_seqs; ++i) {
+          dropped_seqs[i - 1] = dropped_seqs[i];
+        }
+        dropped_seqs[num_dropped_seqs - 1] = seq;
+        return;
+      }
+      dropped_seqs[num_dropped_seqs++] = seq;
+    }
+
+    bool ContainsDroppedSeq(SequenceNumber seq) const {
+      MutexLock l(&mu);
+      for (size_t i = 0; i < num_dropped_seqs; ++i) {
+        if (dropped_seqs[i] == seq) {
+          return true;
+        }
+      }
+      return false;
+    }
+  };
+
   struct Options {
     // Capacity (in bytes) of the recent write window FIFO set.
     size_t window_capacity = 0;
+    // Capacity (in bytes) of the promoted hot-key LRU set.
+    size_t hot_capacity = 0;
     // Whether repeated writes inside the window contribute to hotness.
     bool enable_write_window = true;
     // Whether compaction obsolete-version feedback contributes to hotness.
     bool enable_compaction_feedback = true;
-    // Count-Min Sketch geometry.
-    uint64_t sketch_width = 0;
-    uint32_t sketch_depth = 0;
-    // Hotness increment when the write window observes a repeated key.
-    uint32_t write_repeat_weight = 1;
-    // Hotness increment when compaction drops an obsolete version.
-    uint32_t compaction_feedback_weight = 2;
-    // Minimum estimated hotness score for routing a key to the hot route.
-    uint32_t threshold = 1;
-    // Number of writes between decay operations. 0 disables decay.
-    uint64_t decay_interval = 0;
-    // Half-life in writes for decayed hotness scores. 0 disables decay.
-    uint64_t half_life_writes = 0;
   };
 
   explicit HotnessTracker(const Options& options, int num_shard_bits = 6)
       : enable_write_window_(options.enable_write_window),
-        enable_compaction_feedback_(options.enable_compaction_feedback),
-        sketch_width_(options.sketch_width),
-        sketch_depth_(options.sketch_depth),
-        write_repeat_weight_(options.write_repeat_weight),
-        compaction_feedback_weight_(options.compaction_feedback_weight),
-        threshold_(options.threshold),
-        decay_interval_(options.decay_interval),
-        half_life_writes_(options.half_life_writes),
-        writes_(0) {
+        enable_compaction_feedback_(options.enable_compaction_feedback) {
     if (enable_write_window_) {
       window_cache_ =
           NewFIFOCache(options.window_capacity, num_shard_bits, false, 0.0);
     }
-    if (sketch_width_ > 0 && sketch_depth_ > 0) {
-      table_.reset(new std::atomic<uint32_t>[ TableSize() ]);
-      for (size_t i = 0; i < TableSize(); ++i) {
-        table_[i].store(0, std::memory_order_relaxed);
-      }
+    if (options.hot_capacity > 0) {
+      hot_cache_ =
+          NewLRUCache(options.hot_capacity, num_shard_bits, false, 0.0);
     }
   }
 
-  // Records a write of key. When the write window is disabled this only
-  // maintains the write counter used for decay and does not change hotness.
+  // Records a write of key. A repeated write inside the FIFO observation
+  // window promotes the key directly into the hot LRU.
   void RecordWrite(const Slice& key) {
     if (enable_write_window_ && window_cache_ != nullptr) {
       uint32_t hash = Hash(key);
@@ -89,12 +110,11 @@ class HotnessTracker {
       if (handle != nullptr) {
         // Repeated write while still inside the recent window: an overwrite.
         window_cache_->Release(handle);
-        CmsAdd(key, write_repeat_weight_);
+        PromoteHotKey(key);
       }
       // Insert (or refresh) the key in the recent window.
       window_cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter);
     }
-    MaybeDecay();
   }
 
   // Records that compaction dropped an obsolete version of key. This must only
@@ -104,14 +124,55 @@ class HotnessTracker {
     if (!enable_compaction_feedback_) {
       return;
     }
-    CmsAdd(key, compaction_feedback_weight_);
+    PromoteHotKey(key);
   }
 
-  // Returns the estimated hotness score for key.
-  uint32_t Estimate(const Slice& key) const { return CmsEstimate(key); }
+  // Overload that, in addition to promoting the key into the hot LRU, records
+  // that the separated-value version identified by (key, seq) was confirmed
+  // dead by compaction. Blob GC can later short-circuit its GetKey() reverse
+  // lookup when (key, seq) is found in this cache. Purely opportunistic: a
+  // miss simply falls back to the legacy GetKey() path.
+  void RecordCompactionFeedback(const Slice& key, SequenceNumber seq) {
+    if (!enable_compaction_feedback_) {
+      return;
+    }
+    Cache::Handle* handle = PromoteHotKeyHandle(key);
+    if (handle == nullptr) {
+      return;
+    }
+    auto* entry = static_cast<HotEntry*>(hot_cache_->Value(handle));
+    if (entry != nullptr) {
+      entry->AddDroppedSeq(seq);
+    }
+    hot_cache_->Release(handle);
+  }
+
+  // Returns whether the separated-value version identified by (key, seq) was
+  // recorded as dropped. Both the user key and the sequence must match;
+  // matching only the user key is not enough (would be a false hit). A miss
+  // (including after LRU eviction) is allowed and falls back to GetKey().
+  bool IsDropped(const Slice& key, SequenceNumber seq) const {
+    if (hot_cache_ == nullptr) {
+      return false;
+    }
+    uint32_t hash = Hash(key);
+    Cache::Handle* handle = hot_cache_->Lookup(key, hash, false /* record_hit */);
+    if (handle == nullptr) {
+      return false;
+    }
+    auto* entry = static_cast<HotEntry*>(hot_cache_->Value(handle));
+    bool dropped = entry != nullptr && entry->ContainsDroppedSeq(seq);
+    hot_cache_->Release(handle);
+    return dropped;
+  }
+
+  // Returns whether the key is currently admitted into the hot LRU.
+  bool IsHot(const Slice& key) const {
+    return HotCacheContains(key, false /* record_hit */);
+  }
 
   FlushRoute ClassifyForFlush(const Slice& key) const {
-    if (Estimate(key) >= threshold_) {
+    if (HotCacheContains(key, true /* record_hit */)) {
       return FlushRoute::kEphemeral;  // hot route
     }
     return FlushRoute::kWarm;  // cold route
@@ -127,14 +188,6 @@ class HotnessTracker {
 
   // --- Test-only helpers -------------------------------------------------
 
-  uint64_t TEST_WriteCount() const {
-    return writes_.load(std::memory_order_relaxed);
-  }
-
-  void TEST_ForceDecay() {
-    Decay(DecayEnabled() ? decay_interval_ : 1);
-  }
-
   bool TEST_RecentWindowContains(const Slice& key) const {
     if (window_cache_ == nullptr) {
       return false;
@@ -148,107 +201,69 @@ class HotnessTracker {
     return true;
   }
 
+  bool TEST_HotCacheContains(const Slice& key) const {
+    return HotCacheContains(key, false /* record_hit */);
+  }
+
  private:
-  size_t TableSize() const {
-    return static_cast<size_t>(sketch_depth_) *
-           static_cast<size_t>(sketch_width_);
+  static void DeleteHotEntry(const Slice& /*key*/, void* value) {
+    delete static_cast<HotEntry*>(value);
   }
 
-  // Derives an independent hash for sketch row i using double hashing.
-  uint32_t RowHash(const Slice& key, uint32_t row) const {
-    return TERARKDB_NAMESPACE::Hash(key.data(), key.size(),
-                                    0x9747b28cu + row * 0xc2b2ae35u);
+  // Looks up the hot entry for key, inserting a fresh one if absent, and
+  // returns a referenced handle (or nullptr when the hot LRU is disabled).
+  // Looking up an existing entry refreshes its LRU position and preserves any
+  // dropped sequences it already holds. Caller must Release the handle.
+  Cache::Handle* PromoteHotKeyHandle(const Slice& key) {
+    if (hot_cache_ == nullptr) {
+      return nullptr;
+    }
+    uint32_t hash = Hash(key);
+    Cache::Handle* handle = hot_cache_->Lookup(key, hash, true /* record_hit */);
+    if (handle != nullptr) {
+      return handle;
+    }
+    size_t charge = key.size() + sizeof(HotEntry);
+    if (charge == 0) {
+      charge = 1;
+    }
+    HotEntry* entry = new HotEntry();
+    Status s = hot_cache_->Insert(key, hash, entry, charge, &DeleteHotEntry,
+                                  &handle);
+    if (!s.ok() || handle == nullptr) {
+      // Insert refused the entry without taking ownership (e.g. a strict
+      // capacity limit). Free it ourselves to avoid leaking.
+      delete entry;
+      return nullptr;
+    }
+    return handle;
   }
 
-  void CmsAdd(const Slice& key, uint32_t weight) {
-    if (table_ == nullptr || weight == 0) {
-      return;
-    }
-    for (uint32_t row = 0; row < sketch_depth_; ++row) {
-      uint32_t h = RowHash(key, row);
-      size_t idx = static_cast<size_t>(row) * sketch_width_ +
-                   (h % sketch_width_);
-      table_[idx].fetch_add(weight, std::memory_order_relaxed);
-    }
-  }
-
-  uint32_t CmsEstimate(const Slice& key) const {
-    if (table_ == nullptr) {
-      return 0;
-    }
-    uint32_t min_value = UINT32_MAX;
-    for (uint32_t row = 0; row < sketch_depth_; ++row) {
-      uint32_t h = RowHash(key, row);
-      size_t idx = static_cast<size_t>(row) * sketch_width_ +
-                   (h % sketch_width_);
-      uint32_t value = table_[idx].load(std::memory_order_relaxed);
-      if (value < min_value) {
-        min_value = value;
-      }
-    }
-    return min_value;
-  }
-
-  bool DecayEnabled() const {
-    return decay_interval_ > 0 && half_life_writes_ > 0;
-  }
-
-  void MaybeDecay() {
-    if (!DecayEnabled()) {
-      writes_.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-    uint64_t now = writes_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (now % decay_interval_ == 0) {
-      Decay(decay_interval_);
+  void PromoteHotKey(const Slice& key) {
+    Cache::Handle* handle = PromoteHotKeyHandle(key);
+    if (handle != nullptr) {
+      hot_cache_->Release(handle);
     }
   }
 
-  uint32_t DecayedValue(uint32_t value, uint64_t elapsed_writes) const {
-    if (value == 0) {
-      return 0;
+  bool HotCacheContains(const Slice& key, bool record_hit) const {
+    if (hot_cache_ == nullptr) {
+      return false;
     }
-    if (!DecayEnabled()) {
-      return value / 2;
+    uint32_t hash = Hash(key);
+    Cache::Handle* handle = hot_cache_->Lookup(key, hash, record_hit);
+    if (handle == nullptr) {
+      return false;
     }
-    const double exponent =
-        -static_cast<double>(elapsed_writes) /
-        static_cast<double>(half_life_writes_);
-    const double factor = std::exp2(exponent);
-    return static_cast<uint32_t>(static_cast<double>(value) * factor);
-  }
-
-  // Apply half-life decay: counter *= 2^(-elapsed_writes / half_life_writes).
-  void Decay(uint64_t elapsed_writes) {
-    if (table_ == nullptr) {
-      return;
-    }
-    for (size_t i = 0; i < TableSize(); ++i) {
-      uint32_t value = table_[i].load(std::memory_order_relaxed);
-      while (true) {
-        uint32_t decayed = DecayedValue(value, elapsed_writes);
-        if (table_[i].compare_exchange_weak(value, decayed,
-                                            std::memory_order_relaxed,
-                                            std::memory_order_relaxed)) {
-          break;
-        }
-      }
-    }
+    hot_cache_->Release(handle);
+    return true;
   }
 
   const bool enable_write_window_;
   const bool enable_compaction_feedback_;
-  const uint64_t sketch_width_;
-  const uint32_t sketch_depth_;
-  const uint32_t write_repeat_weight_;
-  const uint32_t compaction_feedback_weight_;
-  const uint32_t threshold_;
-  const uint64_t decay_interval_;
-  const uint64_t half_life_writes_;
 
-  std::atomic<uint64_t> writes_;
   std::shared_ptr<Cache> window_cache_;
-  std::unique_ptr<std::atomic<uint32_t>[]> table_;
+  mutable std::shared_ptr<Cache> hot_cache_;
 };
 
 }  // namespace TERARKDB_NAMESPACE

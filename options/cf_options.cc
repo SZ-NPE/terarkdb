@@ -204,20 +204,6 @@ void MutableCFOptions::Dump(Logger* log) const {
                  hotness_enable_write_window);
   ROCKS_LOG_INFO(log, "      hotness_enable_compaction_feedback: %d",
                  hotness_enable_compaction_feedback);
-  ROCKS_LOG_INFO(log, "                    hotness_sketch_width: %" PRIu64,
-                 hotness_sketch_width);
-  ROCKS_LOG_INFO(log, "                    hotness_sketch_depth: %u",
-                 hotness_sketch_depth);
-  ROCKS_LOG_INFO(log, "             hotness_write_repeat_weight: %u",
-                 hotness_write_repeat_weight);
-  ROCKS_LOG_INFO(log, "      hotness_compaction_feedback_weight: %u",
-                 hotness_compaction_feedback_weight);
-  ROCKS_LOG_INFO(log, "                       hotness_threshold: %u",
-                 hotness_threshold);
-  ROCKS_LOG_INFO(log, "                  hotness_decay_interval: %" PRIu64,
-                 hotness_decay_interval);
-  ROCKS_LOG_INFO(log, "              hotness_half_life_writes: %" PRIu64,
-                 hotness_half_life_writes);
   ROCKS_LOG_INFO(log, "                     blob_large_key_ratio: %f",
                  blob_large_key_ratio);
   ROCKS_LOG_INFO(log, "                            blob_gc_ratio: %f",
@@ -336,14 +322,6 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       hotness_enable_write_window(options.hotness_enable_write_window),
       hotness_enable_compaction_feedback(
           options.hotness_enable_compaction_feedback),
-      hotness_sketch_width(options.hotness_sketch_width),
-      hotness_sketch_depth(options.hotness_sketch_depth),
-      hotness_write_repeat_weight(options.hotness_write_repeat_weight),
-      hotness_compaction_feedback_weight(
-          options.hotness_compaction_feedback_weight),
-      hotness_threshold(options.hotness_threshold),
-      hotness_decay_interval(options.hotness_decay_interval),
-      hotness_half_life_writes(options.hotness_half_life_writes),
       blob_large_key_ratio(options.blob_large_key_ratio),
       blob_gc_ratio(options.blob_gc_ratio),
       precise_gc(options.precise_gc),

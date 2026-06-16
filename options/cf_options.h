@@ -161,13 +161,6 @@ struct MutableCFOptions {
         hotness_hot_capacity(0),
         hotness_enable_write_window(false),
         hotness_enable_compaction_feedback(false),
-        hotness_sketch_width(0),
-        hotness_sketch_depth(0),
-        hotness_write_repeat_weight(0),
-        hotness_compaction_feedback_weight(0),
-        hotness_threshold(0),
-        hotness_decay_interval(0),
-        hotness_half_life_writes(0),
         blob_large_key_ratio(0),
         blob_gc_ratio(0),
         precise_gc(false),
@@ -241,13 +234,6 @@ struct MutableCFOptions {
   size_t hotness_hot_capacity;
   bool hotness_enable_write_window;
   bool hotness_enable_compaction_feedback;
-  uint64_t hotness_sketch_width;
-  uint32_t hotness_sketch_depth;
-  uint32_t hotness_write_repeat_weight;
-  uint32_t hotness_compaction_feedback_weight;
-  uint32_t hotness_threshold;
-  uint64_t hotness_decay_interval;
-  uint64_t hotness_half_life_writes;
   double blob_large_key_ratio;
   double blob_gc_ratio;
   bool precise_gc;

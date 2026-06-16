@@ -253,6 +253,19 @@ class CompactionIterator {
   // reset at a drop site.
   void MaybeRecordBlobDeath();
 
+  // Records the (user_key, sequence) of the current entry into the hotness
+  // tracker's drop-key cache so blob GC can later skip its GetKey() reverse
+  // lookup for this exact version. No-op when the hotness tracker is null or
+  // the current entry is not a separated value (only kTypeValueIndex /
+  // kTypeMergeIndex carry a vSST record). Also promotes the key into the hot
+  // LRU. Purely advisory; never affects compaction output. Must be called
+  // before value_.reset() / input_->Next() at a confirmed drop site.
+  void MaybeRecordDroppedKey();
+
+  // Same as MaybeRecordDroppedKey(), but for a parsed key currently referenced
+  // by input_->key() rather than ikey_. Used by drop paths that peek/skip ahead.
+  void MaybeRecordDroppedKey(const ParsedInternalKey& ikey);
+
  public:
   bool IsShuttingDown() {
     // This is a best-effort facility, so memory_order_relaxed is sufficient.

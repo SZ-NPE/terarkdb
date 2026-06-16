@@ -2186,6 +2186,12 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   Version* input_version = sub_compact->compaction->input_version();
   const VersionStorageInfo* vstorage = input_version->storage_info();
   BlobDeathLog* blob_death_log = cfd->blob_death_log();
+  // Raw view of the optional drop-key cache. When the hotness tracker is
+  // enabled, blob GC consults it to skip the GetKey() reverse lookup for
+  // versions compaction already confirmed dead. Held as a shared_ptr for the
+  // duration of GC so the raw pointer stays valid.
+  std::shared_ptr<HotnessTracker> hotness_tracker_holder = cfd->hotness_tracker();
+  HotnessTracker* hotness_tracker = hotness_tracker_holder.get();
 
   // Holder for the GC death-map fast path. Owns a per-vSST DeathMap cache
   // (built lazily from the in-memory BlobDeathLog) plus the per-vSST
@@ -2392,6 +2398,15 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t bitmap_block_skip_bytes = 0;
     uint64_t bitmap_block_skip_blocks = 0;
     uint64_t bitmap_block_read_blocks = 0;
+    // drop-key cache (HotnessTracker) fast-path counters.
+    //   dropped_key_cache_hit : records whose (user_key, sequence) was found
+    //                           in the in-memory drop-key cache, so the
+    //                           GetKey() reverse lookup was skipped and the
+    //                           record was counted dead directly.
+    //   dropped_key_cache_miss: records that consulted the drop-key cache but
+    //                           missed and fell back to the legacy GetKey().
+    uint64_t dropped_key_cache_hit = 0;
+    uint64_t dropped_key_cache_miss = 0;
   } counter;
   // cache resolves (blob_file_number -> (meta, skip_getkey)) once per
   // blob. `entirely_dead == true` here means "death map complete -> we
@@ -2553,6 +2568,23 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         ++death_holder.getkey_avoided;
         is_live = true;
         break;
+      }
+      // Drop-key cache fast path: when compaction has already confirmed this
+      // exact separated-value version (user_key, sequence) dead and recorded
+      // it in the in-memory HotnessTracker drop-key cache, it is provably
+      // garbage. Count it dead and skip both the GetKey() reverse lookup and
+      // relocation. A miss falls back to the legacy GetKey() path below, so
+      // correctness never depends on the cache (misses are allowed, false
+      // hits are not). Both the user key and the sequence must match.
+      if (hotness_tracker != nullptr &&
+          (ikey.type == kTypeValue || ikey.type == kTypeMerge) &&
+          hotness_tracker->IsDropped(ikey.user_key, ikey.sequence)) {
+        ++counter.dropped_key_cache_hit;
+        gc_invalid_read_bytes_ += record_bytes;
+        break;
+      }
+      if (hotness_tracker != nullptr) {
+        ++counter.dropped_key_cache_miss;
       }
       // NOTE: `input->value()` here is the *real vSST user value*, not a
       // kSST ValueIndex. It does NOT carry a block-id trailer, so we must
@@ -2727,6 +2759,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
           ", getkey_avoided=%" PRIu64 ", fallback_getkey=%" PRIu64
           ", skip_dead_blocks=%" PRIu64 ", skip_dead_block_bytes=%" PRIu64
           ", read_blocks=%" PRIu64 ", skipped_slots=%" PRIu64 "]"
+          ", drop_key_cache=[hit=%" PRIu64 ", miss=%" PRIu64 "]"
           ", inheritance=%zd->%zd",
           cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
           files.size(), counter.input - meta.prop.num_entries,
@@ -2740,6 +2773,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
           death_holder.getkey_avoided, counter.bitmap_fallback_getkey,
           bitmap_block_skip_blocks, bitmap_block_skip_bytes,
           bitmap_block_read_blocks, bitmap_skipped_slots,
+          counter.dropped_key_cache_hit, counter.dropped_key_cache_miss,
           meta.prop.inheritance.size() + inheritance_tree_pruge_count,
           meta.prop.inheritance.size());
     }

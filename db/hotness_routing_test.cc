@@ -21,41 +21,36 @@ namespace TERARKDB_NAMESPACE {
 
 namespace {
 
-// Builds a HotnessTracker::Options with a small but functional Count-Min
-// Sketch and a generous recent write window, suitable for unit tests.
+// Builds a HotnessTracker::Options with generous FIFO/LRU capacities, suitable
+// for unit tests.
 HotnessTracker::Options MakeTestOptions() {
   HotnessTracker::Options options;
   options.window_capacity = 1 << 20;
+  options.hot_capacity = 1 << 20;
   options.enable_write_window = true;
   options.enable_compaction_feedback = true;
-  options.sketch_width = 4096;
-  options.sketch_depth = 4;
-  options.write_repeat_weight = 1;
-  options.compaction_feedback_weight = 2;
-  options.threshold = 2;
-  options.decay_interval = 0;     // disabled by default
-  options.half_life_writes = 0;   // disabled by default
   return options;
 }
 
 }  // namespace
 
-// Unit tests for the Count-Min Sketch based HotnessTracker.
+// Unit tests for the FIFO + hot-LRU based HotnessTracker.
 class HotnessTrackerTest : public testing::Test {};
 
-// (a) A single write must never exceed the threshold.
+// (a) A single write only enters the FIFO observation window.
 TEST_F(HotnessTrackerTest, SingleWriteStaysBelowThreshold) {
   HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
   Slice key("single_write_key");
   tracker.RecordWrite(key);
 
-  ASSERT_LT(tracker.Estimate(key), 2U);
+  ASSERT_TRUE(tracker.TEST_RecentWindowContains(key));
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kWarm);
 }
 
-// (b) Repeated writes raise the score and route the key to the hot route.
+// (b) Repeated writes inside the FIFO window promote the key to hot LRU.
 TEST_F(HotnessTrackerTest, RepeatedWritesBecomeHot) {
   HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
@@ -63,75 +58,135 @@ TEST_F(HotnessTrackerTest, RepeatedWritesBecomeHot) {
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kWarm);
 
-  // First write only inserts into the window. The next two writes are
-  // overwrites and each adds write_repeat_weight (=1), reaching threshold (=2).
-  tracker.RecordWrite(key);
+  // First write only inserts into the window. The second write is an overwrite
+  // inside the observation window and promotes the key directly to hot LRU.
   tracker.RecordWrite(key);
   tracker.RecordWrite(key);
 
-  ASSERT_GE(tracker.Estimate(key), 2U);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kEphemeral);
 }
 
-// (c) Compaction feedback raises the score.
+// (c) Compaction feedback is confirmed overwrite evidence and promotes directly.
 TEST_F(HotnessTrackerTest, CompactionFeedbackBecomesHot) {
   HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
   Slice key("compaction_feedback_key");
-  ASSERT_EQ(tracker.Estimate(key), 0U);
 
-  // compaction_feedback_weight (=2) reaches threshold (=2) in one shot.
   tracker.RecordCompactionFeedback(key);
 
-  ASSERT_GE(tracker.Estimate(key), 2U);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kEphemeral);
 }
 
-// (d) Decay reduces a previously accumulated score.
-TEST_F(HotnessTrackerTest, DecayReducesScore) {
+// (c2) Compaction feedback with a sequence also promotes the key into the hot
+// LRU (same hot-routing semantics as the no-seq overload).
+TEST_F(HotnessTrackerTest, CompactionFeedbackWithSeqBecomesHot) {
   HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
-  Slice key("decay_key");
-  // Accumulate a clearly-hot score via compaction feedback (weight 2 each).
-  tracker.RecordCompactionFeedback(key);
-  tracker.RecordCompactionFeedback(key);
-  uint32_t before = tracker.Estimate(key);
-  ASSERT_EQ(before, 4U);
+  Slice key("compaction_feedback_seq_key");
 
-  tracker.TEST_ForceDecay();
+  tracker.RecordCompactionFeedback(key, 42 /* seq */);
 
-  uint32_t after = tracker.Estimate(key);
-  ASSERT_LT(after, before);
-  ASSERT_EQ(after, before / 2);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kEphemeral);
 }
 
-TEST_F(HotnessTrackerTest, DecayUsesHalfLifeRatio) {
+// (c3) IsDropped only hits the exact recorded sequence. Other sequences under
+// the same user key, and unrecorded keys, must miss (no false hits).
+TEST_F(HotnessTrackerTest, IsDroppedMatchesOnlyRecordedSequence) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
+
+  Slice key("dropped_key");
+  ASSERT_FALSE(tracker.IsDropped(key, 100));
+
+  tracker.RecordCompactionFeedback(key, 100 /* seq */);
+  tracker.RecordCompactionFeedback(key, 200 /* seq */);
+
+  ASSERT_TRUE(tracker.IsDropped(key, 100));
+  ASSERT_TRUE(tracker.IsDropped(key, 200));
+  // Same user key, different (unrecorded) sequence must not match.
+  ASSERT_FALSE(tracker.IsDropped(key, 150));
+  // A different user key must not match.
+  ASSERT_FALSE(tracker.IsDropped(Slice("other_key"), 100));
+}
+
+// (c4) Once the hot entry is evicted by the LRU, its dropped-sequence info is
+// allowed to be lost; IsDropped then returns false (a miss falls back to
+// GetKey()).
+TEST_F(HotnessTrackerTest, IsDroppedLostAfterEviction) {
   HotnessTracker::Options options = MakeTestOptions();
-  options.decay_interval = 100;
-  options.half_life_writes = 400;
+  options.hot_capacity = 20;
   HotnessTracker tracker(options, 0 /* num_shard_bits */);
 
-  Slice key("half_life_key");
-  for (int i = 0; i < 8; ++i) {
-    tracker.RecordCompactionFeedback(key);
-  }
-  const uint32_t before = tracker.Estimate(key);
-  ASSERT_EQ(before, 16U);
+  Slice first("drop_key_1");
+  Slice second("drop_key_2");
+  Slice third("drop_key_3");
 
-  for (int i = 0; i < 100; ++i) {
-    std::string filler = "decay_filler_" + std::to_string(i);
+  tracker.RecordCompactionFeedback(first, 1 /* seq */);
+  tracker.RecordCompactionFeedback(second, 2 /* seq */);
+  tracker.RecordCompactionFeedback(third, 3 /* seq */);
+
+  // `first` was evicted by the small-capacity LRU; its dropped seq is gone.
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(first));
+  ASSERT_FALSE(tracker.IsDropped(first, 1));
+  // Survivors still report their dropped sequences.
+  ASSERT_TRUE(tracker.IsDropped(second, 2));
+  ASSERT_TRUE(tracker.IsDropped(third, 3));
+}
+
+// (c5) When compaction feedback is disabled, no dropped sequence is recorded.
+TEST_F(HotnessTrackerTest, IsDroppedDisabledWhenFeedbackOff) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.enable_compaction_feedback = false;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("no_feedback_drop_key");
+  tracker.RecordCompactionFeedback(key, 7 /* seq */);
+
+  ASSERT_FALSE(tracker.IsDropped(key, 7));
+}
+
+// (d) Hot LRU capacity bounds the promoted hot set.
+TEST_F(HotnessTrackerTest, HotLruCapacityEvictsOldEntries) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.hot_capacity = 20;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice first("hot_key_1");
+  Slice second("hot_key_2");
+  Slice third("hot_key_3");
+
+  tracker.RecordCompactionFeedback(first);
+  tracker.RecordCompactionFeedback(second);
+  tracker.RecordCompactionFeedback(third);
+
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(first));
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(second));
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(third));
+}
+
+TEST_F(HotnessTrackerTest, HotLruDoesNotExpireWithoutEviction) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
+
+  Slice key("persistent_hot_key");
+  tracker.RecordCompactionFeedback(key);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
+
+  for (int i = 0; i < 1000; ++i) {
+    std::string filler = "filler_" + std::to_string(i);
     tracker.RecordWrite(filler);
   }
 
-  const uint32_t after = tracker.Estimate(key);
-  ASSERT_LT(after, before);
-  ASSERT_GT(after, before / 2);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kEphemeral);
 }
 
-// (f) When the write window is disabled, repeated writes do not raise score.
-TEST_F(HotnessTrackerTest, WriteWindowDisabledKeepsScoreFlat) {
+TEST_F(HotnessTrackerTest, WriteWindowDisabledDoesNotPromoteRepeatedWrites) {
   HotnessTracker::Options options = MakeTestOptions();
   options.enable_write_window = false;
   HotnessTracker tracker(options, 0 /* num_shard_bits */);
@@ -141,13 +196,12 @@ TEST_F(HotnessTrackerTest, WriteWindowDisabledKeepsScoreFlat) {
     tracker.RecordWrite(key);
   }
 
-  ASSERT_EQ(tracker.Estimate(key), 0U);
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kWarm);
 }
 
-// (g) When compaction feedback is disabled, feedback does not raise score.
-TEST_F(HotnessTrackerTest, CompactionFeedbackDisabledKeepsScoreFlat) {
+TEST_F(HotnessTrackerTest, CompactionFeedbackDisabledDoesNotPromote) {
   HotnessTracker::Options options = MakeTestOptions();
   options.enable_compaction_feedback = false;
   HotnessTracker tracker(options, 0 /* num_shard_bits */);
@@ -157,29 +211,9 @@ TEST_F(HotnessTrackerTest, CompactionFeedbackDisabledKeepsScoreFlat) {
     tracker.RecordCompactionFeedback(key);
   }
 
-  ASSERT_EQ(tracker.Estimate(key), 0U);
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kWarm);
-}
-
-// Decay must remain disabled when either knob is zero.
-TEST_F(HotnessTrackerTest, DecayDisabledByZeroIntervalDoesNotFire) {
-  HotnessTracker::Options options = MakeTestOptions();
-  options.decay_interval = 0;
-  options.half_life_writes = 6500000;
-  HotnessTracker tracker(options, 0 /* num_shard_bits */);
-
-  Slice key("decay_disabled_key");
-  tracker.RecordCompactionFeedback(key);
-  uint32_t before = tracker.Estimate(key);
-
-  for (int i = 0; i < 1000; ++i) {
-    std::string filler = "filler_" + std::to_string(i);
-    tracker.RecordWrite(filler);
-  }
-
-  // No automatic decay should have occurred.
-  ASSERT_EQ(tracker.Estimate(key), before);
 }
 
 // Cold keys written only once must never be promoted to the hot route.
@@ -210,7 +244,7 @@ TEST_F(HotnessTrackerTest, ConcurrentSafetyBasicCheck) {
           tracker.RecordWrite(key);
           tracker.RecordWrite(key);
         } else {
-          tracker.Estimate(key);
+            tracker.ClassifyForFlush(key);
         }
       }
     });
@@ -327,20 +361,14 @@ TEST_F(AdaptiveHotnessRoutingTest, RepeatedWritesRouteToHotBlob) {
   options.blob_size = 0;
   options.enable_hotness_tracker = true;
   options.hotness_window_capacity = 1 << 20;
+  options.hotness_hot_capacity = 1 << 20;
   options.hotness_enable_write_window = true;
   options.hotness_enable_compaction_feedback = true;
-  options.hotness_sketch_width = 4096;
-  options.hotness_sketch_depth = 4;
-  options.hotness_write_repeat_weight = 1;
-  options.hotness_compaction_feedback_weight = 2;
-  options.hotness_threshold = 2;
-  options.hotness_decay_interval = 0;
-  options.hotness_half_life_writes = 0;
   options.target_blob_file_size = 10 * 1024;
 
   DestroyAndReopen(options);
 
-  // Hot keys: written 3 times each (two overwrites -> score reaches threshold).
+  // Hot keys: written at least twice so the second write promotes them.
   for (int i = 0; i < 8; ++i) {
     std::string key = "hot" + std::to_string(i);
     ASSERT_OK(Put(key, BlobValue("v1")));
@@ -413,15 +441,9 @@ TEST_F(AdaptiveHotnessRoutingTest, CompactionFeedbackRoutesNextFlushToHotBlob) {
   options.blob_size = 0;
   options.enable_hotness_tracker = true;
   options.hotness_window_capacity = 1 << 20;
+  options.hotness_hot_capacity = 1 << 20;
   options.hotness_enable_write_window = false;
   options.hotness_enable_compaction_feedback = true;
-  options.hotness_sketch_width = 4096;
-  options.hotness_sketch_depth = 4;
-  options.hotness_write_repeat_weight = 1;
-  options.hotness_compaction_feedback_weight = 2;
-  options.hotness_threshold = 2;
-  options.hotness_decay_interval = 0;
-  options.hotness_half_life_writes = 0;
   options.target_blob_file_size = 10 * 1024;
 
   DestroyAndReopen(options);
