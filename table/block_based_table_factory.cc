@@ -260,6 +260,10 @@ Status BlockBasedTableFactory::SanitizeOptions(
         "data_block_hash_table_util_ratio should be greater than 0 when "
         "data_block_index_type is set to kDataBlockBinaryAndHash");
   }
+  if (cf_opts.precise_gc && !table_options_.use_delta_block) {
+    return Status::InvalidArgument(
+        "precise_gc requires BlockBasedTableOptions::use_delta_block");
+  }
   return Status::OK();
 }
 

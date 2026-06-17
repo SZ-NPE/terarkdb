@@ -526,8 +526,9 @@ Status BuildTable(
         assert(sst_meta()->prop.dependence.empty() ||
                blob.fd.GetNumber() >
                    sst_meta()->prop.dependence.back().file_number);
-        sst_meta()->prop.dependence.emplace_back(Dependence{
-            blob.fd.GetNumber(), blob.prop.num_entries, blob.fd.GetFileSize()});
+        sst_meta()->prop.dependence.emplace_back(
+            Dependence{blob.fd.GetNumber(), blob.prop.num_entries,
+                       blob.prop.raw_key_size + blob.prop.raw_value_size});
       }
       auto shrinked_snapshots = sst_meta()->ShrinkSnapshot(snapshots);
       s = builder->Finish(&sst_meta()->prop, &shrinked_snapshots);

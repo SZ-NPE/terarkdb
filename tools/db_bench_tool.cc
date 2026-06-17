@@ -1036,6 +1036,10 @@ DEFINE_bool(blob_gc_collect_bytes_stats, false,
 
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
+DEFINE_bool(read_separated_value_by_handle,
+            TERARKDB_NAMESPACE::Options().read_separated_value_by_handle,
+            "Encode and use data-block handles in separated value indexes");
+
 DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
 
 DEFINE_bool(precise_gc, false,
@@ -3525,7 +3529,8 @@ class Benchmark {
       block_based_options.enable_index_compression =
           FLAGS_enable_index_compression;
       block_based_options.block_align = FLAGS_block_align;
-      block_based_options.use_delta_block = FLAGS_use_delta_block;
+      block_based_options.use_delta_block =
+          FLAGS_use_delta_block || FLAGS_precise_gc;
       if (FLAGS_use_data_block_hash_index) {
         block_based_options.data_block_index_type =
             TERARKDB_NAMESPACE::BlockBasedTableOptions::kDataBlockBinaryAndHash;
@@ -3661,6 +3666,8 @@ class Benchmark {
     options.blob_gc_collect_latency_stats = FLAGS_blob_gc_collect_latency_stats;
     options.blob_gc_collect_bytes_stats = FLAGS_blob_gc_collect_bytes_stats;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
+    options.read_separated_value_by_handle =
+        FLAGS_read_separated_value_by_handle;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;
     options.target_blob_file_size = FLAGS_target_blob_file_size;

@@ -33,6 +33,7 @@
 #include "monitoring/thread_status_util.h"
 #include "options/options_helper.h"
 #include "rocksdb/terark_namespace.h"
+#include "table/block_based_table_factory.h"
 #include "table/merging_iterator.h"
 #include "util/autovector.h"
 #include "util/compression.h"
@@ -324,6 +325,16 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
 
   if (result.blob_size > 0 && result.blob_size < 8) {
     result.blob_size = 8;
+  }
+  if (result.precise_gc) {
+    if (result.table_factory != nullptr &&
+        result.table_factory->Name() == BlockBasedTableFactory::kName) {
+      auto* block_based_table_options = static_cast<BlockBasedTableOptions*>(
+          result.table_factory->GetOptions());
+      if (block_based_table_options != nullptr) {
+        block_based_table_options->use_delta_block = true;
+      }
+    }
   }
   if (result.middle_blob_size != size_t(-1) &&
       result.middle_blob_size < result.blob_size) {
