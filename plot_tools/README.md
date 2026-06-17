@@ -1,12 +1,13 @@
 # TerarkDB Plot Tools
 
-这个目录存放 Blob GC / GC-aware block cache 实验的可视化脚本。新增的两个脚本面向论文和技术报告图，默认输出 `pdf` 和 `png`，图形风格按 SIGMOD/FAST 常见双栏论文尺寸、Times 系字体、色盲友好配色和低噪声网格配置。
+这个目录存放 Blob GC / GC-aware block cache 实验的可视化脚本。脚本面向论文和技术报告图，默认输出 `pdf` 和 `png`，图形风格按 SIGMOD/FAST 常见双栏论文尺寸、色盲友好配色和低噪声网格配置。
 
 ## 脚本分工
 
 | 脚本 | 用途 | 输入 | 典型输出 |
 | --- | --- | --- | --- |
 | `plot_motivation_tests.py` | 第一、第二点动机测试 | 两个可选 CSV：`--motivation1`、`--motivation2` | GC 无效读放大、可跳过比例、cache pressure 下 hit rate / throughput / p99、GC-aware cache 事件 |
+| `plot_block_cache_obsolete_timeline.py` | 默认 LRU block cache 失效块动机测试 | TerarkDB INFO LOG | 失效块数量柱状图、compaction/GC 任务并发曲线 |
 | `plot_final_validation.py` | 最终收益测试 | 一个 final validation CSV | 归一化吞吐收益、P99 改善、绝对尾延迟、读写/空间/GC 资源效率、cache hit rate |
 | `gc_visualizer.py` | 已有 GC INFO_LOG 解析 | TerarkDB INFO_LOG | GC bandwidth、block invalidity、phase latency、timeline |
 
@@ -46,6 +47,10 @@ python3 plot_final_validation.py \
   --input ./data/final_validation.csv \
   --baseline baseline \
   --out ./figures/final
+
+python3 plot_block_cache_obsolete_timeline.py \
+  /path/to/LOG \
+  --out ./figures/obsolete_cache
 ```
 
 每张图都会同时保存为：
@@ -56,6 +61,29 @@ python3 plot_final_validation.py \
 ```
 
 论文、slides、技术报告建议优先使用 PDF。
+
+## 动机测试：默认 LRU 中失效块驻留
+
+目标：证明默认 LRU block cache 在常态 overwrite/GC/compaction 运行中会长期驻留属于旧 file number 的 data blocks。一次 compaction 或 Blob GC install 成功后，输入文件的 file number 被标记为 obsolete；此时仍在 block cache 中的对应 data blocks 立即计入失效块。
+
+推荐运行参数：
+
+```bash
+--use_gc_aware_block_cache=false
+--block_cache_obsolete_tracking=true
+--block_cache_obsolete_sample_interval_sec=10
+--block_cache_obsolete_topk_files=10
+```
+
+INFO LOG 中会出现：
+
+```text
+[BLOCK_CACHE_OBSOLETE_EVENT] reason=compaction|gc ...
+[BLOCK_CACHE_OBSOLETE_SAMPLE] obsolete_blocks=... obsolete_byte_ratio=...
+[BLOCK_CACHE_OBSOLETE_DRAIN] file=... residency_us=...
+```
+
+主图 `block_cache_obsolete_blocks_with_job_concurrency` 的左轴是 `obsolete_blocks` 柱状图，表示当前 block cache 中属于旧 file number 的 resident data block 数量；右轴是从 `EVENT_LOG_v1` 的 `compaction_started` / `compaction_finished` 配对还原出的 compaction+GC 任务并发曲线。GC job 通过 tracker 的 `[BLOCK_CACHE_OBSOLETE_EVENT] reason=gc job=...` 识别，并额外画一条 GC 并发虚线。
 
 ## 动机测试 1：GC 读无效数据的代价
 

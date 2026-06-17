@@ -1033,6 +1033,15 @@ DEFINE_bool(blob_gc_collect_latency_stats, false,
             "Collect blob GC latency breakdown in INFO LOG.");
 DEFINE_bool(blob_gc_collect_bytes_stats, false,
             "Collect blob GC byte counters in statistics and INFO LOG.");
+DEFINE_bool(block_cache_obsolete_tracking, false,
+            "Track obsolete-file residency in the block cache for motivation "
+            "tests. Intended for default LRU block cache.");
+DEFINE_uint64(block_cache_obsolete_sample_interval_sec, 30,
+              "Periodic INFO LOG sample interval for "
+              "block_cache_obsolete_tracking.");
+DEFINE_uint32(block_cache_obsolete_topk_files, 10,
+              "Number of obsolete files to include in block-cache obsolete "
+              "residency sample logs.");
 
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
@@ -2436,7 +2445,8 @@ class Benchmark {
     virtual const char* Name() const override { return "KeepFilter"; }
   };
 
-  std::shared_ptr<Cache> NewCache(int64_t capacity) {
+  std::shared_ptr<Cache> NewCache(int64_t capacity,
+                                  bool enable_obsolete_tracking) {
     if (capacity <= 0) {
       return nullptr;
     }
@@ -2455,16 +2465,26 @@ class Benchmark {
           FLAGS_gc_aware_cache_demote_score_threshold,
           FLAGS_gc_aware_cache_log_interval);
     } else {
-      return NewLRUCache((size_t)capacity, FLAGS_cache_numshardbits,
-                         false /*strict_capacity_limit*/,
-                         FLAGS_cache_high_pri_pool_ratio);
+      LRUCacheOptions cache_opts;
+      cache_opts.capacity = static_cast<size_t>(capacity);
+      cache_opts.num_shard_bits = FLAGS_cache_numshardbits;
+      cache_opts.strict_capacity_limit = false;
+      cache_opts.high_pri_pool_ratio = FLAGS_cache_high_pri_pool_ratio;
+      cache_opts.obsolete_tracking_options.enabled =
+          enable_obsolete_tracking && FLAGS_block_cache_obsolete_tracking;
+      cache_opts.obsolete_tracking_options.sample_interval_sec =
+          FLAGS_block_cache_obsolete_sample_interval_sec;
+      cache_opts.obsolete_tracking_options.topk_files =
+          FLAGS_block_cache_obsolete_topk_files;
+      return NewLRUCache(cache_opts);
     }
   }
 
  public:
   Benchmark()
-      : cache_(NewCache(FLAGS_cache_size)),
-        compressed_cache_(NewCache(FLAGS_compressed_cache_size)),
+      : cache_(NewCache(FLAGS_cache_size, true /* enable_obsolete_tracking */)),
+        compressed_cache_(NewCache(FLAGS_compressed_cache_size,
+                                   false /* enable_obsolete_tracking */)),
         filter_policy_(FLAGS_bloom_bits >= 0
                            ? NewBloomFilterPolicy(FLAGS_bloom_bits,
                                                   FLAGS_use_block_based_filter)
@@ -3665,6 +3685,12 @@ class Benchmark {
     options.blob_gc_collect_block_stats = FLAGS_blob_gc_collect_block_stats;
     options.blob_gc_collect_latency_stats = FLAGS_blob_gc_collect_latency_stats;
     options.blob_gc_collect_bytes_stats = FLAGS_blob_gc_collect_bytes_stats;
+    options.block_cache_obsolete_tracking =
+        FLAGS_block_cache_obsolete_tracking;
+    options.block_cache_obsolete_sample_interval_sec =
+        FLAGS_block_cache_obsolete_sample_interval_sec;
+    options.block_cache_obsolete_topk_files =
+        FLAGS_block_cache_obsolete_topk_files;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.read_separated_value_by_handle =
         FLAGS_read_separated_value_by_handle;

@@ -1077,6 +1077,20 @@ struct DBOptions {
   // DEFAULT: false
   bool blob_gc_collect_bytes_stats = false;
 
+  // If true, enable experimental block-cache obsolete-file residency tracking.
+  // A block is obsolete when its cached file number has been replaced by a
+  // successful compaction or Blob GC install. Intended for motivation tests.
+  // DEFAULT: false
+  bool block_cache_obsolete_tracking = false;
+
+  // Periodic sample interval for block_cache_obsolete_tracking.
+  // DEFAULT: 30 seconds
+  uint64_t block_cache_obsolete_sample_interval_sec = 30;
+
+  // Number of obsolete files to include in top_obsolete_files log field.
+  // DEFAULT: 10
+  uint32_t block_cache_obsolete_topk_files = 10;
+
   // By default RocksDB replay WAL logs and flush them on DB open, which may
   // create very small SST files. If this option is enabled, RocksDB will try
   // to avoid (but not guarantee not to) flush during recovery. Also, existing

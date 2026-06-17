@@ -103,12 +103,14 @@ void LRUHandleTable::Resize() {
 template <class CacheMonitor>
 LRUCacheShardTemplate<CacheMonitor>::LRUCacheShardTemplate(
     size_t capacity, bool strict_capacity_limit, double high_pri_pool_ratio,
-    const typename CacheMonitor::Options& options)
+    const typename CacheMonitor::Options& options,
+    std::shared_ptr<BlockCacheObsoleteTracker> obsolete_tracker)
     : CacheMonitor(options),
       capacity_(0),
       strict_capacity_limit_(strict_capacity_limit),
       high_pri_pool_ratio_(high_pri_pool_ratio),
-      high_pri_pool_capacity_(0) {
+      high_pri_pool_capacity_(0),
+      obsolete_tracker_(std::move(obsolete_tracker)) {
   // Make empty circular linked list
   lru_.next = &lru_;
   lru_.prev = &lru_;
@@ -143,6 +145,7 @@ void LRUCacheShardTemplate<CacheMonitor>::EraseUnRefEntries() {
       old->SetInCache(false);
       Unref(old);
       UsageSub(old);
+      TrackErase(old);
       last_reference_list.push_back(old);
     }
   }
@@ -255,6 +258,7 @@ void LRUCacheShardTemplate<CacheMonitor>::EvictFromLRU(
     old->SetInCache(false);
     Unref(old);
     UsageSub(old);
+      TrackErase(old);
     deleted->push_back(old);
   }
 }
@@ -346,6 +350,7 @@ bool LRUCacheShardTemplate<CacheMonitor>::Release(Cache::Handle* handle,
         e->SetInCache(false);
         Unref(e);
         UsageSub(e);
+          TrackErase(e);
         last_reference = true;
       } else if (e->next == nullptr && e->prev == nullptr) {
         // Entries returned by Lookup(record_hit = false) stay on the LRU list.
@@ -366,6 +371,16 @@ template <class CacheMonitor>
 Status LRUCacheShardTemplate<CacheMonitor>::Insert(
     const Slice& key, uint32_t hash, void* value, size_t charge,
     void (*deleter)(const Slice& key, void* value), Cache::Handle** handle,
+    Cache::Priority priority) {
+  return InsertWithMetadata(key, hash, value, charge, deleter,
+                            nullptr /* metadata */, handle, priority);
+}
+
+template <class CacheMonitor>
+Status LRUCacheShardTemplate<CacheMonitor>::InsertWithMetadata(
+    const Slice& key, uint32_t hash, void* value, size_t charge,
+    void (*deleter)(const Slice& key, void* value),
+    const BlockCacheMetadata* metadata, Cache::Handle** handle,
     Cache::Priority priority) {
   // Allocate the memory here outside of the mutex
   // If the cache is full, we'll have to release it
@@ -413,10 +428,12 @@ Status LRUCacheShardTemplate<CacheMonitor>::Insert(
       // space was freed
       LRUHandle* old = table_.Insert(e);
       UsageAdd(e);
+      TrackInsert(e, metadata);
       if (old != nullptr) {
         old->SetInCache(false);
         if (Unref(old)) {
           UsageSub(old);
+          TrackErase(old);
           // old is on LRU because it's in cache and its reference count
           // was just 1 (Unref returned 0)
           LRU_Remove(old);
@@ -456,6 +473,7 @@ void LRUCacheShardTemplate<CacheMonitor>::Erase(const Slice& key,
       }
       if (last_reference) {
         UsageSub(e);
+        TrackErase(e);
       }
       e->SetInCache(false);
     }
@@ -482,6 +500,21 @@ size_t LRUCacheShardTemplate<CacheMonitor>::GetPinnedUsage() const {
 }
 
 template <class CacheMonitor>
+void LRUCacheShardTemplate<CacheMonitor>::TrackInsert(
+    LRUHandle* e, const BlockCacheMetadata* metadata) {
+  if (obsolete_tracker_ != nullptr) {
+    obsolete_tracker_->RecordInsert(e, metadata, e->charge);
+  }
+}
+
+template <class CacheMonitor>
+void LRUCacheShardTemplate<CacheMonitor>::TrackErase(LRUHandle* e) {
+  if (obsolete_tracker_ != nullptr) {
+    obsolete_tracker_->RecordErase(e);
+  }
+}
+
+template <class CacheMonitor>
 std::string LRUCacheShardTemplate<CacheMonitor>::GetPrintableOptions() const {
   const int kBufferSize = 200;
   char buffer[kBufferSize];
@@ -498,9 +531,14 @@ LRUCacheBase<LRUCacheDiagnosableShard>::LRUCacheBase(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
     const typename LRUCacheDiagnosableShard::MonitorOptions& options,
-    std::shared_ptr<MemoryAllocator> allocator)
+    std::shared_ptr<MemoryAllocator> allocator,
+    const BlockCacheObsoleteTrackingOptions& tracking_options)
     : ShardedCache(capacity, num_shard_bits, strict_capacity_limit,
-                   std::move(allocator)) {
+                   std::move(allocator)),
+      obsolete_tracker_(tracking_options.enabled
+                            ? std::make_shared<BlockCacheObsoleteTracker>(
+                                  tracking_options)
+                            : nullptr) {
   num_shards_ = 1 << num_shard_bits;
   shards_ =
       reinterpret_cast<LRUCacheDiagnosableShard*>(port::cacheline_aligned_alloc(
@@ -508,7 +546,8 @@ LRUCacheBase<LRUCacheDiagnosableShard>::LRUCacheBase(
   size_t per_shard = (capacity + (num_shards_ - 1)) / num_shards_;
   for (int i = 0; i < num_shards_; i++) {
     new (&shards_[i]) LRUCacheDiagnosableShard(per_shard, strict_capacity_limit,
-                                               high_pri_pool_ratio, options);
+                                               high_pri_pool_ratio, options,
+                                               obsolete_tracker_);
   }
 }
 
@@ -517,16 +556,22 @@ LRUCacheBase<LRUCacheShardType>::LRUCacheBase(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
     const typename LRUCacheShardType::MonitorOptions& options,
-    std::shared_ptr<MemoryAllocator> allocator)
+    std::shared_ptr<MemoryAllocator> allocator,
+    const BlockCacheObsoleteTrackingOptions& tracking_options)
     : ShardedCache(capacity, num_shard_bits, strict_capacity_limit,
-                   std::move(allocator)) {
+                   std::move(allocator)),
+      obsolete_tracker_(tracking_options.enabled
+                            ? std::make_shared<BlockCacheObsoleteTracker>(
+                                  tracking_options)
+                            : nullptr) {
   num_shards_ = 1 << num_shard_bits;
   shards_ = reinterpret_cast<LRUCacheShardType*>(
       port::cacheline_aligned_alloc(sizeof(LRUCacheShardType) * num_shards_));
   size_t per_shard = (capacity + (num_shards_ - 1)) / num_shards_;
   for (int i = 0; i < num_shards_; i++) {
     new (&shards_[i]) LRUCacheShardType(per_shard, strict_capacity_limit,
-                                        high_pri_pool_ratio, options);
+                                        high_pri_pool_ratio, options,
+                                        obsolete_tracker_);
   }
 }
 
@@ -542,6 +587,38 @@ std::string LRUCacheBase<LRUCacheShardType>::DumpLRUCacheStatistics() {
     res.append(shards_[i].DumpDiagnoseInfo());
   }
   return res;
+}
+
+template <class LRUCacheShardType>
+Status LRUCacheBase<LRUCacheShardType>::InsertWithMetadata(
+    const Slice& key, void* value, size_t charge,
+    void (*deleter)(const Slice& key, void* value),
+    const BlockCacheMetadata* metadata, Handle** handle, Priority priority) {
+  uint32_t hash = HashSlice(key);
+  const int shard = (GetNumShardBits() > 0)
+                        ? (hash >> (32 - GetNumShardBits()))
+                        : 0;
+  return shards_[shard].InsertWithMetadata(key, hash, value, charge, deleter,
+                                           metadata, handle, priority);
+}
+
+template <class LRUCacheShardType>
+void LRUCacheBase<LRUCacheShardType>::MarkBlockCacheFilesObsolete(
+    const std::vector<uint64_t>& file_numbers,
+    const std::vector<uint64_t>& output_file_numbers, const char* reason,
+    uint64_t job_id, Logger* info_log) {
+  if (obsolete_tracker_ != nullptr) {
+    obsolete_tracker_->MarkFilesObsolete(file_numbers, output_file_numbers,
+                                         reason, job_id, info_log);
+  }
+}
+
+template <class LRUCacheShardType>
+void LRUCacheBase<LRUCacheShardType>::LogBlockCacheObsoleteSample(
+    const char* reason, uint64_t job_id, Logger* info_log) {
+  if (obsolete_tracker_ != nullptr) {
+    obsolete_tracker_->LogSample(reason, job_id, info_log);
+  }
 }
 
 #ifdef WITH_DIAGNOSE_CACHE
@@ -621,10 +698,21 @@ size_t LRUCacheBase<LRUCacheShardType>::TEST_GetLRUSize() {
 // double LRUCacheBase<LRUCacheShardType>::GetHighPriPoolRatio()
 
 std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts) {
-  return NewLRUCache(cache_opts.capacity, cache_opts.num_shard_bits,
-                     cache_opts.strict_capacity_limit,
-                     cache_opts.high_pri_pool_ratio,
-                     cache_opts.memory_allocator);
+  int num_shard_bits = cache_opts.num_shard_bits;
+  if (num_shard_bits >= 20) {
+    return nullptr;
+  }
+  if (cache_opts.high_pri_pool_ratio < 0.0 ||
+      cache_opts.high_pri_pool_ratio > 1.0) {
+    return nullptr;
+  }
+  if (num_shard_bits < 0) {
+    num_shard_bits = GetDefaultCacheShardBits(cache_opts.capacity);
+  }
+  return std::make_shared<LRUCache>(
+      cache_opts.capacity, num_shard_bits, cache_opts.strict_capacity_limit,
+      cache_opts.high_pri_pool_ratio, LRUCacheShard::MonitorOptions{},
+      cache_opts.memory_allocator, cache_opts.obsolete_tracking_options);
 }
 
 std::shared_ptr<Cache> NewLRUCache(
@@ -650,10 +738,22 @@ std::shared_ptr<Cache> NewLRUCache(
 std::shared_ptr<Cache> NewDiagnosableLRUCache(
     const LRUCacheOptions& cache_opts) {
   assert(cache_opts.is_diagnose);
-  return NewDiagnosableLRUCache(cache_opts.capacity, cache_opts.num_shard_bits,
-                                cache_opts.strict_capacity_limit,
-                                cache_opts.high_pri_pool_ratio,
-                                cache_opts.memory_allocator, cache_opts.topk);
+  int num_shard_bits = cache_opts.num_shard_bits;
+  if (num_shard_bits >= 20) {
+    return nullptr;
+  }
+  if (cache_opts.high_pri_pool_ratio < 0.0 ||
+      cache_opts.high_pri_pool_ratio > 1.0) {
+    return nullptr;
+  }
+  if (num_shard_bits < 0) {
+    num_shard_bits = GetDefaultCacheShardBits(cache_opts.capacity);
+  }
+  return std::make_shared<DiagnosableLRUCache>(
+      cache_opts.capacity, num_shard_bits, cache_opts.strict_capacity_limit,
+      cache_opts.high_pri_pool_ratio,
+      LRUCacheDiagnosableShard::MonitorOptions{cache_opts.topk},
+      cache_opts.memory_allocator, cache_opts.obsolete_tracking_options);
 }
 
 std::shared_ptr<Cache> NewDiagnosableLRUCache(

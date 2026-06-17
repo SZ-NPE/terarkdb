@@ -563,6 +563,7 @@ endif()
 # Main library source code
 set(SOURCES
         cache/clock_cache.cc
+        cache/block_cache_obsolete_tracker.cc
         cache/fifo_cache.cc
         cache/garbage_aware_cache.cc
         cache/lirs_cache.cc

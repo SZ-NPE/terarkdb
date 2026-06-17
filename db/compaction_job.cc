@@ -1501,6 +1501,41 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
   if (status.ok()) {
     status = InstallCompactionResults(mutable_cf_options);
   }
+  if (status.ok() && db_options_.block_cache_obsolete_tracking) {
+    Compaction* compaction = compact_->compaction;
+    std::vector<uint64_t> input_file_numbers;
+    std::vector<uint64_t> output_file_numbers;
+    for (const auto& input_level : *compaction->inputs()) {
+      for (const auto* file : input_level.files) {
+        input_file_numbers.push_back(file->fd.GetNumber());
+      }
+    }
+    for (const auto& sub_compact : compact_->sub_compact_states) {
+      for (const auto& output : sub_compact.outputs) {
+        output_file_numbers.push_back(output.meta.fd.GetNumber());
+      }
+      for (const auto& output : sub_compact.blob_outputs) {
+        output_file_numbers.push_back(output.meta.fd.GetNumber());
+      }
+    }
+    const bool has_replacement =
+        compaction->compaction_type() == kGarbageCollection ||
+        !output_file_numbers.empty();
+    auto* table_factory = cfd->ioptions()->table_factory;
+    if (has_replacement && table_factory != nullptr &&
+        table_factory->Name() == BlockBasedTableFactory::kName) {
+      auto* block_based_factory =
+          static_cast<BlockBasedTableFactory*>(table_factory);
+      const auto& table_options = block_based_factory->table_options();
+      if (table_options.block_cache != nullptr) {
+        table_options.block_cache->MarkBlockCacheFilesObsolete(
+            input_file_numbers, output_file_numbers,
+            compaction->compaction_type() == kGarbageCollection ? "gc"
+                                                                : "compaction",
+            static_cast<uint64_t>(job_id_), db_options_.info_log.get());
+      }
+    }
+  }
   VersionStorageInfo::LevelSummaryStorage tmp;
   auto vstorage = cfd->current()->storage_info();
   const auto& stats = compaction_stats_;

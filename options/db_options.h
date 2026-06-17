@@ -83,6 +83,9 @@ struct ImmutableDBOptions {
   bool blob_gc_collect_block_stats;
   bool blob_gc_collect_latency_stats;
   bool blob_gc_collect_bytes_stats;
+  bool block_cache_obsolete_tracking;
+  uint64_t block_cache_obsolete_sample_interval_sec;
+  uint32_t block_cache_obsolete_topk_files;
   bool avoid_flush_during_recovery;
   bool allow_ingest_behind;
   bool preserve_deletes;

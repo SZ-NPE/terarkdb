@@ -26,6 +26,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "rocksdb/memory_allocator.h"
 #include "rocksdb/slice.h"
@@ -47,6 +48,12 @@ struct BlockCacheMetadata {
   double garbage_ratio = 0.0;
   Statistics* statistics = nullptr;
   Logger* info_log = nullptr;
+};
+
+struct BlockCacheObsoleteTrackingOptions {
+  bool enabled = false;
+  uint64_t sample_interval_sec = 30;
+  uint32_t topk_files = 10;
 };
 
 struct LRUCacheOptions {
@@ -86,6 +93,10 @@ struct LRUCacheOptions {
   // ignored when dealing with compression libraries that allocate memory
   // internally (currently only XPRESS).
   std::shared_ptr<MemoryAllocator> memory_allocator;
+
+  // Experimental tracker for motivation tests. When disabled, LRU cache does
+  // not retain block metadata or maintain obsolete-file residency counters.
+  BlockCacheObsoleteTrackingOptions obsolete_tracking_options;
 
   LRUCacheOptions() {}
   LRUCacheOptions(size_t _capacity, int _num_shard_bits,
@@ -265,6 +276,16 @@ class Cache {
     (void)metadata;
     return Insert(key, value, charge, deleter, handle, priority);
   }
+
+  virtual void MarkBlockCacheFilesObsolete(
+      const std::vector<uint64_t>& /*file_numbers*/,
+      const std::vector<uint64_t>& /*output_file_numbers*/,
+      const char* /*reason*/, uint64_t /*job_id*/,
+      Logger* /*info_log*/ = nullptr) {}
+
+  virtual void LogBlockCacheObsoleteSample(const char* /*reason*/,
+                                           uint64_t /*job_id*/,
+                                           Logger* /*info_log*/ = nullptr) {}
 
   // If the cache has no mapping for "key", returns nullptr.
   //

@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "cache/block_cache_obsolete_tracker.h"
 #include "cache/sharded_cache.h"
 #include "port/port.h"
 #include "rocksdb/terark_namespace.h"
@@ -185,7 +186,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShardTemplate : public CacheMonitor,
   using MonitorOptions = typename CacheMonitor::Options;
   LRUCacheShardTemplate(size_t capacity, bool strict_capacity_limit,
                         double high_pri_pool_ratio,
-                        const typename CacheMonitor::Options& options);
+                        const typename CacheMonitor::Options& options,
+                        std::shared_ptr<BlockCacheObsoleteTracker>
+                            obsolete_tracker = nullptr);
   virtual ~LRUCacheShardTemplate();
 
   // Separate from constructor so caller can easily make an array of LRUCache
@@ -205,6 +208,12 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShardTemplate : public CacheMonitor,
                         void (*deleter)(const Slice& key, void* value),
                         Cache::Handle** handle,
                         Cache::Priority priority) override;
+  Status InsertWithMetadata(const Slice& key, uint32_t hash, void* value,
+                            size_t charge,
+                            void (*deleter)(const Slice& key, void* value),
+                            const BlockCacheMetadata* metadata,
+                            Cache::Handle** handle,
+                            Cache::Priority priority);
   virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true) override;
   virtual bool Ref(Cache::Handle* handle) override;
   virtual bool Release(Cache::Handle* handle,
@@ -251,6 +260,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShardTemplate : public CacheMonitor,
   // This function is not thread safe - it needs to be executed while
   // holding the mutex_
   void EvictFromLRU(size_t charge, autovector<LRUHandle*>* deleted);
+  void TrackInsert(LRUHandle* e, const BlockCacheMetadata* metadata);
+  void TrackErase(LRUHandle* e);
 
   // Initialized before use.
   size_t capacity_;
@@ -290,6 +301,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShardTemplate : public CacheMonitor,
   // We don't count mutex_ as the cache's internal state so semantically we
   // don't mind mutex_ invoking the non-const actions.
   mutable port::Mutex mutex_;
+  std::shared_ptr<BlockCacheObsoleteTracker> obsolete_tracker_;
 };
 
 class LRUCacheNoMonitor {
@@ -656,7 +668,8 @@ class LRUCacheBase : public ShardedCache {
   LRUCacheBase(size_t capacity, int num_shard_bits, bool strict_capacity_limit,
                double high_pri_pool_ratio,
                const typename LRUCacheShardType::MonitorOptions& options = {},
-               std::shared_ptr<MemoryAllocator> memory_allocator = nullptr);
+               std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
+               const BlockCacheObsoleteTrackingOptions& tracking_options = {});
   virtual ~LRUCacheBase();
   virtual const char* Name() const override;
   virtual CacheShard* GetShard(int shard) override;
@@ -666,6 +679,17 @@ class LRUCacheBase : public ShardedCache {
   virtual uint32_t GetHash(Handle* handle) const override;
   virtual void DisownData() override;
   virtual std::string DumpLRUCacheStatistics();
+  Status InsertWithMetadata(
+      const Slice& key, void* value, size_t charge,
+      void (*deleter)(const Slice& key, void* value),
+      const BlockCacheMetadata* metadata, Handle** handle = nullptr,
+      Priority priority = Priority::LOW) override;
+  void MarkBlockCacheFilesObsolete(
+      const std::vector<uint64_t>& file_numbers,
+      const std::vector<uint64_t>& output_file_numbers, const char* reason,
+      uint64_t job_id, Logger* info_log = nullptr) override;
+  void LogBlockCacheObsoleteSample(const char* reason, uint64_t job_id,
+                                   Logger* info_log = nullptr) override;
 
   //  Retrieves number of elements in LRU, for unit test purpose only
   size_t TEST_GetLRUSize();
@@ -682,6 +706,7 @@ class LRUCacheBase : public ShardedCache {
  private:
   LRUCacheShardType* shards_ = nullptr;
   int num_shards_ = 0;
+  std::shared_ptr<BlockCacheObsoleteTracker> obsolete_tracker_;
 };
 
 using LRUCacheShard = LRUCacheShardTemplate<LRUCacheNoMonitor>;
