@@ -362,6 +362,8 @@ InternalIterator* TableCache::NewIterator(
   }
   InternalIterator* result = nullptr;
   if (s.ok()) {
+    table_reader->UpdateBlockCacheMetadata(IsBlobCacheFile(file_meta),
+                                           FileGarbageRatio(file_meta));
     if (!file_meta.prop.is_map_sst()) {
       if (options.table_filter &&
           !options.table_filter(*table_reader->GetTableProperties())) {
@@ -494,6 +496,8 @@ Status TableCache::Get(const ReadOptions& options,
     }
   }
   if (s.ok()) {
+    t->UpdateBlockCacheMetadata(IsBlobCacheFile(file_meta),
+                                FileGarbageRatio(file_meta));
     t->UpdateMaxCoveringTombstoneSeq(options, ExtractUserKey(k),
                                      get_context->max_covering_tombstone_seq());
     if (!file_meta.prop.is_map_sst()) {
@@ -626,6 +630,8 @@ Status TableCache::GetTableProperties(
   auto table_reader = fd.table_reader;
   // table already been pre-loaded?
   if (table_reader) {
+    table_reader->UpdateBlockCacheMetadata(IsBlobCacheFile(file_meta),
+                                           FileGarbageRatio(file_meta));
     *properties = table_reader->GetTableProperties();
 
     return s;
@@ -643,6 +649,8 @@ Status TableCache::GetTableProperties(
   }
   assert(table_handle);
   auto table = GetTableReaderFromHandle(table_handle);
+  table->UpdateBlockCacheMetadata(IsBlobCacheFile(file_meta),
+                                  FileGarbageRatio(file_meta));
   *properties = table->GetTableProperties();
   ReleaseHandle(table_handle);
   return s;

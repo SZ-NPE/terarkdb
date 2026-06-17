@@ -985,8 +985,7 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
   }
 
   rep->file_number = file_number;
-  rep->is_blob_file = is_blob_file;
-  rep->file_garbage_ratio = file_garbage_ratio;
+  new_table->UpdateBlockCacheMetadata(is_blob_file, file_garbage_ratio);
 
   // Read the range del meta block
   bool found_range_del_block;
@@ -1198,6 +1197,12 @@ size_t BlockBasedTable::ApproximateMemoryUsage() const {
 }
 
 uint64_t BlockBasedTable::FileNumber() const { return rep_->file_number; }
+
+void BlockBasedTable::UpdateBlockCacheMetadata(bool is_blob_file,
+                                               double file_garbage_ratio) {
+  rep_->is_blob_file.store(is_blob_file, std::memory_order_relaxed);
+  rep_->file_garbage_ratio.store(file_garbage_ratio, std::memory_order_relaxed);
+}
 
 // Load the meta-block from the file. On success, return the loaded meta block
 // and its iterator.
@@ -1917,12 +1922,14 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
       if (s.ok()) {
         SequenceNumber seq_no = rep->get_global_seqno(is_index);
         BlockCacheMetadata block_cache_metadata;
-        block_cache_metadata.is_blob_file = rep->is_blob_file;
+        block_cache_metadata.is_blob_file =
+            rep->is_blob_file.load(std::memory_order_relaxed);
         block_cache_metadata.is_data_block = !is_index;
         block_cache_metadata.file_number = rep->file_number;
         block_cache_metadata.block_offset = handle.offset();
         block_cache_metadata.block_size = handle.size();
-        block_cache_metadata.garbage_ratio = rep->file_garbage_ratio;
+        block_cache_metadata.garbage_ratio =
+            rep->file_garbage_ratio.load(std::memory_order_relaxed);
         block_cache_metadata.statistics = statistics;
         block_cache_metadata.info_log = rep->ioptions.info_log;
         // If filling cache is allowed and a cache is configured, try to put the

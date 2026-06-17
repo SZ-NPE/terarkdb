@@ -14,51 +14,49 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/sharded_cache.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/terark_namespace.h"
 
 namespace TERARKDB_NAMESPACE {
 
-class GarbageAwareCache : public Cache {
+class GarbageAwareCacheShard : public CacheShard {
  public:
-  explicit GarbageAwareCache(const GarbageAwareCacheOptions& options);
-  ~GarbageAwareCache() override;
+  GarbageAwareCacheShard(size_t capacity, bool strict_capacity_limit,
+                         double admission_ratio, double demote_score_threshold,
+                         uint64_t log_interval);
+  ~GarbageAwareCacheShard() override;
 
-  const char* Name() const override { return "GarbageAwareCache"; }
-
-  Status Insert(const Slice& key, void* value, size_t charge,
+  Status Insert(const Slice& key, uint32_t hash, void* value, size_t charge,
                 void (*deleter)(const Slice& key, void* value),
-                Handle** handle = nullptr,
-                Priority priority = Priority::LOW) override;
-  using Cache::Insert;
+                Cache::Handle** handle,
+                Cache::Priority priority) override;
 
   Status InsertWithMetadata(
       const Slice& key, void* value, size_t charge,
       void (*deleter)(const Slice& key, void* value),
-      const BlockCacheMetadata* metadata, Handle** handle = nullptr,
-      Priority priority = Priority::LOW) override;
+      const BlockCacheMetadata* metadata, uint32_t hash,
+      Cache::Handle** handle, Cache::Priority priority);
 
-  Handle* Lookup(const Slice& key, Statistics* stats = nullptr) override;
-  Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true,
-                 Statistics* stats = nullptr) override;
-  bool Ref(Handle* handle) override;
-  bool Release(Handle* handle, bool force_erase = false) override;
-  void* Value(Handle* handle) override;
-  void Erase(const Slice& key) override;
+  Cache::Handle* Lookup(const Slice& key, uint32_t hash,
+                        bool record_hit = true) override;
+  Cache::Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit,
+                        Statistics* stats);
+  bool Ref(Cache::Handle* handle) override;
+  bool Release(Cache::Handle* handle, bool force_erase = false) override;
   void Erase(const Slice& key, uint32_t hash) override;
-  uint64_t NewId() override;
   void SetCapacity(size_t capacity) override;
   void SetStrictCapacityLimit(bool strict_capacity_limit) override;
-  bool HasStrictCapacityLimit() const override;
-  size_t GetCapacity() const override;
   size_t GetUsage() const override;
-  size_t GetUsage(Handle* handle) const override;
   size_t GetPinnedUsage() const override;
   void ApplyToAllCacheEntries(void (*callback)(void*, size_t),
                               bool thread_safe) override;
   void EraseUnRefEntries() override;
   std::string GetPrintableOptions() const override;
+
+  void* Value(Cache::Handle* handle);
+  size_t GetCharge(Cache::Handle* handle) const;
+  uint32_t GetHash(Cache::Handle* handle) const;
 
   size_t TEST_GetAdmissionSize() const;
   size_t TEST_GetProbationSize() const;
@@ -84,12 +82,13 @@ class GarbageAwareCache : public Cache {
     void* value = nullptr;
     void (*deleter)(const Slice&, void*) = nullptr;
     size_t charge = 0;
+    uint32_t hash = 0;
     uint32_t refs = 0;
     bool in_cache = false;
     bool in_admission = true;
     bool in_queue = false;
     bool garbage_aware = false;
-    Priority priority = Priority::LOW;
+    Cache::Priority priority = Cache::Priority::LOW;
     uint64_t access_freq = 1;
     double garbage_ratio = 0.0;
     double score = 1.0;
@@ -102,9 +101,10 @@ class GarbageAwareCache : public Cache {
 
   Status InsertImpl(const Slice& key, void* value, size_t charge,
                     void (*deleter)(const Slice& key, void* value),
-                    const BlockCacheMetadata* metadata, Handle** handle,
-                    Priority priority);
+                    const BlockCacheMetadata* metadata, uint32_t hash,
+                    Cache::Handle** handle, Cache::Priority priority);
   void FreeEntry(GAHandle* h);
+  void DeleteHandleOnly(GAHandle* h);
   bool Unref(GAHandle* h);
   void RemoveFromQueue(GAHandle* h);
   void AddToQueue(GAHandle* h);
@@ -126,13 +126,46 @@ class GarbageAwareCache : public Cache {
   double admission_ratio_;
   double demote_score_threshold_;
   uint64_t log_interval_;
-  std::atomic<uint64_t> last_id_;
   uint64_t next_score_seq_ = 1;
   uint64_t demotions_ = 0;
   uint64_t low_score_evictions_ = 0;
   uint64_t admission_hits_ = 0;
   uint64_t probation_hits_ = 0;
   Statistics* statistics_ = nullptr;
+};
+
+class GarbageAwareCache : public ShardedCache {
+ public:
+  GarbageAwareCache(const GarbageAwareCacheOptions& options,
+                    int num_shard_bits);
+  ~GarbageAwareCache() override;
+
+  const char* Name() const override { return "GarbageAwareCache"; }
+  CacheShard* GetShard(int shard) override;
+  const CacheShard* GetShard(int shard) const override;
+  void* Value(Handle* handle) override;
+  size_t GetCharge(Handle* handle) const override;
+  uint32_t GetHash(Handle* handle) const override;
+  void DisownData() override;
+
+  using Cache::Insert;
+  Handle* Lookup(const Slice& key, Statistics* stats = nullptr) override;
+  Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true,
+                 Statistics* stats = nullptr) override;
+  Status InsertWithMetadata(
+      const Slice& key, void* value, size_t charge,
+      void (*deleter)(const Slice& key, void* value),
+      const BlockCacheMetadata* metadata, Handle** handle = nullptr,
+      Priority priority = Priority::LOW) override;
+
+  size_t TEST_GetAdmissionSize() const;
+  size_t TEST_GetProbationSize() const;
+
+ private:
+  uint32_t ShardForHash(uint32_t hash) const;
+
+  GarbageAwareCacheShard* shards_ = nullptr;
+  int num_shards_ = 0;
 };
 
 }  // namespace TERARKDB_NAMESPACE

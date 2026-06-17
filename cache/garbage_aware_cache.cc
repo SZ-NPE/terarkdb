@@ -34,48 +34,51 @@ double ClampRatio(double ratio) {
 
 }  // namespace
 
-GarbageAwareCache::GarbageAwareCache(const GarbageAwareCacheOptions& options)
-    : Cache(options.memory_allocator),
-      capacity_(options.capacity),
-      strict_capacity_limit_(options.strict_capacity_limit),
-      admission_ratio_(ClampRatio(options.admission_ratio)),
-      demote_score_threshold_(std::max(0.0, options.demote_score_threshold)),
-      log_interval_(options.log_interval),
-      last_id_(1) {}
+GarbageAwareCacheShard::GarbageAwareCacheShard(
+    size_t capacity, bool strict_capacity_limit, double admission_ratio,
+    double demote_score_threshold, uint64_t log_interval)
+    : capacity_(capacity),
+      strict_capacity_limit_(strict_capacity_limit),
+      admission_ratio_(ClampRatio(admission_ratio)),
+      demote_score_threshold_(std::max(0.0, demote_score_threshold)),
+      log_interval_(log_interval) {}
 
-GarbageAwareCache::~GarbageAwareCache() { EraseUnRefEntries(); }
+GarbageAwareCacheShard::~GarbageAwareCacheShard() { EraseUnRefEntries(); }
 
-Status GarbageAwareCache::Insert(
-    const Slice& key, void* value, size_t charge,
-    void (*deleter)(const Slice& key, void* value), Handle** handle,
-    Priority priority) {
-  return InsertImpl(key, value, charge, deleter, nullptr, handle, priority);
+Status GarbageAwareCacheShard::Insert(
+    const Slice& key, uint32_t hash, void* value, size_t charge,
+    void (*deleter)(const Slice& key, void* value), Cache::Handle** handle,
+    Cache::Priority priority) {
+  return InsertImpl(key, value, charge, deleter, nullptr, hash, handle,
+                    priority);
 }
 
-Status GarbageAwareCache::InsertWithMetadata(
+Status GarbageAwareCacheShard::InsertWithMetadata(
     const Slice& key, void* value, size_t charge,
     void (*deleter)(const Slice& key, void* value),
-    const BlockCacheMetadata* metadata, Handle** handle, Priority priority) {
-  return InsertImpl(key, value, charge, deleter, metadata, handle, priority);
+    const BlockCacheMetadata* metadata, uint32_t hash, Cache::Handle** handle,
+    Cache::Priority priority) {
+  return InsertImpl(key, value, charge, deleter, metadata, hash, handle,
+                    priority);
 }
 
-Status GarbageAwareCache::InsertImpl(
+Status GarbageAwareCacheShard::InsertImpl(
     const Slice& key, void* value, size_t charge,
     void (*deleter)(const Slice& key, void* value),
-    const BlockCacheMetadata* metadata, Handle** handle, Priority priority) {
+    const BlockCacheMetadata* metadata, uint32_t hash, Cache::Handle** handle,
+    Cache::Priority priority) {
   if (handle != nullptr) {
     *handle = nullptr;
   }
-  if (strict_capacity_limit_ && charge > capacity_) {
-    return Status::Incomplete("Insert failed due to strict capacity limit");
-  }
-
   std::vector<GAHandle*> deleted;
   GAHandle* h = new GAHandle();
+  bool inserted = true;
+  Status s;
   h->key.assign(key.data(), key.size());
   h->value = value;
   h->deleter = deleter;
   h->charge = charge;
+  h->hash = hash;
   h->refs = handle == nullptr ? 1 : 2;
   h->in_cache = true;
   h->priority = priority;
@@ -108,6 +111,12 @@ Status GarbageAwareCache::InsertImpl(
                  GC_AWARE_CACHE_VSST_DATA_INSERT);
     }
     EvictIfNeeded(&deleted);
+    if (strict_capacity_limit_ && handle != nullptr && usage_ > capacity_) {
+      RemoveFromCache(h);
+      Unref(h);  // Drop the cache reference; caller keeps value ownership.
+      inserted = false;
+      s = Status::Incomplete("Insert failed due to strict capacity limit");
+    }
     MaybeLogLocked(metadata);
   }
 
@@ -115,18 +124,25 @@ Status GarbageAwareCache::InsertImpl(
     FreeEntry(e);
   }
 
+  if (!inserted) {
+    DeleteHandleOnly(h);
+    return s;
+  }
   if (handle != nullptr) {
     *handle = h;
   }
   return Status::OK();
 }
 
-Cache::Handle* GarbageAwareCache::Lookup(const Slice& key, Statistics* stats) {
-  return Lookup(key, 0, true, stats);
+Cache::Handle* GarbageAwareCacheShard::Lookup(const Slice& key,
+                                              uint32_t hash, bool record_hit) {
+  return Lookup(key, hash, record_hit, nullptr);
 }
 
-Cache::Handle* GarbageAwareCache::Lookup(const Slice& key, uint32_t /*hash*/,
-                                         bool record_hit, Statistics* stats) {
+Cache::Handle* GarbageAwareCacheShard::Lookup(const Slice& key,
+                                              uint32_t /*hash*/,
+                                              bool record_hit,
+                                              Statistics* stats) {
   MutexLock l(&mutex_);
   auto it = table_.find(key.ToString());
   if (it == table_.end()) {
@@ -151,7 +167,7 @@ Cache::Handle* GarbageAwareCache::Lookup(const Slice& key, uint32_t /*hash*/,
   return h;
 }
 
-bool GarbageAwareCache::Ref(Handle* handle) {
+bool GarbageAwareCacheShard::Ref(Cache::Handle* handle) {
   MutexLock l(&mutex_);
   GAHandle* h = reinterpret_cast<GAHandle*>(handle);
   if (!h->in_cache) {
@@ -164,7 +180,7 @@ bool GarbageAwareCache::Ref(Handle* handle) {
   return true;
 }
 
-bool GarbageAwareCache::Release(Handle* handle, bool force_erase) {
+bool GarbageAwareCacheShard::Release(Cache::Handle* handle, bool force_erase) {
   std::vector<GAHandle*> deleted;
   bool erased = false;
   {
@@ -191,13 +207,11 @@ bool GarbageAwareCache::Release(Handle* handle, bool force_erase) {
   return erased;
 }
 
-void* GarbageAwareCache::Value(Handle* handle) {
+void* GarbageAwareCacheShard::Value(Cache::Handle* handle) {
   return reinterpret_cast<GAHandle*>(handle)->value;
 }
 
-void GarbageAwareCache::Erase(const Slice& key) { Erase(key, 0); }
-
-void GarbageAwareCache::Erase(const Slice& key, uint32_t /*hash*/) {
+void GarbageAwareCacheShard::Erase(const Slice& key, uint32_t /*hash*/) {
   std::vector<GAHandle*> deleted;
   {
     MutexLock l(&mutex_);
@@ -216,11 +230,7 @@ void GarbageAwareCache::Erase(const Slice& key, uint32_t /*hash*/) {
   }
 }
 
-uint64_t GarbageAwareCache::NewId() {
-  return last_id_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void GarbageAwareCache::SetCapacity(size_t capacity) {
+void GarbageAwareCacheShard::SetCapacity(size_t capacity) {
   std::vector<GAHandle*> deleted;
   {
     MutexLock l(&mutex_);
@@ -232,31 +242,26 @@ void GarbageAwareCache::SetCapacity(size_t capacity) {
   }
 }
 
-void GarbageAwareCache::SetStrictCapacityLimit(bool strict_capacity_limit) {
+void GarbageAwareCacheShard::SetStrictCapacityLimit(
+    bool strict_capacity_limit) {
   MutexLock l(&mutex_);
   strict_capacity_limit_ = strict_capacity_limit;
 }
 
-bool GarbageAwareCache::HasStrictCapacityLimit() const {
-  MutexLock l(&mutex_);
-  return strict_capacity_limit_;
-}
-
-size_t GarbageAwareCache::GetCapacity() const {
-  MutexLock l(&mutex_);
-  return capacity_;
-}
-
-size_t GarbageAwareCache::GetUsage() const {
+size_t GarbageAwareCacheShard::GetUsage() const {
   MutexLock l(&mutex_);
   return usage_;
 }
 
-size_t GarbageAwareCache::GetUsage(Handle* handle) const {
+size_t GarbageAwareCacheShard::GetCharge(Cache::Handle* handle) const {
   return reinterpret_cast<GAHandle*>(handle)->charge;
 }
 
-size_t GarbageAwareCache::GetPinnedUsage() const {
+uint32_t GarbageAwareCacheShard::GetHash(Cache::Handle* handle) const {
+  return reinterpret_cast<GAHandle*>(handle)->hash;
+}
+
+size_t GarbageAwareCacheShard::GetPinnedUsage() const {
   MutexLock l(&mutex_);
   size_t pinned = 0;
   for (const auto& item : table_) {
@@ -267,8 +272,8 @@ size_t GarbageAwareCache::GetPinnedUsage() const {
   return pinned;
 }
 
-void GarbageAwareCache::ApplyToAllCacheEntries(void (*callback)(void*, size_t),
-                                               bool thread_safe) {
+void GarbageAwareCacheShard::ApplyToAllCacheEntries(
+    void (*callback)(void*, size_t), bool thread_safe) {
   if (thread_safe) {
     mutex_.Lock();
   }
@@ -280,7 +285,7 @@ void GarbageAwareCache::ApplyToAllCacheEntries(void (*callback)(void*, size_t),
   }
 }
 
-void GarbageAwareCache::EraseUnRefEntries() {
+void GarbageAwareCacheShard::EraseUnRefEntries() {
   std::vector<GAHandle*> deleted;
   {
     MutexLock l(&mutex_);
@@ -300,7 +305,7 @@ void GarbageAwareCache::EraseUnRefEntries() {
   }
 }
 
-std::string GarbageAwareCache::GetPrintableOptions() const {
+std::string GarbageAwareCacheShard::GetPrintableOptions() const {
   char buffer[512];
   MutexLock l(&mutex_);
   snprintf(buffer, sizeof(buffer),
@@ -314,30 +319,32 @@ std::string GarbageAwareCache::GetPrintableOptions() const {
   return std::string(buffer);
 }
 
-size_t GarbageAwareCache::TEST_GetAdmissionSize() const {
+size_t GarbageAwareCacheShard::TEST_GetAdmissionSize() const {
   MutexLock l(&mutex_);
   return admission_lru_.size();
 }
 
-size_t GarbageAwareCache::TEST_GetProbationSize() const {
+size_t GarbageAwareCacheShard::TEST_GetProbationSize() const {
   MutexLock l(&mutex_);
   return probation_scores_.size();
 }
 
-void GarbageAwareCache::FreeEntry(GAHandle* h) {
+void GarbageAwareCacheShard::FreeEntry(GAHandle* h) {
   if (h->deleter != nullptr) {
     h->deleter(h->key_slice(), h->value);
   }
   delete h;
 }
 
-bool GarbageAwareCache::Unref(GAHandle* h) {
+void GarbageAwareCacheShard::DeleteHandleOnly(GAHandle* h) { delete h; }
+
+bool GarbageAwareCacheShard::Unref(GAHandle* h) {
   assert(h->refs > 0);
   h->refs--;
   return h->refs == 0;
 }
 
-void GarbageAwareCache::RemoveFromQueue(GAHandle* h) {
+void GarbageAwareCacheShard::RemoveFromQueue(GAHandle* h) {
   if (!h->in_queue) {
     return;
   }
@@ -349,7 +356,7 @@ void GarbageAwareCache::RemoveFromQueue(GAHandle* h) {
   h->in_queue = false;
 }
 
-void GarbageAwareCache::AddToQueue(GAHandle* h) {
+void GarbageAwareCacheShard::AddToQueue(GAHandle* h) {
   assert(h->refs == 1);
   if (h->in_queue) {
     return;
@@ -364,7 +371,7 @@ void GarbageAwareCache::AddToQueue(GAHandle* h) {
   h->in_queue = true;
 }
 
-void GarbageAwareCache::RemoveFromCache(GAHandle* h) {
+void GarbageAwareCacheShard::RemoveFromCache(GAHandle* h) {
   if (!h->in_cache) {
     return;
   }
@@ -379,8 +386,9 @@ void GarbageAwareCache::RemoveFromCache(GAHandle* h) {
   }
 }
 
-void GarbageAwareCache::MoveToProbation(GAHandle* h) {
-  if (!h->in_admission || !h->garbage_aware || h->priority == Priority::HIGH) {
+void GarbageAwareCacheShard::MoveToProbation(GAHandle* h) {
+  if (!h->in_admission || !h->garbage_aware ||
+      h->priority == Cache::Priority::HIGH) {
     return;
   }
   RemoveFromQueue(h);
@@ -392,16 +400,16 @@ void GarbageAwareCache::MoveToProbation(GAHandle* h) {
   RecordTick(statistics_, GC_AWARE_CACHE_DEMOTE);
 }
 
-void GarbageAwareCache::UpdateScore(GAHandle* h) {
+void GarbageAwareCacheShard::UpdateScore(GAHandle* h) {
   h->score = h->access_freq * (1.0 - h->garbage_ratio);
 }
 
-void GarbageAwareCache::EvictIfNeeded(std::vector<GAHandle*>* deleted) {
+void GarbageAwareCacheShard::EvictIfNeeded(std::vector<GAHandle*>* deleted) {
   const size_t admission_capacity =
       static_cast<size_t>(capacity_ * admission_ratio_);
   while (admission_usage_ > admission_capacity && !admission_lru_.empty()) {
     GAHandle* h = admission_lru_.back();
-    if (h->garbage_aware && h->priority != Priority::HIGH) {
+    if (h->garbage_aware && h->priority != Cache::Priority::HIGH) {
       MoveToProbation(h);
     } else {
       RemoveFromCache(h);
@@ -440,7 +448,8 @@ void GarbageAwareCache::EvictIfNeeded(std::vector<GAHandle*>* deleted) {
   }
 }
 
-void GarbageAwareCache::MaybeLogLocked(const BlockCacheMetadata* metadata) {
+void GarbageAwareCacheShard::MaybeLogLocked(
+    const BlockCacheMetadata* metadata) {
   if (metadata == nullptr || metadata->info_log == nullptr ||
       log_interval_ == 0) {
     return;
@@ -460,6 +469,101 @@ void GarbageAwareCache::MaybeLogLocked(const BlockCacheMetadata* metadata) {
       probation_hits_, demotions_, low_score_evictions_);
 }
 
+GarbageAwareCache::GarbageAwareCache(const GarbageAwareCacheOptions& options,
+                                     int num_shard_bits)
+    : ShardedCache(options.capacity, num_shard_bits,
+                   options.strict_capacity_limit, options.memory_allocator) {
+  num_shards_ = 1 << num_shard_bits;
+  shards_ = reinterpret_cast<GarbageAwareCacheShard*>(
+      port::cacheline_aligned_alloc(sizeof(GarbageAwareCacheShard) *
+                                    num_shards_));
+  const size_t per_shard =
+      (options.capacity + (num_shards_ - 1)) / num_shards_;
+  for (int i = 0; i < num_shards_; ++i) {
+    new (&shards_[i]) GarbageAwareCacheShard(
+        per_shard, options.strict_capacity_limit, options.admission_ratio,
+        options.demote_score_threshold, options.log_interval);
+  }
+}
+
+GarbageAwareCache::~GarbageAwareCache() {
+  if (shards_ != nullptr) {
+    for (int i = 0; i < num_shards_; ++i) {
+      shards_[i].~GarbageAwareCacheShard();
+    }
+    port::cacheline_aligned_free(shards_);
+  }
+}
+
+CacheShard* GarbageAwareCache::GetShard(int shard) {
+  return reinterpret_cast<CacheShard*>(&shards_[shard]);
+}
+
+const CacheShard* GarbageAwareCache::GetShard(int shard) const {
+  return reinterpret_cast<const CacheShard*>(&shards_[shard]);
+}
+
+void* GarbageAwareCache::Value(Handle* handle) {
+  return reinterpret_cast<GarbageAwareCacheShard*>(GetShard(ShardForHash(
+             GetHash(handle))))
+      ->Value(handle);
+}
+
+size_t GarbageAwareCache::GetCharge(Handle* handle) const {
+  return reinterpret_cast<const GarbageAwareCacheShard*>(
+             GetShard(ShardForHash(GetHash(handle))))
+      ->GetCharge(handle);
+}
+
+uint32_t GarbageAwareCache::GetHash(Handle* handle) const {
+  return reinterpret_cast<const GarbageAwareCacheShard*>(GetShard(0))
+      ->GetHash(handle);
+}
+
+void GarbageAwareCache::DisownData() { shards_ = nullptr; }
+
+Cache::Handle* GarbageAwareCache::Lookup(const Slice& key, Statistics* stats) {
+  uint32_t hash = HashSlice(key);
+  return Lookup(key, hash, true, stats);
+}
+
+Cache::Handle* GarbageAwareCache::Lookup(const Slice& key, uint32_t hash,
+                                         bool record_hit, Statistics* stats) {
+  return reinterpret_cast<GarbageAwareCacheShard*>(GetShard(ShardForHash(hash)))
+      ->Lookup(key, hash, record_hit, stats);
+}
+
+Status GarbageAwareCache::InsertWithMetadata(
+    const Slice& key, void* value, size_t charge,
+    void (*deleter)(const Slice& key, void* value),
+    const BlockCacheMetadata* metadata, Handle** handle, Priority priority) {
+  uint32_t hash = HashSlice(key);
+  return reinterpret_cast<GarbageAwareCacheShard*>(GetShard(ShardForHash(hash)))
+      ->InsertWithMetadata(key, value, charge, deleter, metadata, hash, handle,
+                           priority);
+}
+
+size_t GarbageAwareCache::TEST_GetAdmissionSize() const {
+  size_t total = 0;
+  for (int i = 0; i < num_shards_; ++i) {
+    total += shards_[i].TEST_GetAdmissionSize();
+  }
+  return total;
+}
+
+size_t GarbageAwareCache::TEST_GetProbationSize() const {
+  size_t total = 0;
+  for (int i = 0; i < num_shards_; ++i) {
+    total += shards_[i].TEST_GetProbationSize();
+  }
+  return total;
+}
+
+uint32_t GarbageAwareCache::ShardForHash(uint32_t hash) const {
+  int num_shard_bits = GetNumShardBits();
+  return (num_shard_bits > 0) ? (hash >> (32 - num_shard_bits)) : 0;
+}
+
 std::shared_ptr<Cache> NewGarbageAwareCache(
     const GarbageAwareCacheOptions& cache_opts) {
   return NewGarbageAwareCache(
@@ -473,15 +577,21 @@ std::shared_ptr<Cache> NewGarbageAwareCache(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double admission_ratio, double demote_score_threshold, uint64_t log_interval,
     std::shared_ptr<MemoryAllocator> memory_allocator) {
-  (void)num_shard_bits;
+  if (num_shard_bits >= 20) {
+    return nullptr;  // the cache cannot be sharded into too many fine pieces
+  }
+  if (num_shard_bits < 0) {
+    num_shard_bits = GetDefaultCacheShardBits(capacity);
+  }
   GarbageAwareCacheOptions options;
   options.capacity = capacity;
+  options.num_shard_bits = num_shard_bits;
   options.strict_capacity_limit = strict_capacity_limit;
   options.admission_ratio = admission_ratio;
   options.demote_score_threshold = demote_score_threshold;
   options.log_interval = log_interval;
   options.memory_allocator = std::move(memory_allocator);
-  return std::make_shared<GarbageAwareCache>(options);
+  return std::make_shared<GarbageAwareCache>(options, num_shard_bits);
 }
 
 }  // namespace TERARKDB_NAMESPACE

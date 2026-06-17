@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 
+#include <atomic>
 #include <memory>
 #include <set>
 #include <string>
@@ -126,6 +127,9 @@ class BlockBasedTable : public TableReader {
   Status Get(const ReadOptions& readOptions, const Slice& key,
              GetContext* get_context, const SliceTransform* prefix_extractor,
              bool skip_filters = false) override;
+
+  void UpdateBlockCacheMetadata(bool is_blob_file,
+                                double file_garbage_ratio) override;
 
   // Pre-fetch the disk blocks that correspond to the key range specified by
   // (kbegin, kend). The call will return error status in the event of
@@ -456,6 +460,8 @@ struct BlockBasedTable::Rep {
         whole_key_filtering(_table_opt.whole_key_filtering),
         prefix_filtering(true),
         global_seqno(kDisableGlobalSequenceNumber),
+        is_blob_file(false),
+        file_garbage_ratio(0.0),
         level(_level),
         immortal_table(_immortal_table) {}
 
@@ -530,8 +536,8 @@ struct BlockBasedTable::Rep {
   // and every key have it's own seqno.
   SequenceNumber global_seqno;
   uint64_t file_number;
-  bool is_blob_file = false;
-  double file_garbage_ratio = 0.0;
+  std::atomic<bool> is_blob_file;
+  std::atomic<double> file_garbage_ratio;
 
   // the level when the table is opened, could potentially change when trivial
   // move is involved

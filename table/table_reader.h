@@ -78,6 +78,11 @@ class TableReader {
 
   virtual uint64_t FileNumber() const = 0;
 
+  // Refresh dynamic metadata used when newly-read blocks are inserted into
+  // block cache. TableReader instances can outlive FileMetaData snapshots.
+  virtual void UpdateBlockCacheMetadata(bool /*is_blob_file*/,
+                                        double /*file_garbage_ratio*/) {}
+
   // Calls get_context->SaveValue() repeatedly, starting with
   // the entry found after a call to Seek(key), until it returns false.
   // May not make such a call if filter policy says that key is not present.

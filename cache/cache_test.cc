@@ -752,6 +752,34 @@ TEST(GarbageAwareCacheTest, ProbationEvictsLowestScore) {
   ASSERT_EQ(1U, stats->getTickerCount(GC_AWARE_CACHE_EVICT_LOW_SCORE));
 }
 
+TEST(GarbageAwareCacheTest, StrictCapacityRejectsPinnedOverflow) {
+  auto cache = NewGarbageAwareCache(1, 0, true);
+
+  Cache::Handle* first = nullptr;
+  ASSERT_OK(cache->Insert("a", EncodeValue(1), 1, dumbDeleter, &first));
+  ASSERT_NE(nullptr, first);
+
+  Cache::Handle* second = nullptr;
+  Status s = cache->Insert("b", EncodeValue(2), 1, dumbDeleter, &second);
+  ASSERT_TRUE(s.IsIncomplete());
+  ASSERT_EQ(nullptr, second);
+  ASSERT_EQ(1U, cache->GetUsage());
+  ASSERT_EQ(nullptr, cache->Lookup("b"));
+
+  ASSERT_OK(cache->Insert("b", EncodeValue(2), 1, dumbDeleter));
+  ASSERT_EQ(1U, cache->GetUsage());
+  ASSERT_EQ(nullptr, cache->Lookup("b"));
+
+  cache->Release(first);
+}
+
+TEST(GarbageAwareCacheTest, HonorsShardBits) {
+  auto cache = NewGarbageAwareCache(1024, 2, false);
+  auto* sharded = dynamic_cast<ShardedCache*>(cache.get());
+  ASSERT_NE(nullptr, sharded);
+  ASSERT_EQ(2, sharded->GetNumShardBits());
+}
+
 #ifdef SUPPORT_CLOCK_CACHE
 shared_ptr<Cache> (*new_clock_cache_func)(size_t, int, bool) = NewClockCache;
 INSTANTIATE_TEST_CASE_P(CacheTestInstance, CacheTest,
