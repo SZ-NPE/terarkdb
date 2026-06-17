@@ -1744,12 +1744,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       MaxBlobSize(*mutable_cf_options, cfd->ioptions()->num_levels,
                   cfd->ioptions()->compaction_style);
 
-  // precise_gc: accumulate the raw value bytes actually written into each
-  // newly-created blob file during this compaction. Entries that merely carry
-  // an index to an existing blob (i.e. value is already in kTypeValueIndex
-  // form when it enters the compaction iterator) are NOT recorded here; their
-  // byte cost is already reflected in the source blob's existing metadata.
-  std::unordered_map<uint64_t, uint64_t> new_blob_bytes_per_fn;
   auto trans_to_separate = [&](const Slice& key, LazyBuffer& value,
                                SeparateHelper::ValueMetaData* value_meta) {
     Status s;
@@ -1765,15 +1759,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       blob_builder = sub_compact->blob_builder.get();
       blob_meta = &sub_compact->current_blob_output()->meta;
     }
-    uint64_t raw_value_bytes = 0;
-    if (s.ok()) {
-      // Fetch before Add so we can observe the real value length without
-      // paying an extra I/O; Add() itself fetches internally.
-      s = value.fetch();
-      if (s.ok()) {
-        raw_value_bytes = value.slice().size();
-      }
-    }
     if (s.ok()) {
       if (value_meta == nullptr) {
         s = blob_builder->Add(key, value);
@@ -1783,7 +1768,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     }
     if (s.ok()) {
       blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
-      new_blob_bytes_per_fn[blob_meta->fd.GetNumber()] += raw_value_bytes;
       if (value_meta != nullptr &&
           !mutable_cf_options->read_separated_value_by_handle) {
         value_meta->block_handle = BlockHandle();
@@ -1922,7 +1906,11 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (!sub_compact->compaction->partial_compaction()) {
     dict_sample_data.reserve(kSampleBytes);
   }
-  std::unordered_map<uint64_t, uint64_t> dependence;
+  // For KV separation, record how many entries and bytes in each blob SST are
+  // still referenced by this output kSST. The byte component is filled from
+  // delta-block value_size metadata and is the key input for precise Blob GC.
+  std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> dependence;
+  const bool precise_gc = mutable_cf_options->precise_gc;
 
   size_t yield_count = 0;
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid()) {
@@ -1933,9 +1921,12 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     if (c_iter->ikey().type == kTypeValueIndex ||
         c_iter->ikey().type == kTypeMergeIndex) {
       assert(value.file_number() != uint64_t(-1));
-      auto ib = dependence.emplace(value.file_number(), 1);
+      const uint64_t value_size = precise_gc ? c_iter->value_size() : 0;
+      auto ib = dependence.emplace(value.file_number(),
+                                   std::make_pair(uint64_t{1}, value_size));
       if (!ib.second) {
-        ++ib.first->second;
+        ++ib.first->second.first;
+        ib.first->second.second += value_size;
       }
     }
 
@@ -2076,8 +2067,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       CompactionIterationStats range_del_out_stats;
       status = FinishCompactionOutputFile(input_status, sub_compact,
                                           &range_del_agg, &range_del_out_stats,
-                                          dependence, new_blob_bytes_per_fn,
-                                          next_key);
+                                          dependence, next_key);
       dependence.clear();
       RecordDroppedKeys(range_del_out_stats,
                         &sub_compact->compaction_job_stats);
@@ -2146,8 +2136,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (sub_compact->builder != nullptr) {
     CompactionIterationStats range_del_out_stats;
     Status s = FinishCompactionOutputFile(status, sub_compact, &range_del_agg,
-                                          &range_del_out_stats, dependence,
-                                          new_blob_bytes_per_fn);
+                                          &range_del_out_stats, dependence);
     dependence.clear();
     if (status.ok()) {
       status = s;
@@ -2680,8 +2669,8 @@ Status CompactionJob::FinishCompactionOutputFile(
     const Status& input_status, SubcompactionState* sub_compact,
     CompactionRangeDelAggregator* range_del_agg,
     CompactionIterationStats* range_del_out_stats,
-    const std::unordered_map<uint64_t, uint64_t>& dependence,
-    const std::unordered_map<uint64_t, uint64_t>& new_blob_bytes_per_fn,
+    const std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>>&
+        dependence,
     const Slice* next_table_min_key /* = nullptr */) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_SYNC_FILE);
@@ -2798,19 +2787,8 @@ Status CompactionJob::FinishCompactionOutputFile(
                                       : 0;
     meta->prop.num_entries = sub_compact->builder->NumEntries();
     for (auto& pair : dependence) {
-      // precise_gc: byte_count is populated for blob files that were created
-      // during this very compaction (we observed raw value sizes while writing
-      // them out in `trans_to_separate`). For blob files being merely
-      // re-referenced via value-index carrying entries, byte_count stays 0,
-      // and VersionBuilder's fallback will estimate it by averaging over the
-      // source blob file.
-      uint64_t byte_count = 0;
-      auto bit = new_blob_bytes_per_fn.find(pair.first);
-      if (bit != new_blob_bytes_per_fn.end()) {
-        byte_count = bit->second;
-      }
       meta->prop.dependence.emplace_back(
-          Dependence{pair.first, pair.second, byte_count});
+          Dependence{pair.first, pair.second.first, pair.second.second});
     }
     std::sort(meta->prop.dependence.begin(), meta->prop.dependence.end(),
               TERARK_CMP(file_number, <));
@@ -2923,9 +2901,6 @@ Status CompactionJob::FinishCompactionOutputBlob(
   assert(sub_compact->blob_outfile);
   assert(sub_compact->blob_builder != nullptr);
   assert(sub_compact->current_blob_output() != nullptr);
-  TEST_SYNC_POINT_CALLBACK("CompactionJob::FinishCompactionOutputBlob::Start",
-                           &sub_compact->current_blob_output()->meta);
-
   uint64_t output_number =
       sub_compact->current_blob_output()->meta.fd.GetNumber();
   assert(output_number != 0);
@@ -2938,6 +2913,10 @@ Status CompactionJob::FinishCompactionOutputBlob(
   assert(meta != nullptr);
   if (s.ok()) {
     meta->prop.num_entries = sub_compact->blob_builder->NumEntries();
+    if (meta->prop.num_entries > 0) {
+      TEST_SYNC_POINT_CALLBACK(
+          "CompactionJob::FinishCompactionOutputBlob::Start", meta);
+    }
     meta->prop.inheritance = InheritanceTreeToSet(inheritance_tree);
     assert(std::is_sorted(meta->prop.inheritance.begin(),
                           meta->prop.inheritance.end()));
@@ -2972,7 +2951,21 @@ Status CompactionJob::FinishCompactionOutputBlob(
     meta->prop.flags |= TablePropertyCache::kNoRangeDeletions;
   }
 
-  if (s.ok()) {
+  if (s.ok() && meta->prop.num_entries == 0) {
+    std::string fname =
+        TableFileName(sub_compact->compaction->immutable_cf_options()->cf_paths,
+                      meta->fd.GetNumber(), meta->fd.GetPathId());
+    env_->DeleteFile(fname);
+
+    // Also remove the empty blob output so it will not be installed into the
+    // VersionEdit. Empty blob outputs can happen when a GC/rebuild job finds no
+    // live entries after opening its output file.
+    assert(!sub_compact->blob_outputs.empty());
+    sub_compact->blob_outputs.pop_back();
+    meta = nullptr;
+  }
+
+  if (s.ok() && meta != nullptr) {
     // Output to event logger and fire events.
     sub_compact->current_blob_output()->table_properties =
         std::make_shared<TableProperties>(tp);

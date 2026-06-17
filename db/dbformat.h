@@ -56,6 +56,11 @@ class BlockHandle {
   // as a null block handle that points to no where.
   bool IsNull() const { return offset_ == 0 && size_ == 0; }
 
+  bool IsInvalid() const {
+    return offset_ == ~static_cast<uint64_t>(0) ||
+           size_ == ~static_cast<uint64_t>(0);
+  }
+
   static const BlockHandle& NullBlockHandle() { return kNullBlockHandle; }
 
   // Maximum encoding length of a BlockHandle

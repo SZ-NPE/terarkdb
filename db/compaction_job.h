@@ -136,8 +136,8 @@ class CompactionJob {
       const Status& input_status, SubcompactionState* sub_compact,
       CompactionRangeDelAggregator* range_del_agg,
       CompactionIterationStats* range_del_out_stats,
-      const std::unordered_map<uint64_t, uint64_t>& dependence,
-      const std::unordered_map<uint64_t, uint64_t>& new_blob_bytes_per_fn,
+      const std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>>&
+          dependence,
       const Slice* next_table_min_key = nullptr);
   Status FinishCompactionOutputBlob(
       const Status& input_status, SubcompactionState* sub_compact,

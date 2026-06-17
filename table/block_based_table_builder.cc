@@ -441,21 +441,28 @@ Status BlockBasedTableBuilder::Add(
     r->filter_builder->Add(ExtractUserKey(key));
   }
 
-  r->last_key.assign(key.data(), key.size());
-  r->data_block.Add(key, value);
-  if (r->store_block_handle_in_sst) {
-    Flush();
-    value_meta.block_handle = r->pending_handle;
-  }
   const ValueType value_type = ExtractValueType(key);
   const bool is_separated =
       value_type == kTypeValueIndex || value_type == kTypeMergeIndex;
+  if (r->store_block_handle_in_sst && r->props.num_entries > 0) {
+    r->index_builder->AddIndexEntry(&r->last_key, &key, r->pending_handle);
+  }
+  r->data_block.Add(key, value);
   if (r->table_options.use_delta_block) {
     r->delta_block.Add(is_separated,
                        is_separated ? value_meta.value_size : 0,
                        value_meta.meta_data.empty() ? nullptr
                                                      : &value_meta.meta_data);
   }
+  if (r->store_block_handle_in_sst) {
+    Flush();
+    value_meta.block_handle = r->pending_handle;
+    if (r->table_options.use_delta_block) {
+      r->delta_block.AddIndexEntry(r->props.num_data_blocks,
+                                   static_cast<uint32_t>(r->props.num_entries));
+    }
+  }
+  r->last_key.assign(key.data(), key.size());
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
@@ -956,7 +963,7 @@ Status BlockBasedTableBuilder::Finish(
 
   // To make sure properties block is able to keep the accurate size of index
   // block, we will finish writing all index entries first.
-  if (ok() && !empty_data_block) {
+  if (ok() && (r->store_block_handle_in_sst || !empty_data_block)) {
     r->index_builder->AddIndexEntry(
         &r->last_key, nullptr /* no next data block */, r->pending_handle);
   }

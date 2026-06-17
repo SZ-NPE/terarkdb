@@ -271,7 +271,7 @@ Status SeparateHelper::TransToSeparate(
   if (value.valid() && meta->value_size == 0) {
     meta->value_size = static_cast<uint32_t>(internal_key.size() + value.size());
   }
-  if (!meta->block_handle.IsNull()) {
+  if (!meta->block_handle.IsInvalid() && !meta->block_handle.IsNull()) {
     std::string handle_encode;
     meta->block_handle.EncodeTo(&handle_encode);
     Slice parts[] = {EncodeFileNumber(file_number), handle_encode};

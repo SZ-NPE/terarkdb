@@ -866,7 +866,8 @@ void CompactionIterator::PrepareOutput() {
       if (!blob_config_.read_separated_value_by_handle) {
         output_value_meta_.block_handle = BlockHandle();
       }
-      output_value_meta_.value_size = value_.size();
+      output_value_meta_.value_size =
+          current_key_.GetInternalKey().size() + value_.size();
       s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_, &output_value_meta_,
           ikey_.type == kTypeMergeIndex, false);
@@ -918,7 +919,8 @@ void CompactionIterator::PrepareOutput() {
           status_ = std::move(s);
           return;
         }
-        output_value_meta_.value_size = value_.size();
+        output_value_meta_.value_size =
+            current_key_.GetInternalKey().size() + value_.size();
       }
       auto s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_, &output_value_meta_,

@@ -921,6 +921,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   dirtiest_blob.f->set_gc_candidate();
   uint64_t total_estimate_size = dirtiest_blob.estimate_size;
   uint64_t num_antiquation = dirtiest_blob.f->num_antiquation;
+  uint64_t size_antiquated = dirtiest_blob.f->num_antiquation_bytes;
 
   // expand with neighbor blob
   std::vector<GarbageFileInfo> candidate_blob_vec;
@@ -986,6 +987,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
     if (total_estimate_size + estimate_size < target_blob_file_size) {
       total_estimate_size += estimate_size;
       num_antiquation += f->num_antiquation;
+      size_antiquated += f->num_antiquation_bytes;
       f->set_gc_candidate();
       input.files.push_back(f);
     }
@@ -1001,6 +1003,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   params.inputs = std::move(inputs);
   params.output_level = -1;
   params.num_antiquation = num_antiquation;
+  params.size_antiquated = size_antiquated;
   params.max_compaction_bytes = LLONG_MAX;
   params.output_path_id = GetPathId(ioptions_, mutable_cf_options, 1);
   params.compression = GetCompressionType(
@@ -1020,9 +1023,10 @@ Compaction* CompactionPicker::PickGarbageCollection(
     RecordTick(ioptions_.statistics, GC_PICK_SELECTED_BYTES,
                total_estimate_size);
     RecordTick(ioptions_.statistics, GC_PICK_SELECTED_GARBAGE_BYTES,
-               num_antiquation);
+               size_antiquated);
     RecordTick(ioptions_.statistics, GC_PICK_SELECTED_LIVE_BYTES,
-               total_estimate_size - std::min(total_estimate_size, num_antiquation));
+               total_estimate_size -
+                   std::min(total_estimate_size, size_antiquated));
   ROCKS_LOG_INFO(
       ioptions_.info_log,
       "[%s] GC_PICK scanned=%" PRIu64 " permitted=%" PRIu64

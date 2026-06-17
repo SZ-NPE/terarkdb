@@ -87,6 +87,7 @@ struct CompactionParams {
   int output_level = 0;
   uint64_t target_file_size = 0;
   uint64_t num_antiquation = 0;
+  uint64_t size_antiquated = 0;
   uint64_t max_compaction_bytes = 0;
   uint32_t output_path_id = 0;
   CompressionType compression = kNoCompression;
@@ -262,6 +263,7 @@ class Compaction {
 
   // GC expectation clears
   uint64_t num_antiquation() const { return num_antiquation_; }
+  uint64_t size_antiquated() const { return size_antiquated_; }
 
   // Maximum size of files to build during this compaction.
   uint64_t max_output_file_size() const { return max_output_file_size_; }
@@ -456,6 +458,7 @@ class Compaction {
   const int start_level_;   // the lowest level to be compacted
   const int output_level_;  // levels to which output files are stored
   uint64_t num_antiquation_;
+  uint64_t size_antiquated_;
   uint64_t max_output_file_size_;
   uint64_t max_compaction_bytes_;
   uint32_t max_subcompactions_;
