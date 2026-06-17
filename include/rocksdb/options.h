@@ -307,6 +307,11 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // valid [8 , size_t(-1)]
   size_t blob_size = 512;
 
+  // Enable the middle-value Delta Separate policy. This is a master gate for
+  // middle_blob_size and middle_combine_level so POC benchmarks can A/B test
+  // the policy without changing the base KV separation threshold.
+  bool enable_delta_separate = true;
+
   // Values in [blob_size, middle_blob_size) are treated as middle separated
   // values. They may be combined back into normal SST files once compaction
   // reaches middle_combine_level. Set middle_blob_size <= blob_size to disable

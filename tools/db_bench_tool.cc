@@ -1001,6 +1001,19 @@ DEFINE_bool(disable_auto_compactions, false, "Do not auto trigger compactions");
 DEFINE_bool(enable_lazy_compaction, true, "Enable map or link compaction");
 
 DEFINE_uint64(blob_size, size_t(-1), "Key Value Separate blob size");
+DEFINE_bool(enable_delta_separate,
+            TERARKDB_NAMESPACE::Options().enable_delta_separate,
+            "Enable the middle-value Delta Separate policy. Disable this to "
+            "A/B test against normal KV separation with the same blob_size.");
+DEFINE_uint64(middle_blob_size,
+              TERARKDB_NAMESPACE::Options().middle_blob_size,
+              "Upper bound for middle separated values. Values in "
+              "[blob_size, middle_blob_size) use the Delta Separate "
+              "middle-value policy. Set <= blob_size to disable it.");
+DEFINE_uint64(middle_combine_level,
+              TERARKDB_NAMESPACE::Options().middle_combine_level,
+              "Combine middle separated values back into normal SST files "
+              "when compaction input level reaches this level.");
 DEFINE_bool(enable_hotness_tracker, false,
             "Enable hotness-based hot/cold blob routing");
 DEFINE_uint64(hotness_window_capacity, 1000000,
@@ -3633,6 +3646,9 @@ class Benchmark {
     options.disable_auto_compactions = FLAGS_disable_auto_compactions;
     options.enable_lazy_compaction = FLAGS_enable_lazy_compaction;
     options.blob_size = FLAGS_blob_size;
+    options.enable_delta_separate = FLAGS_enable_delta_separate;
+    options.middle_blob_size = FLAGS_middle_blob_size;
+    options.middle_combine_level = FLAGS_middle_combine_level;
     options.enable_hotness_tracker = FLAGS_enable_hotness_tracker;
     options.hotness_window_capacity = FLAGS_hotness_window_capacity;
     options.hotness_hot_capacity = FLAGS_hotness_hot_capacity;

@@ -75,7 +75,7 @@ class CompactionIterator {
                      bool report_detailed_time, bool expect_valid_internal_key,
                      CompactionRangeDelAggregator* range_del_agg,
                      const Compaction* compaction = nullptr,
-                     BlobConfig blob_config = BlobConfig{size_t(-1),
+                     BlobConfig blob_config = BlobConfig{size_t(-1), true,
                                                          size_t(-1),
                                                          size_t(-1), 0.0,
                                                          false},

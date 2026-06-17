@@ -175,6 +175,7 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.disable_auto_compactions =
       mutable_cf_options.disable_auto_compactions;
   cf_opts.blob_size = mutable_cf_options.blob_size;
+  cf_opts.enable_delta_separate = mutable_cf_options.enable_delta_separate;
   cf_opts.middle_blob_size = mutable_cf_options.middle_blob_size;
   cf_opts.middle_combine_level = mutable_cf_options.middle_combine_level;
   cf_opts.hotness_window_capacity = mutable_cf_options.hotness_window_capacity;
@@ -1955,6 +1956,10 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::blob_size), OptionType::kSizeT,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, blob_size)}},
+        {"enable_delta_separate",
+         {offset_of(&ColumnFamilyOptions::enable_delta_separate),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, enable_delta_separate)}},
         {"middle_blob_size",
          {offset_of(&ColumnFamilyOptions::middle_blob_size), OptionType::kSizeT,
           OptionVerificationType::kNormal, true,

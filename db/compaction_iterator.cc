@@ -208,7 +208,7 @@ CompactionIterator::CompactionIterator(
                      separation_type == kCompactionAutoRebuildBlob;
   do_combine_value_ = separation_type == kCompactionCombineValue;
   need_combine_middle_value_ =
-      compaction_ != nullptr &&
+      blob_config_.enable_delta_separate && compaction_ != nullptr &&
       static_cast<size_t>(compaction_->level()) >=
           blob_config_.middle_combine_level;
 }

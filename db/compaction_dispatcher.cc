@@ -232,8 +232,8 @@ AJSON(CompactionFilterContext, is_full_compaction, is_manual_compaction,
 using NameParam = CompactionWorkerContext::NameParam;
 AJSON(NameParam, name, param);
 
-AJSON(BlobConfig, blob_size, middle_blob_size, middle_combine_level,
-      large_key_ratio, read_separated_value_by_handle);
+AJSON(BlobConfig, blob_size, enable_delta_separate, middle_blob_size,
+      middle_combine_level, large_key_ratio, read_separated_value_by_handle);
 
 AJSON(CompactionWorkerContext, user_comparator, merge_operator,
       merge_operator_data, value_meta_extractor_factory,

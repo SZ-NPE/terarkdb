@@ -197,6 +197,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  max_subcompactions);
   ROCKS_LOG_INFO(log, "                                blob_size: %zd",
                  blob_size);
+  ROCKS_LOG_INFO(log, "                     enable_delta_separate: %d",
+                 enable_delta_separate);
   ROCKS_LOG_INFO(log, "                         middle_blob_size: %zd",
                  middle_blob_size);
   ROCKS_LOG_INFO(log, "                      middle_combine_level: %zd",
@@ -312,6 +314,7 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       disable_auto_compactions(options.disable_auto_compactions),
       max_subcompactions(options.max_subcompactions),
       blob_size(options.blob_size),
+      enable_delta_separate(options.enable_delta_separate),
       middle_blob_size(options.middle_blob_size),
       middle_combine_level(options.middle_combine_level),
       hotness_window_capacity(options.hotness_window_capacity),

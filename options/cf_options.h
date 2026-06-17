@@ -141,6 +141,7 @@ struct ImmutableCFOptions {
 
 struct BlobConfig {
   size_t blob_size;
+  bool enable_delta_separate;
   size_t middle_blob_size;
   size_t middle_combine_level;
   double large_key_ratio;
@@ -162,6 +163,7 @@ struct MutableCFOptions {
         disable_auto_compactions(false),
         max_subcompactions(0),
         blob_size(0),
+        enable_delta_separate(true),
         middle_blob_size(size_t(-1)),
         middle_combine_level(size_t(-1)),
         hotness_window_capacity(0),
@@ -199,8 +201,12 @@ struct MutableCFOptions {
   explicit MutableCFOptions(const Options& options);
 
   BlobConfig get_blob_config() const {
-    return BlobConfig{blob_size, middle_blob_size, middle_combine_level,
-                      blob_large_key_ratio, read_separated_value_by_handle};
+    return BlobConfig{blob_size,
+                      enable_delta_separate,
+                      middle_blob_size,
+                      middle_combine_level,
+                      blob_large_key_ratio,
+                      read_separated_value_by_handle};
   }
 
   // Must be called after any change to MutableCFOptions
@@ -233,6 +239,7 @@ struct MutableCFOptions {
   bool disable_auto_compactions;
   uint32_t max_subcompactions;
   size_t blob_size;
+  bool enable_delta_separate;
   size_t middle_blob_size;
   size_t middle_combine_level;
   size_t hotness_window_capacity;

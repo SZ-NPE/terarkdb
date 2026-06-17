@@ -266,6 +266,9 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log, "                              Options.blob_size: %zd",
                    blob_size);
   ROCKS_LOG_HEADER(log,
+                   "                   Options.enable_delta_separate: %d",
+                   enable_delta_separate);
+  ROCKS_LOG_HEADER(log,
                    "                       Options.middle_blob_size: %zd",
                    middle_blob_size);
   ROCKS_LOG_HEADER(log,

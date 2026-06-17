@@ -476,6 +476,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "hard_pending_compaction_bytes_limit=0;"
       "disable_auto_compactions=false;"
       "blob_size=1028;"
+      "enable_delta_separate=true;"
       "middle_blob_size=2048;"
       "middle_combine_level=2;"
       "blob_large_key_ratio=0.5;"
