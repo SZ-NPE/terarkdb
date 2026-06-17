@@ -111,6 +111,11 @@ class TableCache {
                             const SliceTransform* prefix_extractor = nullptr,
                             bool no_io = false);
 
+  Status ApproximateKeyAnchors(const ReadOptions& read_options,
+                               const FileMetaData& file_meta, bool no_io,
+                               int level,
+                               std::vector<TableReader::Anchor>& anchors);
+
   // Return total memory usage of the table reader of the file.
   // 0 if table reader of the file is not loaded.
   size_t GetMemoryUsageByTableReader(

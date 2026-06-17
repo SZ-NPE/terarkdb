@@ -656,6 +656,35 @@ Status TableCache::GetTableProperties(
   return s;
 }
 
+Status TableCache::ApproximateKeyAnchors(
+    const ReadOptions& read_options, const FileMetaData& file_meta, bool no_io,
+    int level, std::vector<TableReader::Anchor>& anchors) {
+  Status s;
+  TableReader* table_reader = file_meta.fd.table_reader;
+  Cache::Handle* table_handle = nullptr;
+  if (table_reader == nullptr) {
+    s = FindTable(env_options_, file_meta.fd, &table_handle,
+                  nullptr /* prefix_extractor */, no_io,
+                  true /* record_read_stats */, nullptr /* file_read_hist */,
+                  false /* skip_filters */, level,
+                  true /* prefetch_index_and_filter_in_cache */,
+                  file_meta.prop.is_map_sst(), IsBlobCacheFile(file_meta),
+                  FileGarbageRatio(file_meta));
+    if (s.ok()) {
+      table_reader = GetTableReaderFromHandle(table_handle);
+    }
+  }
+  if (s.ok() && table_reader != nullptr) {
+    table_reader->UpdateBlockCacheMetadata(IsBlobCacheFile(file_meta),
+                                           FileGarbageRatio(file_meta));
+    s = table_reader->ApproximateKeyAnchors(read_options, anchors);
+  }
+  if (table_handle != nullptr) {
+    ReleaseHandle(table_handle);
+  }
+  return s;
+}
+
 size_t TableCache::GetMemoryUsageByTableReader(
     const EnvOptions& env_options, const FileDescriptor& fd,
     const SliceTransform* prefix_extractor) {

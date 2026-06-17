@@ -918,10 +918,14 @@ int CompactionJob::Prepare(int sub_compaction_slots) {
 
     assert(sizes_.size() == boundaries_.size() + 1);
 
-    for (size_t i = 0; i <= boundaries_.size(); i++) {
-      Slice* start = i == 0 ? nullptr : &boundaries_[i - 1];
-      Slice* end = i == boundaries_.size() ? nullptr : &boundaries_[i];
-      compact_->sub_compact_states.emplace_back(c, start, end, sizes_[i]);
+    if (!boundaries_.empty()) {
+      for (size_t i = 0; i <= boundaries_.size(); i++) {
+        Slice* start = i == 0 ? nullptr : &boundaries_[i - 1];
+        Slice* end = i == boundaries_.size() ? nullptr : &boundaries_[i];
+        compact_->sub_compact_states.emplace_back(c, start, end, sizes_[i]);
+      }
+    } else {
+      compact_->sub_compact_states.emplace_back(c, nullptr, nullptr);
     }
     MeasureTime(stats_, NUM_SUBCOMPACTIONS_SCHEDULED,
                 compact_->sub_compact_states.size());
@@ -932,151 +936,144 @@ int CompactionJob::Prepare(int sub_compaction_slots) {
   return static_cast<int>(compact_->sub_compact_states.size() - 1);
 }
 
-struct RangeWithSize {
-  Range range;
-  uint64_t size;
-
-  RangeWithSize(const Slice& a, const Slice& b, uint64_t s = 0)
-      : range(a, b), size(s) {}
-};
-
-// Generates a histogram representing potential divisions of key ranges from
-// the input. It adds the starting and/or ending keys of certain input files
-// to the working set and then finds the approximate size of data in between
-// each consecutive pair of slices. Then it divides these ranges into
-// consecutive groups such that each group has a similar size.
+// Samples table index anchors from compaction inputs and chooses key boundaries
+// so each subcompaction covers roughly similar input bytes.
 void CompactionJob::GenSubcompactionBoundaries(int max_usable_threads) {
   auto* c = compact_->compaction;
+  if (c->max_subcompactions() <= 1 &&
+      c->immutable_cf_options()->compaction_style != kCompactionStyleLevel) {
+    return;
+  }
   auto* cfd = c->column_family_data();
   const Comparator* cfd_comparator = cfd->user_comparator();
-  std::vector<Slice> bounds;
+  auto* v = compact_->compaction->input_version();
+  int base_level = v->storage_info()->base_level();
+
+  struct MutexUnlockGuard {
+    explicit MutexUnlockGuard(InstrumentedMutex* mutex) : mutex_(mutex) {
+      mutex_->Unlock();
+    }
+    ~MutexUnlockGuard() { mutex_->Lock(); }
+    InstrumentedMutex* mutex_;
+  } unlock_guard(db_mutex_);
+
+  uint64_t total_size = 0;
+  std::vector<TableReader::Anchor> all_anchors;
   int start_lvl = c->start_level();
   int out_lvl = c->output_level();
 
-  // Add the starting and/or ending key of certain input files as a potential
-  // boundary
   for (size_t lvl_idx = 0; lvl_idx < c->num_input_levels(); lvl_idx++) {
     int lvl = c->level(lvl_idx);
     if (lvl >= start_lvl && lvl <= out_lvl) {
       const LevelFilesBrief* flevel = c->input_levels(lvl_idx);
-      size_t num_files = flevel->num_files;
-
-      if (num_files == 0) {
+      if (flevel->num_files == 0) {
         continue;
       }
+      for (size_t i = 0; i < flevel->num_files; i++) {
+        FileMetaData* f = flevel->files[i].file_metadata;
+        std::vector<TableReader::Anchor> my_anchors;
 
-      if (lvl == 0) {
-        // For level 0 add the starting and ending key of each file since the
-        // files may have greatly differing key ranges (not range-partitioned)
-        for (size_t i = 0; i < num_files; i++) {
-          bounds.emplace_back(flevel->files[i].smallest_key);
-          bounds.emplace_back(flevel->files[i].largest_key);
-        }
-      } else {
-        // For all other levels add the smallest/largest key in the level to
-        // encompass the range covered by that level
-        bounds.emplace_back(flevel->files[0].smallest_key);
-        bounds.emplace_back(flevel->files[num_files - 1].largest_key);
-        if (lvl == out_lvl) {
-          // For the last level include the starting keys of all files since
-          // the last level is the largest and probably has the widest key
-          // range. Since it's range partitioned, the ending key of one file
-          // and the starting key of the next are very close (or identical).
-          for (size_t i = 1; i < num_files; i++) {
-            bounds.emplace_back(flevel->files[i].smallest_key);
-          }
-        }
-        for (size_t i = 0; i < num_files; i++) {
-          if (flevel->files[i].file_metadata->prop.is_map_sst()) {
-            auto& dependence_map =
-                c->input_version()->storage_info()->dependence_map();
-            for (auto& dependence :
-                 flevel->files[i].file_metadata->prop.dependence) {
-              auto find = dependence_map.find(dependence.file_number);
-              if (find == dependence_map.end()) {
-                assert(false);
-                continue;
-              }
-              bounds.emplace_back(find->second->smallest.Encode());
-              bounds.emplace_back(find->second->largest.Encode());
+        if (f->prop.is_map_sst()) {
+          auto& dependence_map =
+              c->input_version()->storage_info()->dependence_map();
+          for (auto& dependence : f->prop.dependence) {
+            auto find = dependence_map.find(dependence.file_number);
+            if (find == dependence_map.end()) {
+              assert(false);
+              continue;
+            }
+            Status s = cfd->table_cache()->ApproximateKeyAnchors(
+                ReadOptions(), *(find->second), false /* no_io */, lvl,
+                my_anchors);
+            if (!s.ok() || my_anchors.empty()) {
+              my_anchors.emplace_back(find->second->largest.user_key(),
+                                      find->second->fd.GetFileSize());
             }
           }
+        } else {
+          Status s = cfd->table_cache()->ApproximateKeyAnchors(
+              ReadOptions(), *f, false /* no_io */, lvl, my_anchors);
+          if (!s.ok() || my_anchors.empty()) {
+            my_anchors.emplace_back(f->largest.user_key(), f->fd.GetFileSize());
+          }
         }
+        for (const auto& anchor : my_anchors) {
+          total_size += anchor.range_size;
+        }
+        all_anchors.insert(all_anchors.end(),
+                           std::make_move_iterator(my_anchors.begin()),
+                           std::make_move_iterator(my_anchors.end()));
       }
     }
   }
-  terark::sort_a(bounds, &ExtractUserKey < *cfd_comparator);
 
-  // Remove duplicated entries from bounds
-  // bounds.resize(terark::unique_a(bounds, &ExtractUserKey ==
-  // *cfd_comparator));
-  bounds.resize(terark::unique_a(bounds, &ExtractUserKey == *cfd_comparator));
-
-  // Combine consecutive pairs of boundaries into ranges with an approximate
-  // size of data covered by keys in that range
-  uint64_t sum = 0;
-  std::vector<RangeWithSize> ranges;
-  // Get input version from CompactionState since it's already referenced
-  // earlier in SetInputVersioCompaction::SetInputVersion and will not change
-  // when db_mutex_ is released below
-  auto* v = compact_->compaction->input_version();
-  for (auto it = bounds.begin();;) {
-    const Slice a = *it;
-    it++;
-
-    if (it == bounds.end()) {
-      break;
-    }
-
-    const Slice b = *it;
-
-    // ApproximateSize could potentially create table reader iterator to seek
-    // to the index block and may incur I/O cost in the process. Unlock db
-    // mutex to reduce contention
-    db_mutex_->Unlock();
-    uint64_t size = versions_->ApproximateSize(v, a, b, start_lvl, out_lvl + 1);
-    db_mutex_->Lock();
-    ranges.emplace_back(a, b, size);
-    sum += size;
+  if (all_anchors.empty()) {
+    sizes_.emplace_back(static_cast<size_t>(total_size));
+    return;
   }
 
-  // Group the ranges into subcompactions
-  const double min_file_fill_percent = 4.0 / 5;
-  int base_level = v->storage_info()->base_level();
-  uint64_t max_output_files = static_cast<uint64_t>(std::ceil(
-      sum / min_file_fill_percent /
-      MaxFileSizeForLevel(
-          *(c->mutable_cf_options()), out_lvl,
-          c->immutable_cf_options()->compaction_style, base_level,
-          c->immutable_cf_options()->level_compaction_dynamic_level_bytes)));
-  int subcompactions =
-      std::min({max_usable_threads, static_cast<int>(ranges.size()),
-                static_cast<int>(c->max_subcompactions()),
-                static_cast<int>(max_output_files)});
+  std::sort(all_anchors.begin(), all_anchors.end(),
+            [cfd_comparator](const TableReader::Anchor& a,
+                             const TableReader::Anchor& b) {
+              return cfd_comparator->Compare(a.user_key, b.user_key) < 0;
+            });
+  all_anchors.erase(
+      std::unique(all_anchors.begin(), all_anchors.end(),
+                  [cfd_comparator](const TableReader::Anchor& a,
+                                   const TableReader::Anchor& b) {
+                    return cfd_comparator->Compare(a.user_key, b.user_key) == 0;
+                  }),
+      all_anchors.end());
+
+  uint64_t subcompactions = 0;
+  if (c->immutable_cf_options()->compaction_style == kCompactionStyleLevel) {
+    subcompactions = static_cast<uint64_t>(c->num_input_files(0));
+    uint64_t max_subcompaction_limit =
+        static_cast<uint64_t>(c->max_subcompactions());
+    if (max_subcompaction_limit < subcompactions) {
+      subcompactions = std::min({static_cast<uint64_t>(max_usable_threads),
+                                 subcompactions, max_subcompaction_limit});
+    } else {
+      subcompactions = std::min(static_cast<uint64_t>(max_usable_threads),
+                                max_subcompaction_limit);
+    }
+  } else {
+    subcompactions = std::min(static_cast<uint64_t>(max_usable_threads),
+                              static_cast<uint64_t>(c->max_subcompactions()));
+  }
+
+  TEST_SYNC_POINT_CALLBACK("CompactionJob::GenSubcompactionBoundaries:0",
+                           &subcompactions);
 
   if (subcompactions > 1) {
-    double mean = sum * 1.0 / subcompactions;
-    // Greedily add ranges to the subcompaction until the sum of the ranges'
-    // sizes becomes >= the expected mean size of a subcompaction
-    sum = 0;
-    for (size_t i = 0; i < ranges.size() - 1; i++) {
-      sum += ranges[i].size;
-      if (subcompactions == 1) {
-        // If there's only one left to schedule then it goes to the end so no
-        // need to put an end boundary
-        continue;
-      }
-      if (sum >= mean) {
-        boundaries_.emplace_back(ExtractUserKey(ranges[i].range.limit));
-        sizes_.emplace_back(sum);
-        subcompactions--;
-        sum = 0;
+    uint64_t target_range_size = std::max(
+        total_size / subcompactions,
+        MaxFileSizeForLevel(
+            *(c->mutable_cf_options()), out_lvl,
+            c->immutable_cf_options()->compaction_style, base_level,
+            c->immutable_cf_options()->level_compaction_dynamic_level_bytes));
+    if (target_range_size >= total_size) {
+      sizes_.emplace_back(static_cast<size_t>(total_size));
+      return;
+    }
+
+    uint64_t cumulative_size = 0;
+    uint64_t num_actual_subcompactions = 1;
+    for (const auto& anchor : all_anchors) {
+      cumulative_size += anchor.range_size;
+      if (cumulative_size > target_range_size) {
+        ++num_actual_subcompactions;
+        sizes_.emplace_back(static_cast<size_t>(cumulative_size));
+        boundaries_.emplace_back(anchor.user_key);
+        cumulative_size = 0;
       }
     }
-    sizes_.emplace_back(sum + ranges.back().size);
+    sizes_.emplace_back(static_cast<size_t>(cumulative_size));
+    TEST_SYNC_POINT_CALLBACK("CompactionJob::GenSubcompactionBoundaries:1",
+                             &num_actual_subcompactions);
   } else {
     // Only one range so its size is the total sum of sizes computed above
-    sizes_.emplace_back(sum);
+    sizes_.emplace_back(static_cast<size_t>(total_size));
   }
 }
 

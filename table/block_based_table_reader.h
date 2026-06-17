@@ -145,6 +145,11 @@ class BlockBasedTable : public TableReader {
   // be close to the file length.
   uint64_t ApproximateOffsetOf(const Slice& key) override;
 
+  // Retrieve sampled anchor points from the table index for subcompaction
+  // boundary selection.
+  Status ApproximateKeyAnchors(const ReadOptions& read_options,
+                               std::vector<Anchor>& anchors) override;
+
   // Returns true if the block for the specified key is in cache.
   // REQUIRES: key is in this table && block cache enabled
   bool TEST_KeyInCache(const ReadOptions& options, const Slice& key);

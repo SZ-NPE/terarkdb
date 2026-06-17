@@ -11,9 +11,12 @@
 #include <stdint.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "db/range_tombstone_fragmenter.h"
 #include "rocksdb/cache.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/terark_namespace.h"
 #include "table/internal_iterator.h"
@@ -63,6 +66,21 @@ class TableReader {
   // E.g., the approximate offset of the last key in the table will
   // be close to the file length.
   virtual uint64_t ApproximateOffsetOf(const Slice& key) = 0;
+
+  struct Anchor {
+    Anchor(const Slice& _user_key, size_t _range_size)
+        : user_key(_user_key.ToString()), range_size(_range_size) {}
+    std::string user_key;
+    size_t range_size;
+  };
+
+  // Return sampled user-key anchors with approximate byte sizes between
+  // anchors. Used to choose balanced subcompaction boundaries without probing
+  // every input key.
+  virtual Status ApproximateKeyAnchors(const ReadOptions& /*read_options*/,
+                                       std::vector<Anchor>& /*anchors*/) {
+    return Status::NotSupported("ApproximateKeyAnchors() not supported.");
+  }
 
   // Set up the table for Compaction. Might change some parameters with
   // posix_fadvise

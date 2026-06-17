@@ -3018,6 +3018,63 @@ uint64_t BlockBasedTable::ApproximateOffsetOf(const Slice& key) {
   return result;
 }
 
+Status BlockBasedTable::ApproximateKeyAnchors(
+    const ReadOptions& read_options, std::vector<Anchor>& anchors) {
+  CachableEntry<IndexReader> index_entry;
+  IndexBlockIter iiter_on_stack;
+  InternalIteratorBase<BlockHandle>* iiter = NewIndexIterator(
+      read_options, false /* disable_prefix_seek */, &iiter_on_stack,
+      &index_entry);
+  std::unique_ptr<InternalIteratorBase<BlockHandle>> iiter_guard;
+  if (iiter != &iiter_on_stack) {
+    iiter_guard.reset(iiter);
+  }
+  Status s = iiter->status();
+  if (!s.ok()) {
+    return s;
+  }
+  if (index_entry.value != nullptr) {
+    index_entry.value->CacheDependencies(false /* pin */);
+  }
+
+  std::shared_ptr<const TableProperties> table_props = GetTableProperties();
+  if (table_props == nullptr) {
+    return Status::Corruption("Failed to get table properties");
+  }
+
+  constexpr uint64_t kMaxNumAnchors = 128;
+  uint64_t num_blocks = table_props->num_data_blocks;
+  uint64_t num_blocks_per_anchor = num_blocks / kMaxNumAnchors;
+  if (num_blocks_per_anchor == 0) {
+    num_blocks_per_anchor = 1;
+  }
+  const bool index_key_is_user_key = table_props->index_key_is_user_key > 0;
+
+  uint64_t count = 0;
+  std::string last_key;
+  uint64_t range_size = 0;
+  uint64_t prev_offset = 0;
+  for (iiter->SeekToFirst(); iiter->Valid(); iiter->Next()) {
+    const BlockHandle& bh = iiter->value();
+    range_size += bh.offset() + bh.size() - prev_offset;
+    prev_offset = bh.offset() + bh.size();
+
+    Slice user_key =
+        index_key_is_user_key ? iiter->key() : ExtractUserKey(iiter->key());
+    if (++count % num_blocks_per_anchor == 0) {
+      count = 0;
+      anchors.emplace_back(user_key, range_size);
+      range_size = 0;
+    } else {
+      last_key = user_key.ToString();
+    }
+  }
+  if (count != 0) {
+    anchors.emplace_back(last_key, range_size);
+  }
+  return iiter->status();
+}
+
 bool BlockBasedTable::TEST_filter_block_preloaded() const {
   return rep_->filter != nullptr;
 }
