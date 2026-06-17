@@ -37,10 +37,13 @@ struct TableReaderOptions {
                      const EnvOptions& _env_options,
                      const InternalKeyComparator& _internal_comparator,
                      bool _skip_filters = false, bool _immortal = false,
-                     int _level = -1, uint64_t _file_number = uint64_t(-1))
+                     int _level = -1, uint64_t _file_number = uint64_t(-1),
+                     bool _is_blob_file = false,
+                     double _file_garbage_ratio = 0.0)
       : TableReaderOptions(_ioptions, _prefix_extractor, _env_options,
                            _internal_comparator, _skip_filters, _immortal,
-                           _level, _file_number, 0 /* _largest_seqno */) {}
+                           _level, _file_number, 0 /* _largest_seqno */,
+                           _is_blob_file, _file_garbage_ratio) {}
 
   // @param skip_filters Disables loading/accessing the filter block
   TableReaderOptions(const ImmutableCFOptions& _ioptions,
@@ -48,7 +51,9 @@ struct TableReaderOptions {
                      const EnvOptions& _env_options,
                      const InternalKeyComparator& _internal_comparator,
                      bool _skip_filters, bool _immortal, int _level,
-                     uint64_t _file_number, SequenceNumber _largest_seqno)
+                     uint64_t _file_number, SequenceNumber _largest_seqno,
+                     bool _is_blob_file = false,
+                     double _file_garbage_ratio = 0.0)
       : ioptions(_ioptions),
         prefix_extractor(_prefix_extractor),
         env_options(_env_options),
@@ -57,7 +62,9 @@ struct TableReaderOptions {
         immortal(_immortal),
         level(_level),
         file_number(_file_number),
-        largest_seqno(_largest_seqno) {}
+        largest_seqno(_largest_seqno),
+        is_blob_file(_is_blob_file),
+        file_garbage_ratio(_file_garbage_ratio) {}
 
   const ImmutableCFOptions& ioptions;
   const SliceTransform* prefix_extractor;
@@ -73,6 +80,8 @@ struct TableReaderOptions {
   uint64_t file_number;
   // largest seqno in the table
   SequenceNumber largest_seqno;
+  bool is_blob_file;
+  double file_garbage_ratio;
 };
 
 struct TableBuilderOptions {

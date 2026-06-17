@@ -765,7 +765,9 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
                              const bool skip_filters, const int level,
                              const bool immortal_table,
                              const SequenceNumber largest_seqno,
-                             TailPrefetchStats* tail_prefetch_stats) {
+                             TailPrefetchStats* tail_prefetch_stats,
+                             bool is_blob_file,
+                             double file_garbage_ratio) {
   table_reader->reset();
 
   Footer footer;
@@ -983,6 +985,8 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
   }
 
   rep->file_number = file_number;
+  rep->is_blob_file = is_blob_file;
+  rep->file_garbage_ratio = file_garbage_ratio;
 
   // Read the range del meta block
   bool found_range_del_block;
@@ -1355,7 +1359,8 @@ Status BlockBasedTable::PutDataBlockToCache(
     CompressionType raw_block_comp_type, uint32_t format_version,
     const Slice& compression_dict, SequenceNumber seq_no,
     size_t read_amp_bytes_per_bit, MemoryAllocator* memory_allocator,
-    bool is_index, Cache::Priority priority, GetContext* get_context) {
+    bool is_index, Cache::Priority priority, GetContext* get_context,
+    const BlockCacheMetadata* block_cache_metadata) {
   assert(raw_block_comp_type == kNoCompression ||
          block_cache_compressed != nullptr);
 
@@ -1414,9 +1419,9 @@ Status BlockBasedTable::PutDataBlockToCache(
   // insert into uncompressed block cache
   if (block_cache != nullptr && cached_block->value->own_bytes()) {
     size_t charge = cached_block->value->ApproximateMemoryUsage();
-    s = block_cache->Insert(block_cache_key, cached_block->value, charge,
-                            &DeleteCachedEntry<Block>,
-                            &(cached_block->cache_handle), priority);
+    s = block_cache->InsertWithMetadata(
+        block_cache_key, cached_block->value, charge, &DeleteCachedEntry<Block>,
+        block_cache_metadata, &(cached_block->cache_handle), priority);
 #ifndef NDEBUG
     block_cache->TEST_mark_as_data_block(block_cache_key, charge);
 #endif  // NDEBUG
@@ -1911,6 +1916,15 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
 
       if (s.ok()) {
         SequenceNumber seq_no = rep->get_global_seqno(is_index);
+        BlockCacheMetadata block_cache_metadata;
+        block_cache_metadata.is_blob_file = rep->is_blob_file;
+        block_cache_metadata.is_data_block = !is_index;
+        block_cache_metadata.file_number = rep->file_number;
+        block_cache_metadata.block_offset = handle.offset();
+        block_cache_metadata.block_size = handle.size();
+        block_cache_metadata.garbage_ratio = rep->file_garbage_ratio;
+        block_cache_metadata.statistics = statistics;
+        block_cache_metadata.info_log = rep->ioptions.info_log;
         // If filling cache is allowed and a cache is configured, try to put the
         // block to the cache.
         s = PutDataBlockToCache(
@@ -1923,7 +1937,7 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
                             .cache_index_and_filter_blocks_with_high_priority
                 ? Cache::Priority::HIGH
                 : Cache::Priority::LOW,
-            get_context);
+            get_context, &block_cache_metadata);
       }
     }
   }

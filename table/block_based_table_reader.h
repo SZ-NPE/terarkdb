@@ -99,7 +99,9 @@ class BlockBasedTable : public TableReader {
                      bool skip_filters = false, int level = -1,
                      const bool immortal_table = false,
                      const SequenceNumber largest_seqno = 0,
-                     TailPrefetchStats* tail_prefetch_stats = nullptr);
+                     TailPrefetchStats* tail_prefetch_stats = nullptr,
+                     bool is_blob_file = false,
+                     double file_garbage_ratio = 0.0);
 
   bool PrefixMayMatch(const Slice& internal_key,
                       const ReadOptions& read_options,
@@ -329,7 +331,8 @@ class BlockBasedTable : public TableReader {
       const Slice& compression_dict, SequenceNumber seq_no,
       size_t read_amp_bytes_per_bit, MemoryAllocator* memory_allocator,
       bool is_index = false, Cache::Priority pri = Cache::Priority::LOW,
-      GetContext* get_context = nullptr);
+      GetContext* get_context = nullptr,
+      const BlockCacheMetadata* block_cache_metadata = nullptr);
 
   // Calls (*handle_result)(arg, ...) repeatedly, starting with the entry found
   // after a call to Seek(key), until handle_result returns false.
@@ -527,6 +530,8 @@ struct BlockBasedTable::Rep {
   // and every key have it's own seqno.
   SequenceNumber global_seqno;
   uint64_t file_number;
+  bool is_blob_file = false;
+  double file_garbage_ratio = 0.0;
 
   // the level when the table is opened, could potentially change when trivial
   // move is involved

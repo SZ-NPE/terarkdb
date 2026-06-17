@@ -81,6 +81,7 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
       allow_ingest_behind(db_options.allow_ingest_behind),
       preserve_deletes(db_options.preserve_deletes),
       listeners(db_options.listeners),
+      blob_gc_collect_bytes_stats(db_options.blob_gc_collect_bytes_stats),
       row_cache(db_options.row_cache),
       memtable_insert_with_hint_prefix_extractor(
           cf_options.memtable_insert_with_hint_prefix_extractor.get()),

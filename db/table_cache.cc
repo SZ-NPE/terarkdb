@@ -85,6 +85,21 @@ static bool InheritanceMismatch(const FileMetaData& sst_meta,
   return true;
 }
 
+static bool IsBlobCacheFile(const FileMetaData& file_meta) {
+  return !file_meta.prop.inheritance.empty() ||
+         file_meta.num_antiquation_bytes > 0 || file_meta.is_gc_candidate() ||
+         file_meta.is_gc_permitted();
+}
+
+static double FileGarbageRatio(const FileMetaData& file_meta) {
+  const uint64_t file_size = file_meta.fd.GetFileSize();
+  if (file_size == 0) {
+    return 0.0;
+  }
+  return std::min<double>(1.0, static_cast<double>(file_meta.num_antiquation_bytes) /
+                                   static_cast<double>(file_size));
+}
+
 // Store params for create depend table iterator in future
 class LazyCreateIterator : public Snapshot {
   TableCache* table_cache_;
@@ -160,11 +175,12 @@ Status TableCache::GetTableReader(
     HistogramImpl* file_read_hist, std::unique_ptr<TableReader>* table_reader,
     const SliceTransform* prefix_extractor, bool skip_filters, int level,
     bool prefetch_index_and_filter_in_cache, bool for_compaction,
-    bool force_memory) {
+    bool force_memory, bool is_blob_file, double file_garbage_ratio) {
   auto s = GetTableReaderImpl(
       env_options, fd, sequential_mode, readahead, record_read_stats,
       file_read_hist, table_reader, prefix_extractor, skip_filters, level,
-      prefetch_index_and_filter_in_cache, for_compaction, force_memory);
+      prefetch_index_and_filter_in_cache, for_compaction, force_memory,
+      is_blob_file, file_garbage_ratio);
   if (s.IsInvalidArgument() && s.subcode() == Status::kRequireMmap) {
     // this table requires mmap open, make it happy
     assert(!env_options.use_mmap_reads);
@@ -175,7 +191,8 @@ Status TableCache::GetTableReader(
     s = GetTableReaderImpl(
         mmap_env_options, fd, sequential_mode, readahead, record_read_stats,
         file_read_hist, table_reader, prefix_extractor, skip_filters, level,
-        prefetch_index_and_filter_in_cache, for_compaction, force_memory);
+        prefetch_index_and_filter_in_cache, for_compaction, force_memory,
+        is_blob_file, file_garbage_ratio);
   }
   return s;
 }
@@ -186,7 +203,7 @@ Status TableCache::GetTableReaderImpl(
     HistogramImpl* file_read_hist, std::unique_ptr<TableReader>* table_reader,
     const SliceTransform* prefix_extractor, bool skip_filters, int level,
     bool prefetch_index_and_filter_in_cache, bool for_compaction,
-    bool force_memory) {
+    bool force_memory, bool is_blob_file, double file_garbage_ratio) {
   std::string fname =
       TableFileName(ioptions_.cf_paths, fd.GetNumber(), fd.GetPathId());
   std::unique_ptr<RandomAccessFile> file;
@@ -217,7 +234,8 @@ Status TableCache::GetTableReaderImpl(
         TableReaderOptions(ioptions_, prefix_extractor, env_options,
                            ioptions_.internal_comparator, skip_filters,
                            immortal_tables_, level, fd.GetNumber(),
-                           fd.largest_seqno),
+                           fd.largest_seqno, is_blob_file,
+                           file_garbage_ratio),
         std::move(file_reader), fd.GetFileSize(), table_reader,
         prefetch_index_and_filter_in_cache);
     TEST_SYNC_POINT("TableCache::GetTableReader:0");
@@ -238,7 +256,8 @@ Status TableCache::FindTable(const EnvOptions& env_options,
                              const bool no_io, bool record_read_stats,
                              HistogramImpl* file_read_hist, bool skip_filters,
                              int level, bool prefetch_index_and_filter_in_cache,
-                             bool force_memory) {
+                             bool force_memory, bool is_blob_file,
+                             double file_garbage_ratio) {
   PERF_TIMER_GUARD(find_table_nanos);
   Status s;
   uint64_t number = fd.GetNumber();
@@ -256,7 +275,8 @@ Status TableCache::FindTable(const EnvOptions& env_options,
                        0 /* readahead */, record_read_stats, file_read_hist,
                        &table_reader, prefix_extractor, skip_filters, level,
                        prefetch_index_and_filter_in_cache,
-                       false /* for_compaction */, force_memory);
+                       false /* for_compaction */, force_memory, is_blob_file,
+                       file_garbage_ratio);
     if (!s.ok()) {
       assert(table_reader == nullptr);
       RecordTick(ioptions_.statistics, NO_FILE_ERRORS);
@@ -321,7 +341,8 @@ InternalIterator* TableCache::NewIterator(
                        record_stats, nullptr, &table_reader_unique_ptr,
                        prefix_extractor, false /* skip_filters */, level,
                        true /* prefetch_index_and_filter_in_cache */,
-                       for_compaction, file_meta.prop.is_map_sst());
+                       for_compaction, file_meta.prop.is_map_sst(),
+                       IsBlobCacheFile(file_meta), FileGarbageRatio(file_meta));
     if (s.ok()) {
       table_reader = table_reader_unique_ptr.release();
     }
@@ -332,7 +353,8 @@ InternalIterator* TableCache::NewIterator(
                     options.read_tier == kBlockCacheTier /* no_io */,
                     record_stats, file_read_hist, skip_filters, level,
                     true /* prefetch_index_and_filter_in_cache */,
-                    file_meta.prop.is_map_sst());
+                    file_meta.prop.is_map_sst(), IsBlobCacheFile(file_meta),
+                    FileGarbageRatio(file_meta));
       if (s.ok()) {
         table_reader = GetTableReaderFromHandle(handle);
       }
@@ -465,7 +487,8 @@ Status TableCache::Get(const ReadOptions& options,
                   options.read_tier == kBlockCacheTier /* no_io */,
                   true /* record_read_stats */, file_read_hist, skip_filters,
                   level, true /* prefetch_index_and_filter_in_cache */,
-                  file_meta.prop.is_map_sst());
+                  file_meta.prop.is_map_sst(), IsBlobCacheFile(file_meta),
+                  FileGarbageRatio(file_meta));
     if (s.ok()) {
       t = GetTableReaderFromHandle(handle);
     }
@@ -613,7 +636,8 @@ Status TableCache::GetTableProperties(
                 true /* record_read_stats */, nullptr /* file_read_hist */,
                 false /* skip_filters */, -1 /* level */,
                 true /* prefetch_index_and_filter_in_cache */,
-                file_meta.prop.is_map_sst());
+                file_meta.prop.is_map_sst(), IsBlobCacheFile(file_meta),
+                FileGarbageRatio(file_meta));
   if (!s.ok()) {
     return s;
   }

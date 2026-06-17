@@ -127,6 +127,8 @@ struct ImmutableCFOptions {
   // when specific RocksDB event happens.
   std::vector<std::shared_ptr<EventListener>> listeners;
 
+  bool blob_gc_collect_bytes_stats;
+
   std::shared_ptr<Cache> row_cache;
 
   const SliceTransform* memtable_insert_with_hint_prefix_extractor;

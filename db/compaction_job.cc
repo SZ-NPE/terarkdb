@@ -755,39 +755,54 @@ CompactionJob::~CompactionJob() {
 
 void CompactionJob::SetGcTriggerSelectTime(uint64_t trigger_nanos,
                                             uint64_t select_nanos) {
+  if (!db_options_.blob_gc_collect_latency_stats) {
+    return;
+  }
   gc_t_trigger_ = trigger_nanos;
   gc_t_select_ = select_nanos;
 }
 
 void CompactionJob::AddGcMetaTime(uint64_t meta_nanos) {
+  if (!db_options_.blob_gc_collect_latency_stats) {
+    return;
+  }
   gc_t_meta_ += meta_nanos;
 }
 
 void CompactionJob::DumpGcBreakdown() const {
-  if (!is_gc_job_) {
+  if (!is_gc_job_ || (!db_options_.blob_gc_collect_latency_stats &&
+                      !db_options_.blob_gc_collect_bytes_stats)) {
     return;
   }
-  ROCKS_LOG_INFO(db_options_.info_log,
-                 "[%s] [JOB %d] [BLOB_GC_BREAKDOWN] blob_files:[%s]"
-                 ", trigger:%" PRIu64
-                 ", select:%" PRIu64
-                 ", scan:%" PRIu64
-                 ", lookup:%" PRIu64
-                 ", write:%" PRIu64
-                 ", meta:%" PRIu64
-                 ", vsst_read:%" PRIu64
-                 ", ksst_read:%" PRIu64
-                 ", invalid_read:%" PRIu64
-                 ", relocation_write:%" PRIu64,
-                 gc_cf_name_.c_str(), job_id_, gc_blob_files_.c_str(),
-                 gc_t_trigger_, gc_t_select_, gc_t_scan_, gc_t_lookup_,
-                 gc_t_write_, gc_t_meta_,
-                 gc_vsst_read_bytes_, gc_ksst_read_bytes_,
-                 gc_invalid_read_bytes_, gc_relocation_write_bytes_);
+  if (db_options_.blob_gc_collect_latency_stats) {
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [JOB %d] [BLOB_GC_LATENCY] blob_files:[%s]"
+                   ", trigger:%" PRIu64
+                   ", select:%" PRIu64
+                   ", scan:%" PRIu64
+                   ", lookup:%" PRIu64
+                   ", write:%" PRIu64
+                   ", meta:%" PRIu64,
+                   gc_cf_name_.c_str(), job_id_, gc_blob_files_.c_str(),
+                   gc_t_trigger_, gc_t_select_, gc_t_scan_, gc_t_lookup_,
+                   gc_t_write_, gc_t_meta_);
+  }
+  if (db_options_.blob_gc_collect_bytes_stats) {
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [JOB %d] [BLOB_GC_BYTES] blob_files:[%s]"
+                   ", vsst_read:%" PRIu64
+                   ", ksst_read:%" PRIu64
+                   ", invalid_read:%" PRIu64
+                   ", relocation_write:%" PRIu64,
+                   gc_cf_name_.c_str(), job_id_, gc_blob_files_.c_str(),
+                   gc_vsst_read_bytes_, gc_ksst_read_bytes_,
+                   gc_invalid_read_bytes_, gc_relocation_write_bytes_);
+  }
 }
 
 void CompactionJob::DumpGcBlockDist() const {
-  if (!is_gc_job_ || gc_block_total_ == 0) {
+  if (!is_gc_job_ || !db_options_.blob_gc_collect_block_stats ||
+      gc_block_total_ == 0) {
     return;
   }
   double skippable_pct =
@@ -2184,9 +2199,15 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact->start == nullptr);
   assert(sub_compact->end == nullptr);
 
-  uint64_t s3 = env_->NowNanos();
+  const bool collect_gc_latency = db_options_.blob_gc_collect_latency_stats;
+  const bool collect_gc_bytes = db_options_.blob_gc_collect_bytes_stats;
+  const bool collect_gc_block_stats = db_options_.blob_gc_collect_block_stats;
+
+  uint64_t s3 = collect_gc_latency ? env_->NowNanos() : 0;
   input->SeekToFirst();
-  gc_t_scan_ += (env_->NowNanos() - s3);
+  if (collect_gc_latency) {
+    gc_t_scan_ += (env_->NowNanos() - s3);
+  }
 
   Arena arena;
   std::unordered_map<Slice, uint64_t, SliceHasher> conflict_map;
@@ -2243,9 +2264,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   std::vector<BlobGcCacheEntry> blob_meta_cache;
   assert(!sub_compact->compaction->inputs()->empty());
   blob_meta_cache.reserve(sub_compact->compaction->inputs()->front().size());
-  // --- block-level invalidity distribution tracking setup ---
   size_t gc_block_size = 4096;  // default BlockBasedTable block size
-  {
+  if (collect_gc_block_stats) {
     auto* table_factory = cfd->ioptions()->table_factory;
     if (table_factory != nullptr) {
       void* raw_opts = table_factory->GetOptions();
@@ -2281,9 +2301,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     ++counter.input;
     bool is_live = false;
     Slice curr_key = input->key();
-    // --- bandwidth tracking: record bytes read from blob (vSST) ---
     const size_t record_bytes = curr_key.size() + input->value().size();
-    gc_vsst_read_bytes_ += record_bytes;
+    if (collect_gc_bytes) {
+      gc_vsst_read_bytes_ += record_bytes;
+    }
     uint64_t curr_file_number = uint64_t(-1);
     if (!ParseInternalKey(curr_key, &ikey)) {
       status =
@@ -2313,7 +2334,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     do {
       if (ikey.type != kTypeValue && ikey.type != kTypeMerge) {
         ++counter.garbage_type;
-        gc_invalid_read_bytes_ += record_bytes;
+        if (collect_gc_bytes) {
+          gc_invalid_read_bytes_ += record_bytes;
+        }
         break;
       }
       // Drop-key cache fast path: when compaction has already confirmed this
@@ -2327,7 +2350,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
           (ikey.type == kTypeValue || ikey.type == kTypeMerge) &&
           hotness_tracker->IsDropped(ikey.user_key, ikey.sequence)) {
         ++counter.dropped_key_cache_hit;
-        gc_invalid_read_bytes_ += record_bytes;
+        if (collect_gc_bytes) {
+          gc_invalid_read_bytes_ += record_bytes;
+        }
         break;
       }
       if (drop_key_cache_enabled) {
@@ -2338,18 +2363,26 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       ValueType type = kTypeDeletion;
       SequenceNumber seq = kMaxSequenceNumber;
       LazyBuffer value;
-      const uint64_t lookup_begin_ts = env_->NowMicros();
-      const uint64_t s4 = env_->NowNanos();
-      const uint64_t ksst_io_before = IOSTATS(bytes_read);
-        RecordTick(db_options_.statistics.get(), GC_GET_KEYS);
+      const uint64_t lookup_begin_ts =
+          collect_gc_latency ? env_->NowMicros() : 0;
+      const uint64_t s4 = collect_gc_latency ? env_->NowNanos() : 0;
+      const uint64_t ksst_io_before =
+          collect_gc_bytes ? IOSTATS(bytes_read) : 0;
+      RecordTick(db_options_.statistics.get(), GC_GET_KEYS);
       input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
                             &seq, &value, *blob_meta);
-      gc_t_lookup_ += (env_->NowNanos() - s4);
-      gc_ksst_read_bytes_ += (IOSTATS(bytes_read) - ksst_io_before);
-      counter.lookup_micros += env_->NowMicros() - lookup_begin_ts;
+      if (collect_gc_latency) {
+        gc_t_lookup_ += (env_->NowNanos() - s4);
+        counter.lookup_micros += env_->NowMicros() - lookup_begin_ts;
+      }
+      if (collect_gc_bytes) {
+        gc_ksst_read_bytes_ += (IOSTATS(bytes_read) - ksst_io_before);
+      }
       if (s.IsNotFound()) {
         ++counter.get_not_found;
-        gc_invalid_read_bytes_ += record_bytes;
+        if (collect_gc_bytes) {
+          gc_invalid_read_bytes_ += record_bytes;
+        }
         break;
       } else if (!s.ok()) {
         status = std::move(s);
@@ -2357,7 +2390,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       } else if (seq != ikey.sequence ||
                  (type != kTypeValueIndex && type != kTypeMergeIndex)) {
         ++counter.get_not_found;
-        gc_invalid_read_bytes_ += record_bytes;
+        if (collect_gc_bytes) {
+          gc_invalid_read_bytes_ += record_bytes;
+        }
         break;
       }
       status = value.fetch();
@@ -2373,23 +2408,29 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       value = input->value();
       if (find->second->fd.GetNumber() != value.file_number()) {
         ++counter.file_number_mismatch;
-        gc_invalid_read_bytes_ += record_bytes;
+        if (collect_gc_bytes) {
+          gc_invalid_read_bytes_ += record_bytes;
+        }
         break;
       }
       curr_file_number = value.file_number();
 
       assert(sub_compact->blob_builder != nullptr);
       assert(sub_compact->current_blob_output() != nullptr);
-      const uint64_t s5 = env_->NowNanos();
+      const uint64_t s5 = collect_gc_latency ? env_->NowNanos() : 0;
       status = sub_compact->blob_builder->Add(curr_key, value);
-      gc_t_write_ += (env_->NowNanos() - s5);
+      if (collect_gc_latency) {
+        gc_t_write_ += (env_->NowNanos() - s5);
+      }
       if (!status.ok()) {
         break;
       }
       sub_compact->current_blob_output()->meta.UpdateBoundaries(curr_key,
                                                                 ikey.sequence);
       sub_compact->num_output_records++;
-      gc_relocation_write_bytes_ += record_bytes;
+      if (collect_gc_bytes) {
+        gc_relocation_write_bytes_ += record_bytes;
+      }
       is_live = true;
     } while (false);
     if (!counter.has_run || counter.run_live != is_live) {
@@ -2404,8 +2445,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     ++counter.curr_run;
     is_live ? ++counter.live : ++counter.dead;
 
-    // --- block-level invalidity tracking ---
-    {
+    if (collect_gc_block_stats) {
       auto& tracker = block_trackers[blob_file_number];
       tracker.block_bytes += record_bytes;
       if (!is_live) {
@@ -2430,9 +2470,11 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     last_key.assign(curr_key.data(), curr_key.size());
     last_file_number = curr_file_number;
 
-    uint64_t s3 = env_->NowNanos();
+    s3 = collect_gc_latency ? env_->NowNanos() : 0;
     input->Next();
-    gc_t_scan_ += (env_->NowNanos() - s3);
+    if (collect_gc_latency) {
+      gc_t_scan_ += (env_->NowNanos() - s3);
+    }
   }
 
   if (status.ok() &&
@@ -2443,9 +2485,10 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   if (status.ok()) {
     status = input->status();
   }
-  // --- finalize remaining block trackers ---
-  for (auto& entry : block_trackers) {
-    finalize_block(entry.second.block_bytes, entry.second.block_dead_bytes);
+  if (collect_gc_block_stats) {
+    for (auto& entry : block_trackers) {
+      finalize_block(entry.second.block_bytes, entry.second.block_dead_bytes);
+    }
   }
   std::vector<uint64_t> inheritance_tree;
   size_t inheritance_tree_pruge_count = 0;
@@ -2454,13 +2497,15 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         *sub_compact->compaction->inputs(), dependence_map, input_version,
         &inheritance_tree, &inheritance_tree_pruge_count);
   }
-  const uint64_t s6 = env_->NowNanos();
+  const uint64_t s6 = collect_gc_latency ? env_->NowNanos() : 0;
   Status s = FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
-  gc_t_meta_ += (env_->NowNanos() - s6);
+  if (collect_gc_latency) {
+    gc_t_meta_ += (env_->NowNanos() - s6);
+  }
   if (status.ok()) {
     status = s;
   }
-  if (status.ok() && !sub_compact->blob_outputs.empty()) {
+  if (status.ok() && collect_gc_bytes && !sub_compact->blob_outputs.empty()) {
     RecordTick(db_options_.statistics.get(), GC_REWRITE_BLOB_BYTES,
                sub_compact->blob_outputs.front().meta.fd.GetFileSize());
   }
@@ -2475,17 +2520,22 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         RecordTick(db_options_.statistics.get(), GC_DROP_KEY_CACHE_MISS,
                    counter.dropped_key_cache_miss);
       }
-      RecordTick(db_options_.statistics.get(), GC_VSST_READ_BYTES,
-                 gc_vsst_read_bytes_);
-      RecordTick(db_options_.statistics.get(), GC_KSST_READ_BYTES,
-                 gc_ksst_read_bytes_);
-      RecordTick(db_options_.statistics.get(), GC_INVALID_READ_BYTES,
-                 gc_invalid_read_bytes_);
-      RecordTick(db_options_.statistics.get(), GC_RELOCATION_WRITE_BYTES,
-                 gc_relocation_write_bytes_);
-      RecordTick(db_options_.statistics.get(), GC_BLOCK_TOTAL, gc_block_total_);
-      RecordTick(db_options_.statistics.get(), GC_BLOCK_INVALID_100,
-                 gc_block_invalid_100_);
+      if (collect_gc_bytes) {
+        RecordTick(db_options_.statistics.get(), GC_VSST_READ_BYTES,
+                   gc_vsst_read_bytes_);
+        RecordTick(db_options_.statistics.get(), GC_KSST_READ_BYTES,
+                   gc_ksst_read_bytes_);
+        RecordTick(db_options_.statistics.get(), GC_INVALID_READ_BYTES,
+                   gc_invalid_read_bytes_);
+        RecordTick(db_options_.statistics.get(), GC_RELOCATION_WRITE_BYTES,
+                   gc_relocation_write_bytes_);
+      }
+      if (collect_gc_block_stats) {
+        RecordTick(db_options_.statistics.get(), GC_BLOCK_TOTAL,
+                   gc_block_total_);
+        RecordTick(db_options_.statistics.get(), GC_BLOCK_INVALID_100,
+                   gc_block_invalid_100_);
+      }
       ROCKS_LOG_INFO(db_options_.info_log,
                      "[%s] [JOB %d] [BLOB_GC_DROP_KEY_CACHE] input:%" PRIu64
                      " hit:%" PRIu64 " miss:%" PRIu64

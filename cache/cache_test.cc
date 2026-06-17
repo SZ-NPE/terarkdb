@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cache/clock_cache.h"
+#include "cache/garbage_aware_cache.h"
 #include "cache/lru_cache.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/coding.h"
@@ -677,6 +678,78 @@ TEST_P(CacheTest, DefaultShardBits) {
   cache = NewLRUCache(1024L * 1024L * 1024L, -1, true);
   sc = dynamic_cast<ShardedCache*>(cache.get());
   ASSERT_EQ(6, sc->GetNumShardBits());
+}
+
+TEST(GarbageAwareCacheTest, DemotesVsstDataBlocksFromAdmission) {
+  GarbageAwareCacheOptions options;
+  options.capacity = 4;
+  options.admission_ratio = 0.5;
+  options.log_interval = 0;
+  auto cache = NewGarbageAwareCache(options);
+  auto* ga_cache = dynamic_cast<GarbageAwareCache*>(cache.get());
+  ASSERT_NE(nullptr, ga_cache);
+
+  auto stats = CreateDBStatistics();
+  BlockCacheMetadata meta;
+  meta.is_blob_file = true;
+  meta.is_data_block = true;
+  meta.garbage_ratio = 0.9;
+  meta.statistics = stats.get();
+
+  ASSERT_OK(cache->InsertWithMetadata("a", EncodeValue(1), 1, dumbDeleter,
+                                      &meta));
+  ASSERT_OK(cache->InsertWithMetadata("b", EncodeValue(2), 1, dumbDeleter,
+                                      &meta));
+  ASSERT_OK(cache->InsertWithMetadata("c", EncodeValue(3), 1, dumbDeleter,
+                                      &meta));
+
+  ASSERT_EQ(2U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(1U, ga_cache->TEST_GetProbationSize());
+  ASSERT_EQ(3U, stats->getTickerCount(GC_AWARE_CACHE_VSST_DATA_INSERT));
+  ASSERT_EQ(1U, stats->getTickerCount(GC_AWARE_CACHE_DEMOTE));
+
+  Cache::Handle* handle = cache->Lookup("a", stats.get());
+  ASSERT_NE(nullptr, handle);
+  ASSERT_EQ(1, DecodeValue(cache->Value(handle)));
+  cache->Release(handle);
+  ASSERT_EQ(1U, stats->getTickerCount(GC_AWARE_CACHE_PROBATION_HIT));
+}
+
+TEST(GarbageAwareCacheTest, ProbationEvictsLowestScore) {
+  GarbageAwareCacheOptions options;
+  options.capacity = 4;
+  options.admission_ratio = 0.5;
+  options.log_interval = 0;
+  auto cache = NewGarbageAwareCache(options);
+  auto stats = CreateDBStatistics();
+
+  BlockCacheMetadata meta;
+  meta.is_blob_file = true;
+  meta.is_data_block = true;
+  meta.statistics = stats.get();
+
+  meta.garbage_ratio = 0.9;
+  ASSERT_OK(cache->InsertWithMetadata("a", EncodeValue(1), 1, dumbDeleter,
+                                      &meta));
+  meta.garbage_ratio = 0.1;
+  ASSERT_OK(cache->InsertWithMetadata("b", EncodeValue(2), 1, dumbDeleter,
+                                      &meta));
+  meta.garbage_ratio = 0.5;
+  ASSERT_OK(cache->InsertWithMetadata("c", EncodeValue(3), 1, dumbDeleter,
+                                      &meta));
+  meta.garbage_ratio = 0.2;
+  ASSERT_OK(cache->InsertWithMetadata("d", EncodeValue(4), 1, dumbDeleter,
+                                      &meta));
+  meta.garbage_ratio = 0.3;
+  ASSERT_OK(cache->InsertWithMetadata("e", EncodeValue(5), 1, dumbDeleter,
+                                      &meta));
+
+  ASSERT_EQ(nullptr, cache->Lookup("a"));
+  Cache::Handle* handle = cache->Lookup("b", stats.get());
+  ASSERT_NE(nullptr, handle);
+  ASSERT_EQ(2, DecodeValue(cache->Value(handle)));
+  cache->Release(handle);
+  ASSERT_EQ(1U, stats->getTickerCount(GC_AWARE_CACHE_EVICT_LOW_SCORE));
 }
 
 #ifdef SUPPORT_CLOCK_CACHE

@@ -160,8 +160,18 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_KSST_READ_BYTES, "rocksdb.bytes.gc.ksst_read"},
     {GC_INVALID_READ_BYTES, "rocksdb.bytes.gc.invalid_read"},
     {GC_RELOCATION_WRITE_BYTES, "rocksdb.bytes.gc.relocation_write"},
+    {GC_RUN_MICROS, "rocksdb.micros.gc.run"},
     {GC_BLOCK_TOTAL, "rocksdb.num.gc.block.total"},
     {GC_BLOCK_INVALID_100, "rocksdb.num.gc.block.invalid_100"},
+    {GC_AWARE_CACHE_ADMISSION_HIT,
+     "rocksdb.block.cache.gc_aware.admission.hit"},
+    {GC_AWARE_CACHE_PROBATION_HIT,
+     "rocksdb.block.cache.gc_aware.probation.hit"},
+    {GC_AWARE_CACHE_DEMOTE, "rocksdb.block.cache.gc_aware.demote"},
+    {GC_AWARE_CACHE_EVICT_LOW_SCORE,
+     "rocksdb.block.cache.gc_aware.evict.low_score"},
+    {GC_AWARE_CACHE_VSST_DATA_INSERT,
+     "rocksdb.block.cache.gc_aware.vsst_data.insert"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

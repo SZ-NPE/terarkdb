@@ -1044,6 +1044,19 @@ struct DBOptions {
   // DEFAULT: false
   bool dump_malloc_stats = false;
 
+  // If true, collect blob GC per-block garbage ratio distribution.
+  // This is intended for experiments because it maintains per-GC block state.
+  // DEFAULT: false
+  bool blob_gc_collect_block_stats = false;
+
+  // If true, collect blob GC latency breakdown in INFO LOG.
+  // DEFAULT: false
+  bool blob_gc_collect_latency_stats = false;
+
+  // If true, collect blob GC byte counters in statistics and INFO LOG.
+  // DEFAULT: false
+  bool blob_gc_collect_bytes_stats = false;
+
   // By default RocksDB replay WAL logs and flush them on DB open, which may
   // create very small SST files. If this option is enabled, RocksDB will try
   // to avoid (but not guarantee not to) flush during recovery. Also, existing

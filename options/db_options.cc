@@ -87,6 +87,9 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
 #endif  // ROCKSDB_LITE
       fail_if_options_file_error(options.fail_if_options_file_error),
       dump_malloc_stats(options.dump_malloc_stats),
+      blob_gc_collect_block_stats(options.blob_gc_collect_block_stats),
+      blob_gc_collect_latency_stats(options.blob_gc_collect_latency_stats),
+      blob_gc_collect_bytes_stats(options.blob_gc_collect_bytes_stats),
       avoid_flush_during_recovery(options.avoid_flush_during_recovery),
       allow_ingest_behind(options.allow_ingest_behind),
       preserve_deletes(options.preserve_deletes),
@@ -233,6 +236,12 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    wal_filter ? wal_filter->Name() : "None");
 #endif  // ROCKDB_LITE
 
+  ROCKS_LOG_HEADER(log, "             Options.blob_gc_collect_block_stats: %d",
+                   blob_gc_collect_block_stats);
+  ROCKS_LOG_HEADER(log, "           Options.blob_gc_collect_latency_stats: %d",
+                   blob_gc_collect_latency_stats);
+  ROCKS_LOG_HEADER(log, "             Options.blob_gc_collect_bytes_stats: %d",
+                   blob_gc_collect_bytes_stats);
   ROCKS_LOG_HEADER(log, "            Options.avoid_flush_during_recovery: %d",
                    avoid_flush_during_recovery);
   ROCKS_LOG_HEADER(log, "                    Options.allow_ingest_behind: %d",

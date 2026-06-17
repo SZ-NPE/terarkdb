@@ -80,6 +80,9 @@ struct ImmutableDBOptions {
 #endif  // ROCKSDB_LITE
   bool fail_if_options_file_error;
   bool dump_malloc_stats;
+  bool blob_gc_collect_block_stats;
+  bool blob_gc_collect_latency_stats;
+  bool blob_gc_collect_bytes_stats;
   bool avoid_flush_during_recovery;
   bool allow_ingest_behind;
   bool preserve_deletes;

@@ -438,6 +438,22 @@ DEFINE_double(cache_high_pri_pool_ratio, 0.0,
 DEFINE_bool(use_clock_cache, false,
             "Replace default LRU block cache with clock cache.");
 
+DEFINE_bool(use_gc_aware_block_cache, false,
+            "Replace default LRU block cache with garbage-aware block cache "
+            "for vSST data blocks.");
+
+DEFINE_double(gc_aware_cache_admission_ratio, 0.7,
+              "Fraction of garbage-aware block cache capacity reserved for the "
+              "normal LRU admission region.");
+
+DEFINE_double(gc_aware_cache_demote_score_threshold, 0.0,
+              "Demote vSST data blocks whose score is below this threshold. "
+              "score = access_frequency * (1 - file_garbage_ratio).");
+
+DEFINE_uint64(gc_aware_cache_log_interval, 10000,
+              "Log garbage-aware block cache state every N demote/evict "
+              "events. 0 disables periodic cache logs.");
+
 DEFINE_int64(simcache_size, -1,
              "Number of bytes to use as a simcache of "
              "uncompressed data. Nagative value disables simcache.");
@@ -992,6 +1008,13 @@ DEFINE_bool(hotness_enable_compaction_feedback, true,
             "Enable compaction obsolete-version feedback for HotnessTracker");
 DEFINE_bool(hotness_enable_drop_key_cache, true,
             "Enable compaction drop-key cache for blob GC GetKey avoidance");
+
+DEFINE_bool(blob_gc_collect_block_stats, false,
+            "Collect blob GC per-block garbage ratio distribution.");
+DEFINE_bool(blob_gc_collect_latency_stats, false,
+            "Collect blob GC latency breakdown in INFO LOG.");
+DEFINE_bool(blob_gc_collect_bytes_stats, false,
+            "Collect blob GC byte counters in statistics and INFO LOG.");
 
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
@@ -2402,6 +2425,13 @@ class Benchmark {
         exit(1);
       }
       return cache;
+    } else if (FLAGS_use_gc_aware_block_cache) {
+      return NewGarbageAwareCache(
+          (size_t)capacity, FLAGS_cache_numshardbits,
+          false /* strict_capacity_limit */,
+          FLAGS_gc_aware_cache_admission_ratio,
+          FLAGS_gc_aware_cache_demote_score_threshold,
+          FLAGS_gc_aware_cache_log_interval);
     } else {
       return NewLRUCache((size_t)capacity, FLAGS_cache_numshardbits,
                          false /*strict_capacity_limit*/,
@@ -3605,6 +3635,9 @@ class Benchmark {
     options.hotness_enable_compaction_feedback =
         FLAGS_hotness_enable_compaction_feedback;
     options.hotness_enable_drop_key_cache = FLAGS_hotness_enable_drop_key_cache;
+    options.blob_gc_collect_block_stats = FLAGS_blob_gc_collect_block_stats;
+    options.blob_gc_collect_latency_stats = FLAGS_blob_gc_collect_latency_stats;
+    options.blob_gc_collect_bytes_stats = FLAGS_blob_gc_collect_bytes_stats;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;

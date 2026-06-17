@@ -93,7 +93,8 @@ class TableCache {
                    HistogramImpl* file_read_hist = nullptr,
                    bool skip_filters = false, int level = -1,
                    bool prefetch_index_and_filter_in_cache = true,
-                   bool force_memory = false);
+                   bool force_memory = false, bool is_blob_file = false,
+                   double file_garbage_ratio = 0.0);
 
   // Get TableReader from a cache handle.
   TableReader* GetTableReaderFromHandle(Cache::Handle* handle);
@@ -142,7 +143,9 @@ class TableCache {
                         const SliceTransform* prefix_extractor = nullptr,
                         bool skip_filters = false, int level = -1,
                         bool prefetch_index_and_filter_in_cache = true,
-                        bool for_compaction = false, bool force_memory = false);
+                        bool for_compaction = false, bool force_memory = false,
+                        bool is_blob_file = false,
+                        double file_garbage_ratio = 0.0);
   Status GetTableReaderImpl(const EnvOptions& env_options,
                             const FileDescriptor& fd, bool sequential_mode,
                             size_t readahead, bool record_read_stats,
@@ -151,7 +154,8 @@ class TableCache {
                             const SliceTransform* prefix_extractor,
                             bool skip_filters, int level,
                             bool prefetch_index_and_filter_in_cache,
-                            bool for_compaction, bool force_memory);
+                            bool for_compaction, bool force_memory,
+                            bool is_blob_file, double file_garbage_ratio);
 
   const ImmutableCFOptions& ioptions_;
   const EnvOptions& env_options_;

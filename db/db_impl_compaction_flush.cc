@@ -2974,19 +2974,25 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
     // be used throughout the garbage collection procedure to make sure
     // consistency. It will eventually be installed into SuperVersion
     auto* mutable_cf_options = cfd->GetLatestMutableCFOptions();
-    // Stage 1: trigger decision overhead (from queue pop to pre-pick)
-    const uint64_t gc_trigger_start = env_->NowNanos();
+    const bool collect_gc_latency =
+        immutable_db_options_.blob_gc_collect_latency_stats;
+    const uint64_t gc_trigger_start =
+        collect_gc_latency ? env_->NowNanos() : 0;
     if (!mutable_cf_options->disable_auto_compactions && !cfd->IsDropped()) {
       // NOTE: try to avoid unnecessary copy of MutableCFOptions if
       // garbage collection is not necessary. Need to make sure mutex is held
       // until we make a copy in the following code
       TEST_SYNC_POINT(
           "DBImpl::BackgroundGarbageCollection():BeforePickGarbageCollection");
-      // Stage 2: select target blob files
-      const uint64_t gc_t_select_start = env_->NowNanos();
-      gc_t_trigger = gc_t_select_start - gc_trigger_start;
+      const uint64_t gc_t_select_start =
+          collect_gc_latency ? env_->NowNanos() : 0;
+      if (collect_gc_latency) {
+        gc_t_trigger = gc_t_select_start - gc_trigger_start;
+      }
       c.reset(cfd->PickGarbageCollection(*mutable_cf_options, log_buffer));
-      gc_t_select = env_->NowNanos() - gc_t_select_start;
+      if (collect_gc_latency) {
+        gc_t_select = env_->NowNanos() - gc_t_select_start;
+      }
       TEST_SYNC_POINT(
           "DBImpl::BackgroundGarbageCollection():AfterPickGarbageCollection");
 
@@ -3057,27 +3063,39 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             garbage_collection_job_stats, job_context->job_id);
 
-    const uint64_t gc_begin_ts = env_->NowMicros();
-    ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                   "[%s] [JOB %d] GarbageCollection begin: ts=%" PRIu64,
-                   c->column_family_data()->GetName().c_str(),
-                   job_context->job_id, gc_begin_ts);
+    const bool collect_gc_latency =
+        immutable_db_options_.blob_gc_collect_latency_stats;
+    const uint64_t gc_begin_ts = collect_gc_latency ? env_->NowMicros() : 0;
+    if (collect_gc_latency) {
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[%s] [JOB %d] GarbageCollection begin: ts=%" PRIu64,
+                     c->column_family_data()->GetName().c_str(),
+                     job_context->job_id, gc_begin_ts);
+    }
     mutex_.Unlock();
     garbage_collection_job.Run();
     TEST_SYNC_POINT("DBImpl::BackgroundGarbageCollection:NonTrivial:AfterRun");
     mutex_.Lock();
-    const uint64_t gc_run_end_ts = env_->NowMicros();
+    const uint64_t gc_run_end_ts = collect_gc_latency ? env_->NowMicros() : 0;
     // Stage 6 (part 2): install version edit, manifest update, fsync
-    const uint64_t gc_meta_start = env_->NowNanos();
+    const uint64_t gc_meta_start =
+        collect_gc_latency ? env_->NowNanos() : 0;
     status = garbage_collection_job.Install(*c->mutable_cf_options());
-    garbage_collection_job.AddGcMetaTime(env_->NowNanos() - gc_meta_start);
+    if (collect_gc_latency) {
+      garbage_collection_job.AddGcMetaTime(env_->NowNanos() - gc_meta_start);
+    }
     garbage_collection_job.DumpGcBreakdown();
     garbage_collection_job.DumpGcBlockDist();
-    ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                   "[%s] [JOB %d] GarbageCollection end: status=%s, run_micros=%" PRIu64,
-                   c->column_family_data()->GetName().c_str(),
-                   job_context->job_id, status.ToString().c_str(),
-                   gc_run_end_ts - gc_begin_ts);
+    if (collect_gc_latency) {
+      const uint64_t gc_run_micros = gc_run_end_ts - gc_begin_ts;
+      RecordTick(stats_, GC_RUN_MICROS, gc_run_micros);
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[%s] [JOB %d] GarbageCollection end: status=%s, "
+                     "run_micros=%" PRIu64,
+                     c->column_family_data()->GetName().c_str(),
+                     job_context->job_id, status.ToString().c_str(),
+                     gc_run_micros);
+    }
     if (status.ok()) {
       InstallSuperVersionAndScheduleWork(
           c->column_family_data(), &job_context->superversion_contexts[0],

@@ -564,6 +564,7 @@ endif()
 set(SOURCES
         cache/clock_cache.cc
         cache/fifo_cache.cc
+        cache/garbage_aware_cache.cc
         cache/lirs_cache.cc
         cache/lru_cache.cc
         cache/sharded_cache.cc

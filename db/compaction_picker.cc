@@ -1014,6 +1014,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
       params.inputs, CompactionReason::kGarbageCollection);
 
   Compaction* c = RegisterCompaction(new Compaction(std::move(params)));
+  if (ioptions_.blob_gc_collect_bytes_stats) {
     RecordTick(ioptions_.statistics, GC_PICK_CANDIDATE_FILES, permitted_blobs);
     RecordTick(ioptions_.statistics, GC_PICK_SELECTED_FILES, input.files.size());
     RecordTick(ioptions_.statistics, GC_PICK_SELECTED_BYTES,
@@ -1036,6 +1037,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
       garbage_ratio_buckets[0], garbage_ratio_buckets[1],
       garbage_ratio_buckets[2], garbage_ratio_buckets[3],
       garbage_ratio_buckets[4], garbage_ratio_buckets[5]);
+  }
   vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options);
 
   return c;

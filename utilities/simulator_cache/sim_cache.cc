@@ -164,6 +164,10 @@ class SimCacheImpl : public SimCache {
         stats_(nullptr) {}
 
   virtual ~SimCacheImpl() {}
+  using Cache::Erase;
+  using Cache::Insert;
+  using Cache::Lookup;
+
   virtual void SetCapacity(size_t capacity) override {
     cache_->SetCapacity(capacity);
   }

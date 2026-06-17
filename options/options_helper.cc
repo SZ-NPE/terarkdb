@@ -135,6 +135,12 @@ DBOptions BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.fail_if_options_file_error =
       immutable_db_options.fail_if_options_file_error;
   options.dump_malloc_stats = immutable_db_options.dump_malloc_stats;
+  options.blob_gc_collect_block_stats =
+      immutable_db_options.blob_gc_collect_block_stats;
+  options.blob_gc_collect_latency_stats =
+      immutable_db_options.blob_gc_collect_latency_stats;
+  options.blob_gc_collect_bytes_stats =
+      immutable_db_options.blob_gc_collect_bytes_stats;
   options.avoid_flush_during_recovery =
       immutable_db_options.avoid_flush_during_recovery;
   options.avoid_flush_during_shutdown =
@@ -1754,6 +1760,15 @@ std::unordered_map<std::string, OptionTypeInfo>
         {"dump_malloc_stats",
          {offsetof(struct DBOptions, dump_malloc_stats), OptionType::kBoolean,
           OptionVerificationType::kNormal, false, 0}},
+        {"blob_gc_collect_block_stats",
+         {offsetof(struct DBOptions, blob_gc_collect_block_stats),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"blob_gc_collect_latency_stats",
+         {offsetof(struct DBOptions, blob_gc_collect_latency_stats),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"blob_gc_collect_bytes_stats",
+         {offsetof(struct DBOptions, blob_gc_collect_bytes_stats),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"avoid_flush_during_recovery",
          {offsetof(struct DBOptions, avoid_flush_during_recovery),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
