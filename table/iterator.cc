@@ -143,7 +143,15 @@ LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
       separate_helper_->TransToCombined(user_key, pikey.sequence, value_index);
   if (meta != nullptr && value_index.valid()) {
     auto meta_slice = SeparateHelper::DecodeValueMeta(value_index.slice());
-    meta->assign(meta_slice.data(), meta_slice.size());
+    if (!meta_slice.empty()) {
+      meta->assign(meta_slice.data(), meta_slice.size());
+    } else {
+      std::string delta_meta;
+      Status s = iter_->GetProperty("rocksdb.delta.value-meta", &delta_meta);
+      if (s.ok()) {
+        *meta = std::move(delta_meta);
+      }
+    }
   }
   return v;
 }

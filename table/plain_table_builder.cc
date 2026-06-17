@@ -109,7 +109,9 @@ PlainTableBuilder::PlainTableBuilder(
 
 PlainTableBuilder::~PlainTableBuilder() {}
 
-Status PlainTableBuilder::Add(const Slice& key, const LazyBuffer& lazy_value) {
+Status PlainTableBuilder::Add(
+    const Slice& key, const LazyBuffer& lazy_value,
+    const SeparateHelper::ValueMetaData& /*value_meta*/) {
   auto s = lazy_value.fetch();
   if (!s.ok()) {
     return s;

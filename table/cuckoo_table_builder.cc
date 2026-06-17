@@ -83,7 +83,9 @@ CuckooTableBuilder::CuckooTableBuilder(
   properties_.column_family_name = column_family_name;
 }
 
-Status CuckooTableBuilder::Add(const Slice& key, const LazyBuffer& lazy_value) {
+Status CuckooTableBuilder::Add(
+    const Slice& key, const LazyBuffer& lazy_value,
+    const SeparateHelper::ValueMetaData& /*value_meta*/) {
   auto s = lazy_value.fetch();
   if (!s.ok()) {
     return s;

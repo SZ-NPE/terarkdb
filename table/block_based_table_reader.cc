@@ -203,6 +203,34 @@ bool PrefixExtractorChanged(const TablePropertiesBase* table_properties_base,
   }
 }
 
+class Fixed32ComparatorImpl : public Comparator {
+ public:
+  const char* Name() const override { return "rocksdb.Fixed32Comparator"; }
+
+  int Compare(const Slice& a, const Slice& b) const override {
+    assert(a.size() == sizeof(uint32_t));
+    assert(b.size() == sizeof(uint32_t));
+    uint32_t lhs = DecodeFixed32(a.data());
+    uint32_t rhs = DecodeFixed32(b.data());
+    if (lhs < rhs) {
+      return -1;
+    }
+    if (lhs > rhs) {
+      return 1;
+    }
+    return 0;
+  }
+
+  void FindShortestSeparator(std::string*, const Slice&) const override {}
+
+  void FindShortSuccessor(std::string*) const override {}
+};
+
+const Comparator* Fixed32Comparator() {
+  static Fixed32ComparatorImpl comparator;
+  return &comparator;
+}
+
 }  // namespace
 
 // Index that allows binary search lookup in a two-level index structure.
@@ -931,6 +959,25 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     rep->table_properties_base = *rep->table_properties;
   }
 
+  if (rep->table_options.use_delta_block) {
+    bool found_delta_block;
+    BlockHandle delta_block_handle;
+    s = SeekToDeltaBlock(meta_iter.get(), &found_delta_block,
+                         &delta_block_handle);
+    if (!s.ok()) {
+      ROCKS_LOG_WARN(rep->ioptions.info_log,
+                     "Error when seeking to delta block from file: %s",
+                     s.ToString().c_str());
+    } else if (found_delta_block && !delta_block_handle.IsNull()) {
+      s = ReadDeltaBlock(rep, prefetch_buffer.get(), delta_block_handle);
+      if (!s.ok()) {
+        ROCKS_LOG_WARN(rep->ioptions.info_log,
+                       "Encountered error while reading delta block %s",
+                       s.ToString().c_str());
+      }
+    }
+  }
+
   // Read the compression dictionary meta block
   bool found_compression_dict;
   BlockHandle compression_dict_handle;
@@ -1234,6 +1281,23 @@ Status BlockBasedTable::ReadMetaBlock(
   iter->reset(meta_block->get()->NewIterator<DataBlockIter>(
       BytewiseComparator(), BytewiseComparator()));
   return Status::OK();
+}
+
+Status BlockBasedTable::ReadDeltaBlock(Rep* rep,
+                                       FilePrefetchBuffer* prefetch_buffer,
+                                       const BlockHandle& delta_handle) {
+  std::unique_ptr<Block> delta_index_block;
+  Status s = ReadBlockFromFile(
+      rep->file.get(), prefetch_buffer, rep->footer, ReadOptions(),
+      delta_handle, &delta_index_block, rep->ioptions,
+      false /* decompress */, false /* maybe_compressed */,
+      Slice() /* compression dict */, rep->persistent_cache_options,
+      kDisableGlobalSequenceNumber, 0 /* read_amp_bytes_per_bit */,
+      GetMemoryAllocator(rep->table_options));
+  if (s.ok()) {
+    rep->delta_index_block = std::move(delta_index_block);
+  }
+  return s;
 }
 
 Status BlockBasedTable::GetDataBlockFromCache(
@@ -2142,6 +2206,17 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::Seek(
 
   block_iter_.Seek(target);
 
+  if (for_compaction_ && delta_block_reader_ != nullptr &&
+      delta_block_reader_->status().ok()) {
+    delta_block_reader_->SeekForBlockIndex(GetIndexPair(index_iter_));
+    if (block_iter_.Valid()) {
+      delta_block_reader_->SeekForEntryIndexWithinBlock(
+          GetIndexPair(&block_iter_));
+    } else {
+      delta_block_reader_->Reset();
+    }
+  }
+
   FindKeyForward();
   assert(
       !block_iter_.Valid() ||
@@ -2205,6 +2280,10 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToFirst() {
     return;
   }
   ResetDataIter();
+  if (for_compaction_ && delta_block_reader_ != nullptr &&
+      delta_block_reader_->status().ok()) {
+    delta_block_reader_->SeekToFirst();
+  }
   FindKeyForward();
 }
 
@@ -2226,6 +2305,10 @@ template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::Next() {
   assert(block_iter_points_to_real_block_);
   block_iter_.Next();
+  if (block_iter_.Valid() && for_compaction_ &&
+      delta_block_reader_ != nullptr && delta_block_reader_->status().ok()) {
+    delta_block_reader_->Next();
+  }
   FindKeyForward();
 }
 
@@ -2311,6 +2394,10 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyForward() {
       // so for code simplicity, we removed it. We can add it back if there is
       // a significant performance regression.
       index_iter_->Next();
+      if (for_compaction_ && delta_block_reader_ != nullptr &&
+          delta_block_reader_->status().ok()) {
+        delta_block_reader_->FindKeyForward();
+      }
     }
 
     if (!index_iter_->Valid()) {
@@ -2363,12 +2450,46 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyBackward() {
   // code simplicity.
 }
 
+template <class TBlockIter, typename TValue>
+Status BlockBasedTableIteratorBase<TBlockIter, TValue>::GetProperty(
+    std::string prop_name, std::string* prop) {
+  if (prop == nullptr) {
+    return Status::InvalidArgument("prop is nullptr");
+  }
+  if (delta_block_reader_ == nullptr || !delta_block_reader_->status().ok()) {
+    return Status::NotFound("delta block is unavailable");
+  }
+  if (prop_name == "rocksdb.delta.is-separated") {
+    *prop = delta_block_reader_->CurrentEntryIsSeparated() ? "1" : "0";
+    return Status::OK();
+  }
+  if (prop_name == "rocksdb.delta.value-size") {
+    PutVarint32(prop, delta_block_reader_->CurrentValueSize());
+    return Status::OK();
+  }
+  if (prop_name == "rocksdb.delta.value-meta") {
+    Slice meta = delta_block_reader_->CurrentValueMeta();
+    prop->assign(meta.data(), meta.size());
+    return Status::OK();
+  }
+  return Status::NotSupported("unidentified property");
+}
+
 InternalIterator* BlockBasedTable::NewIterator(
     const ReadOptions& read_options, const SliceTransform* prefix_extractor,
     Arena* arena, bool skip_filters, bool for_compaction) {
   bool need_upper_bound_check =
       PrefixExtractorChanged(&rep_->table_properties_base, prefix_extractor);
   const bool kIsNotIndex = false;
+  auto new_delta_index_iter = [&]() -> InternalIteratorBase<BlockHandle>* {
+    if (!for_compaction || !rep_->delta_index_block) {
+      return nullptr;
+    }
+    return rep_->delta_index_block->NewIterator<IndexBlockIter>(
+        Fixed32Comparator(), Fixed32Comparator(), nullptr, nullptr,
+        true /* total_order_seek */, false /* key_includes_seq */,
+        true /* value_is_full */);
+  };
   if (arena == nullptr) {
     return new BlockBasedTableIterator<DataBlockIter, LazyBuffer>(
         this, read_options, rep_->internal_comparator,
@@ -2380,7 +2501,7 @@ InternalIterator* BlockBasedTable::NewIterator(
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
         true /*key_includes_seq*/, true /*index_key_is_full*/,
-        for_compaction);
+        for_compaction, new_delta_index_iter());
   } else {
     auto* mem = arena->AllocateAligned(
         sizeof(BlockBasedTableIterator<DataBlockIter, LazyBuffer>));
@@ -2391,7 +2512,7 @@ InternalIterator* BlockBasedTable::NewIterator(
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
         true /*key_includes_seq*/, true /*index_key_is_full*/,
-        for_compaction);
+        for_compaction, new_delta_index_iter());
   }
 }
 

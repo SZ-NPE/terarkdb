@@ -518,6 +518,11 @@ DEFINE_bool(block_align,
             TERARKDB_NAMESPACE::BlockBasedTableOptions().block_align,
             "Align data blocks on page size");
 
+DEFINE_bool(use_delta_block,
+            TERARKDB_NAMESPACE::BlockBasedTableOptions().use_delta_block,
+            "Enable delta block metadata for separated values. Disabled by "
+            "default to keep the classic SST write/read path unchanged.");
+
 DEFINE_bool(use_data_block_hash_index, false,
             "if use kDataBlockBinaryAndHash "
             "instead of kDataBlockBinarySearch. "
@@ -3507,6 +3512,7 @@ class Benchmark {
       block_based_options.enable_index_compression =
           FLAGS_enable_index_compression;
       block_based_options.block_align = FLAGS_block_align;
+      block_based_options.use_delta_block = FLAGS_use_delta_block;
       if (FLAGS_use_data_block_hash_index) {
         block_based_options.data_block_index_type =
             TERARKDB_NAMESPACE::BlockBasedTableOptions::kDataBlockBinaryAndHash;

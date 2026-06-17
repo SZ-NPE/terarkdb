@@ -380,8 +380,9 @@ std::shared_ptr<FilePair> TerarkZipTableBuilder::NewFilePair() {
   return pair;
 };
 
-Status TerarkZipTableBuilder::Add(const Slice& key,
-                                  const LazyBuffer& lazy_value) try {
+Status TerarkZipTableBuilder::Add(
+    const Slice& key, const LazyBuffer& lazy_value,
+    const SeparateHelper::ValueMetaData& /*value_meta*/) try {
   auto s = lazy_value.fetch();
   if (!s.ok()) {
     return s;

@@ -788,6 +788,18 @@ class SeparateHelper {
  public:
   virtual ~SeparateHelper() = default;
 
+  struct ValueMetaData {
+    uint32_t value_size;
+    std::string meta_data;
+
+    ValueMetaData() { Reset(); }
+
+    void Reset() {
+      value_size = 0;
+      meta_data.clear();
+    }
+  };
+
   static Slice EncodeFileNumber(uint64_t& file_number) {
     if (!port::kLittleEndian) {
       file_number = EndianTransform(file_number, sizeof file_number);

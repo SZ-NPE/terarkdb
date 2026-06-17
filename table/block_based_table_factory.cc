@@ -354,6 +354,9 @@ std::string BlockBasedTableFactory::GetPrintableTableOptions() const {
   snprintf(buffer, kBufferSize, "  use_delta_encoding: %d\n",
            table_options_.use_delta_encoding);
   ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  use_delta_block: %d\n",
+           table_options_.use_delta_block);
+  ret.append(buffer);
   snprintf(buffer, kBufferSize, "  filter_policy: %s\n",
            table_options_.filter_policy == nullptr
                ? "nullptr"

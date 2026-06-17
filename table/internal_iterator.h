@@ -77,6 +77,11 @@ class InternalIteratorCommon : public Cleanable {
     return Status::NotSupported("");
   }
 
+  virtual bool GetIndex(uint32_t* /*restart_index*/,
+                        uint32_t* /*entry_index*/) {
+    return false;
+  }
+
  protected:
   void SeekForPrevImpl(const Slice& target, const Comparator* cmp) {
     Seek(target);

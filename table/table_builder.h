@@ -166,7 +166,10 @@ class TableBuilder {
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.
   // REQUIRES: Finish(), Abandon() have not been called
-  virtual Status Add(const Slice& key, const LazyBuffer& value) = 0;
+  virtual Status Add(
+      const Slice& key, const LazyBuffer& value,
+      const SeparateHelper::ValueMetaData& value_meta =
+          SeparateHelper::ValueMetaData()) = 0;
 
   virtual Status AddTombstone(const Slice& /*key*/,
                               const LazyBuffer& /*value*/) {

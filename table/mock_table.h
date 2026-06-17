@@ -149,7 +149,9 @@ class MockTableBuilder : public TableBuilder {
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.
   // REQUIRES: Finish(), Abandon() have not been called
-  Status Add(const Slice& key, const LazyBuffer& value) override {
+  Status Add(const Slice& key, const LazyBuffer& value,
+             const SeparateHelper::ValueMetaData& /*value_meta*/ =
+                 SeparateHelper::ValueMetaData()) override {
     return AddToTable(key, value, file_data_.table);
   }
 

@@ -55,7 +55,9 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.
   // REQUIRES: Finish(), Abandon() have not been called
-  Status Add(const Slice& key, const LazyBuffer& value) override;
+  Status Add(const Slice& key, const LazyBuffer& value,
+             const SeparateHelper::ValueMetaData& value_meta =
+                 SeparateHelper::ValueMetaData()) override;
 
   Status AddTombstone(const Slice& key, const LazyBuffer& value) override;
 
@@ -98,6 +100,8 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Compress and write block content to the file.
   void WriteBlock(const Slice& block_contents, BlockHandle* handle,
                   bool is_data_block);
+
+  void WriteDeltaBlock(MetaIndexBuilder* meta_index_builder);
   // Directly write data to the file.
   void WriteRawBlock(const Slice& data, CompressionType, BlockHandle* handle,
                      bool is_data_block = false);

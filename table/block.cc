@@ -106,6 +106,56 @@ void IndexBlockIter::Next() {
   ParseNextIndexKey();
 }
 
+template <class TValue>
+bool BlockIter<TValue>::GetIndex(uint32_t* restart_index,
+                                 uint32_t* entry_index) {
+  if (!Valid()) {
+    return false;
+  }
+  *restart_index = restart_index_;
+  *entry_index = 0;
+  uint32_t offset = GetRestartPoint(restart_index_);
+  const char* limit = data_ + restarts_;
+  while (offset < current_) {
+    uint32_t shared, non_shared, value_length;
+    const char* p = data_ + offset;
+    p = DecodeEntry()(p, limit, &shared, &non_shared, &value_length);
+    if (p == nullptr) {
+      return false;
+    }
+    offset = static_cast<uint32_t>((p + non_shared + value_length) - data_);
+    ++*entry_index;
+  }
+  return offset == current_;
+}
+
+bool IndexBlockIter::GetIndex(uint32_t* restart_index, uint32_t* entry_index) {
+  if (!Valid()) {
+    return false;
+  }
+  *restart_index = restart_index_;
+  *entry_index = 0;
+  uint32_t offset = GetRestartPoint(restart_index_);
+  const char* limit = data_ + restarts_;
+  while (offset < current_) {
+    uint32_t shared = 0;
+    uint32_t non_shared = 0;
+    uint32_t value_length = 0;
+    const char* p = data_ + offset;
+    if (value_delta_encoded_) {
+      p = DecodeKeyV4()(p, limit, &shared, &non_shared);
+    } else {
+      p = DecodeEntry()(p, limit, &shared, &non_shared, &value_length);
+    }
+    if (p == nullptr) {
+      return false;
+    }
+    offset = static_cast<uint32_t>((p + non_shared + value_length) - data_);
+    ++*entry_index;
+  }
+  return offset == current_;
+}
+
 void IndexBlockIter::Prev() {
   assert(Valid());
   // Scan backwards to a restart point before current_

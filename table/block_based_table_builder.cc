@@ -32,6 +32,7 @@
 #include "table/block_based_table_factory.h"
 #include "table/block_based_table_reader.h"
 #include "table/block_builder.h"
+#include "table/delta_builder.h"
 #include "table/filter_block.h"
 #include "table/format.h"
 #include "table/full_filter_block.h"
@@ -49,6 +50,7 @@ namespace TERARKDB_NAMESPACE {
 
 extern const std::string kHashIndexPrefixesBlock;
 extern const std::string kHashIndexPrefixesMetadataBlock;
+extern const std::string kDeltaBlock;
 
 typedef BlockBasedTableOptions::IndexType IndexType;
 
@@ -252,6 +254,7 @@ struct BlockBasedTableBuilder::Rep {
   size_t alignment;
   BlockBuilder data_block;
   BlockBuilder range_del_block;
+  DeltaBuilder delta_block;
 
   InternalKeySliceTransform internal_prefix_transform;
   std::unique_ptr<IndexBuilder> index_builder;
@@ -301,6 +304,8 @@ struct BlockBasedTableBuilder::Rep {
                        : table_options.data_block_index_type,
                    table_options.data_block_hash_table_util_ratio),
         range_del_block(1 /* block_restart_interval */),
+        delta_block(table_options.block_restart_interval,
+                    table_options.index_block_restart_interval, 1),
         internal_prefix_transform(builder_opt.moptions.prefix_extractor.get()),
         compression_dict(builder_opt.compression_dict),
         compression_ctx(builder_opt.compression_type,
@@ -388,8 +393,9 @@ BlockBasedTableBuilder::~BlockBasedTableBuilder() {
   delete rep_;
 }
 
-Status BlockBasedTableBuilder::Add(const Slice& key,
-                                   const LazyBuffer& lazy_value) {
+Status BlockBasedTableBuilder::Add(
+    const Slice& key, const LazyBuffer& lazy_value,
+    const SeparateHelper::ValueMetaData& value_meta) {
   Rep* r = rep_;
   assert(!r->closed);
   assert(ok());
@@ -418,6 +424,10 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
     // < all entries in subsequent blocks.
     if (ok()) {
       r->index_builder->AddIndexEntry(&r->last_key, &key, r->pending_handle);
+      if (r->table_options.use_delta_block) {
+        r->delta_block.AddIndexEntry(r->props.num_data_blocks,
+                                     static_cast<uint32_t>(r->props.num_entries));
+      }
     }
   }
 
@@ -429,10 +439,18 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
 
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
+  const ValueType value_type = ExtractValueType(key);
+  const bool is_separated =
+      value_type == kTypeValueIndex || value_type == kTypeMergeIndex;
+  if (r->table_options.use_delta_block) {
+    r->delta_block.Add(is_separated,
+                       is_separated ? value_meta.value_size : 0,
+                       value_meta.meta_data.empty() ? nullptr
+                                                     : &value_meta.meta_data);
+  }
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
-  ValueType value_type = ExtractValueType(key);
   if (value_type == kTypeDeletion || value_type == kTypeSingleDeletion) {
     r->props.num_deletions++;
   } else if (value_type == kTypeMerge) {
@@ -874,6 +892,36 @@ void BlockBasedTableBuilder::WriteRangeDelBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteDeltaBlock(
+    MetaIndexBuilder* meta_index_builder) {
+  if (ok() && rep_->table_options.use_delta_block &&
+      !rep_->delta_block.empty()) {
+    BlockHandle delta_block_handle;
+    LazyBuffer delta_block_content;
+    Status s = rep_->delta_block.Finish(&delta_block_content);
+    if (!s.ok() && !s.IsIncomplete()) {
+      rep_->status = s;
+      return;
+    }
+    if (ok()) {
+      WriteRawBlock(delta_block_content.slice(), kNoCompression,
+                    &delta_block_handle);
+    }
+    while (ok() && s.IsIncomplete()) {
+      s = rep_->delta_block.Finish(&delta_block_content, delta_block_handle);
+      if (!s.ok() && !s.IsIncomplete()) {
+        rep_->status = s;
+        return;
+      }
+      WriteRawBlock(delta_block_content.slice(), kNoCompression,
+                    &delta_block_handle);
+    }
+    if (ok()) {
+      meta_index_builder->Add(kDeltaBlock, delta_block_handle);
+    }
+  }
+}
+
 Status BlockBasedTableBuilder::Finish(
     const TablePropertyCache* prop,
     const std::vector<SequenceNumber>* snapshots,
@@ -904,6 +952,11 @@ Status BlockBasedTableBuilder::Finish(
     r->index_builder->AddIndexEntry(
         &r->last_key, nullptr /* no next data block */, r->pending_handle);
   }
+  if (r->table_options.use_delta_block) {
+    r->delta_block.AddIndexEntry(r->props.num_data_blocks,
+                                 static_cast<uint32_t>(r->props.num_entries),
+                                 true);
+  }
 
   // Write meta blocks and metaindex block with the following order.
   //    1. [meta block: filter]
@@ -918,6 +971,7 @@ Status BlockBasedTableBuilder::Finish(
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
+  WriteDeltaBlock(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);
   if (ok()) {
     // flush the meta index block

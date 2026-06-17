@@ -671,6 +671,8 @@ set(SOURCES
         table/block_fetcher.cc
         table/block_prefix_index.cc
         table/bloom_block.cc
+        table/delta_builder.cc
+        table/delta_reader.cc
         table/cuckoo_table_builder.cc
         table/cuckoo_table_factory.cc
         table/cuckoo_table_reader.cc

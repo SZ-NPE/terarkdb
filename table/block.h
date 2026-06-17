@@ -302,6 +302,8 @@ class BlockIter : public InternalIteratorBase<TValue> {
     return key_.GetKey();
   }
 
+  bool GetIndex(uint32_t* restart_index, uint32_t* entry_index) override;
+
   size_t TEST_CurrentEntrySize() { return NextEntryOffset() - current_; }
 
   uint32_t ValueOffset() const {
@@ -529,6 +531,8 @@ class IndexBlockIter final : public BlockIter<BlockHandle> {
       return handle;
     }
   }
+
+  bool GetIndex(uint32_t* restart_index, uint32_t* entry_index) override;
 
   virtual void Seek(const Slice& target) override;
 

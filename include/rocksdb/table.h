@@ -190,6 +190,15 @@ struct BlockBasedTableOptions {
   // Default: true
   bool use_delta_encoding = true;
 
+  // Use an SST-side delta metadata block to store per-entry metadata for
+  // separated values. This is a table-format extension used by precise Blob GC
+  // to recover value sizes without fetching Blob values during compaction.
+  //
+  // Disabled by default during migration; existing precise_gc paths continue
+  // to fall back to Dependence::byte_count or average-size estimation when the
+  // delta block is absent.
+  bool use_delta_block = false;
+
   // If non-nullptr, use the specified filter policy to reduce disk reads.
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.

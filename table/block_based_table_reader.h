@@ -28,6 +28,7 @@
 #include "rocksdb/terark_namespace.h"
 #include "table/block.h"
 #include "table/block_based_table_factory.h"
+#include "table/delta_reader.h"
 #include "table/filter_block.h"
 #include "table/format.h"
 #include "table/persistent_cache_helper.h"
@@ -370,6 +371,9 @@ class BlockBasedTable : public TableReader {
       std::unique_ptr<Block>* meta_block,
       std::unique_ptr<InternalIteratorBase<Slice>>* iter);
 
+  static Status ReadDeltaBlock(Rep* rep, FilePrefetchBuffer* prefetch_buffer,
+                               const BlockHandle& delta_handle);
+
   Status VerifyChecksumInBlocks(InternalIteratorBase<Slice>* index_iter);
   Status VerifyChecksumInBlocks(InternalIteratorBase<BlockHandle>* index_iter);
 
@@ -527,6 +531,7 @@ struct BlockBasedTable::Rep {
   // push flush them out, hence they're pinned
   CachableEntry<FilterBlockReader> filter_entry;
   CachableEntry<IndexReader> index_entry;
+  std::unique_ptr<Block> delta_index_block;
   std::shared_ptr<const FragmentedRangeTombstoneList> fragmented_range_dels;
 
   // If global_seqno is used, all Keys in this file will have the same
@@ -566,7 +571,9 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
                               const SliceTransform* prefix_extractor,
                               bool is_index, bool key_includes_seq = true,
                               bool index_key_is_full = true,
-                              bool for_compaction = false)
+                              bool for_compaction = false,
+                              InternalIteratorBase<BlockHandle>* delta_index_iter =
+                                  nullptr)
       : table_(table),
         read_options_(read_options),
         icomp_(icomp),
@@ -578,9 +585,17 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
         is_index_(is_index),
         key_includes_seq_(key_includes_seq),
         index_key_is_full_(index_key_is_full),
-        for_compaction_(for_compaction) {}
+        for_compaction_(for_compaction),
+        delta_block_reader_(nullptr) {
+    if (for_compaction_ && delta_index_iter != nullptr) {
+      delta_block_reader_ = new DeltaBlockReader(table, delta_index_iter);
+    }
+  }
 
-  ~BlockBasedTableIteratorBase() { delete index_iter_; }
+  ~BlockBasedTableIteratorBase() {
+    delete index_iter_;
+    delete delta_block_reader_;
+  }
 
   void Seek(const Slice& target) override;
   void SeekForPrev(const Slice& target) override;
@@ -599,6 +614,9 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   Status status() const override {
     if (!index_iter_->status().ok()) {
       return index_iter_->status();
+    } else if (delta_block_reader_ != nullptr &&
+               !delta_block_reader_->status().ok()) {
+      return delta_block_reader_->status();
     } else if (block_iter_points_to_real_block_) {
       return block_iter_.status();
     } else {
@@ -642,6 +660,15 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   InitDataBlockResult InitDataBlock();
   void FindKeyForward();
   void FindKeyBackward();
+  Status GetProperty(std::string prop_name, std::string* prop) override;
+
+  std::pair<uint32_t, uint32_t> GetIndexPair(
+      InternalIteratorCommon* iter) const {
+    uint32_t restart_index = 0;
+    uint32_t entry_index = 0;
+    iter->GetIndex(&restart_index, &entry_index);
+    return {restart_index, entry_index};
+  }
 
  protected:
   BlockBasedTable* table_;
@@ -662,6 +689,7 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   bool index_key_is_full_;
   // If this iterator is created for compaction
   bool for_compaction_;
+  DeltaBlockReader* delta_block_reader_;
   BlockHandle prev_index_value_;
 
   static const size_t kInitReadaheadSize = 8 * 1024;
