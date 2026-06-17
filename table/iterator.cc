@@ -125,8 +125,27 @@ LazyBuffer CombinedInternalIterator::value() const {
 
 LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
                                            std::string* meta) const {
+  return value(user_key, meta, nullptr, nullptr);
+}
+
+LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
+                                           std::string* meta,
+                                           uint32_t* value_size) const {
+  return value(user_key, meta, value_size, nullptr);
+}
+
+LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
+                                           std::string* meta,
+                                           uint32_t* value_size,
+                                           BlockHandle* block_handle) const {
   if (meta != nullptr) {
     meta->clear();
+  }
+  if (value_size != nullptr) {
+    *value_size = 0;
+  }
+  if (block_handle != nullptr) {
+    *block_handle = BlockHandle();
   }
   if (separate_helper_ == nullptr) {
     return iter_->value();
@@ -136,20 +155,55 @@ LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
     return LazyBuffer(Status::Corruption("Invalid InternalKey"));
   }
   if (pikey.type != kTypeValueIndex && pikey.type != kTypeMergeIndex) {
+    if (block_handle != nullptr) {
+      std::string encoded_block_handle;
+      Status s = iter_->GetProperty("rocksdb.table.data-block-handle",
+                                    &encoded_block_handle);
+      Slice handle_slice(encoded_block_handle);
+      BlockHandle decoded_handle;
+      if (s.ok() && decoded_handle.DecodeFrom(&handle_slice).ok() &&
+          handle_slice.empty()) {
+        *block_handle = decoded_handle;
+      }
+    }
     return iter_->value();
   }
   LazyBuffer value_index = iter_->value();
   LazyBuffer v =
       separate_helper_->TransToCombined(user_key, pikey.sequence, value_index);
   if (meta != nullptr && value_index.valid()) {
-    auto meta_slice = SeparateHelper::DecodeValueMeta(value_index.slice());
-    if (!meta_slice.empty()) {
-      meta->assign(meta_slice.data(), meta_slice.size());
+    std::string delta_meta;
+    Status s = iter_->GetProperty("rocksdb.delta.value-meta", &delta_meta);
+    if (s.ok()) {
+      *meta = std::move(delta_meta);
     } else {
-      std::string delta_meta;
-      Status s = iter_->GetProperty("rocksdb.delta.value-meta", &delta_meta);
-      if (s.ok()) {
-        *meta = std::move(delta_meta);
+      auto meta_slice = SeparateHelper::DecodeValueMeta(value_index.slice());
+      if (!meta_slice.empty()) {
+        meta->assign(meta_slice.data(), meta_slice.size());
+      }
+    }
+  }
+  if (value_size != nullptr) {
+    std::string delta_value_size;
+    Status s =
+        iter_->GetProperty("rocksdb.delta.value-size", &delta_value_size);
+    Slice size_slice(delta_value_size);
+    uint32_t decoded_value_size = 0;
+    if (s.ok() && GetVarint32(&size_slice, &decoded_value_size)) {
+      *value_size = decoded_value_size;
+    }
+  }
+  if (block_handle != nullptr && value_index.valid()) {
+    std::string delta_value_size;
+    Status s =
+        iter_->GetProperty("rocksdb.delta.value-size", &delta_value_size);
+    if (s.ok()) {
+      Slice handle_slice = SeparateHelper::DecodeValueMeta(value_index.slice());
+      BlockHandle decoded_handle;
+      if (!handle_slice.empty() &&
+          decoded_handle.DecodeFrom(&handle_slice).ok() &&
+          handle_slice.empty()) {
+        *block_handle = decoded_handle;
       }
     }
   }

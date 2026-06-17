@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #include <set>
 
 #include "rocksdb/terark_namespace.h"
@@ -131,6 +133,10 @@ class CombinedInternalIterator : public InternalIterator {
   Slice key() const override { return iter_->key(); }
   LazyBuffer value() const override;
   LazyBuffer value(const Slice& user_key, std::string* meta) const;
+  LazyBuffer value(const Slice& user_key, std::string* meta,
+                   uint32_t* value_size) const;
+  LazyBuffer value(const Slice& user_key, std::string* meta,
+                   uint32_t* value_size, BlockHandle* block_handle) const;
   Status status() const override { return iter_->status(); }
   void Next() override { iter_->Next(); }
   void Prev() override { iter_->Prev(); }

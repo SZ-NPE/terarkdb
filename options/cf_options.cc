@@ -197,6 +197,10 @@ void MutableCFOptions::Dump(Logger* log) const {
                  max_subcompactions);
   ROCKS_LOG_INFO(log, "                                blob_size: %zd",
                  blob_size);
+  ROCKS_LOG_INFO(log, "                         middle_blob_size: %zd",
+                 middle_blob_size);
+  ROCKS_LOG_INFO(log, "                      middle_combine_level: %zd",
+                 middle_combine_level);
   ROCKS_LOG_INFO(log, "                 hotness_window_capacity: %zu",
                  hotness_window_capacity);
   ROCKS_LOG_INFO(log, "                    hotness_hot_capacity: %zu",
@@ -209,6 +213,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  hotness_enable_drop_key_cache);
   ROCKS_LOG_INFO(log, "                     blob_large_key_ratio: %f",
                  blob_large_key_ratio);
+  ROCKS_LOG_INFO(log, "          read_separated_value_by_handle: %d",
+                 read_separated_value_by_handle);
   ROCKS_LOG_INFO(log, "                            blob_gc_ratio: %f",
                  blob_gc_ratio);
   ROCKS_LOG_INFO(log, "                               precise_gc: %d",
@@ -306,6 +312,8 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       disable_auto_compactions(options.disable_auto_compactions),
       max_subcompactions(options.max_subcompactions),
       blob_size(options.blob_size),
+      middle_blob_size(options.middle_blob_size),
+      middle_combine_level(options.middle_combine_level),
       hotness_window_capacity(options.hotness_window_capacity),
       hotness_hot_capacity(options.hotness_hot_capacity),
       hotness_enable_write_window(options.hotness_enable_write_window),
@@ -313,6 +321,7 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
           options.hotness_enable_compaction_feedback),
       hotness_enable_drop_key_cache(options.hotness_enable_drop_key_cache),
       blob_large_key_ratio(options.blob_large_key_ratio),
+      read_separated_value_by_handle(options.read_separated_value_by_handle),
       blob_gc_ratio(options.blob_gc_ratio),
       precise_gc(options.precise_gc),
       target_blob_file_size(options.target_blob_file_size),

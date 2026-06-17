@@ -325,6 +325,10 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   if (result.blob_size > 0 && result.blob_size < 8) {
     result.blob_size = 8;
   }
+  if (result.middle_blob_size != size_t(-1) &&
+      result.middle_blob_size < result.blob_size) {
+    result.middle_blob_size = result.blob_size;
+  }
   if (result.blob_large_key_ratio > 1) {
     result.blob_large_key_ratio = 1;
   }

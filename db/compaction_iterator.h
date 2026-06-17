@@ -75,7 +75,10 @@ class CompactionIterator {
                      bool report_detailed_time, bool expect_valid_internal_key,
                      CompactionRangeDelAggregator* range_del_agg,
                      const Compaction* compaction = nullptr,
-                     BlobConfig blob_config = BlobConfig{size_t(-1), 0.0},
+                     BlobConfig blob_config = BlobConfig{size_t(-1),
+                                                         size_t(-1),
+                                                         size_t(-1), 0.0,
+                                                         false},
                      const CompactionFilter* compaction_filter = nullptr,
                      const std::atomic<bool>* shutting_down = nullptr,
                      const SequenceNumber preserve_deletes_seqnum = 0,
@@ -116,6 +119,10 @@ class CompactionIterator {
   // Getters
   const Slice& key() const { return key_; }
   const LazyBuffer& value() const { return value_; }
+  const SeparateHelper::ValueMetaData& value_meta() const {
+    return output_value_meta_;
+  }
+  uint32_t value_size() const { return output_value_meta_.value_size; }
   const Status& status() const { return status_; }
   const ParsedInternalKey& ikey() const { return ikey_; }
   bool Valid() const { return valid_; }
@@ -182,6 +189,9 @@ class CompactionIterator {
   // current output.
   LazyBuffer value_;
   std::string value_meta_;
+  uint32_t value_size_ = 0;
+  BlockHandle value_block_handle_;
+  SeparateHelper::ValueMetaData output_value_meta_;
   // The status is OK unless compaction iterator encounters a merge operand
   // while not having a merge operator defined.
   Status status_;
@@ -227,6 +237,7 @@ class CompactionIterator {
   bool do_rebuild_blob_;    // rebuild all blobs in need_rebuild_blobs if user
                             // force rebuild need_rebuild_blobs.empty() == true
   bool do_combine_value_;   // fetch and combine bigvalue from blobs
+  bool need_combine_middle_value_;
 
   size_t filter_sample_interval_ = 64;
   size_t filter_hit_count_ = 0;

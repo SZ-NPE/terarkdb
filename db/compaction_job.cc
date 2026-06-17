@@ -1686,11 +1686,23 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     SeparateHelper* separate_helper = nullptr;
     std::unique_ptr<ValueExtractor> value_meta_extractor;
     Status (*trans_to_separate_callback)(void* args, const Slice& key,
-                                         LazyBuffer& value) = nullptr;
+                                         LazyBuffer& value,
+                                         ValueMetaData* meta) = nullptr;
     void* trans_to_separate_callback_args = nullptr;
+    bool update_value_size = false;
+
+    bool ShouldUpdateValueSize() const override { return update_value_size; }
 
     Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                            const Slice& meta, bool is_merge,
+                           bool is_index) override {
+      return SeparateHelper::TransToSeparate(
+          internal_key, value, value.file_number(), meta, is_merge, is_index,
+          value_meta_extractor.get());
+    }
+
+    Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
+                           ValueMetaData* meta, bool is_merge,
                            bool is_index) override {
       return SeparateHelper::TransToSeparate(
           internal_key, value, value.file_number(), meta, is_merge, is_index,
@@ -1702,7 +1714,16 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         return Status::NotSupported();
       }
       return trans_to_separate_callback(trans_to_separate_callback_args, key,
-                                        value);
+                                        value, nullptr);
+    }
+
+    Status TransToSeparate(const Slice& key, LazyBuffer& value,
+                           ValueMetaData* meta) override {
+      if (trans_to_separate_callback == nullptr) {
+        return Status::NotSupported();
+      }
+      return trans_to_separate_callback(trans_to_separate_callback_args, key,
+                                        value, meta);
     }
 
     LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
@@ -1710,6 +1731,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       return separate_helper->TransToCombined(user_key, sequence, value);
     }
   } separate_helper;
+  separate_helper.update_value_size = mutable_cf_options->precise_gc;
   if (compact_->compaction->immutable_cf_options()
           ->value_meta_extractor_factory != nullptr) {
     ValueExtractorContext context = {cfd->GetID()};
@@ -1728,7 +1750,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   // form when it enters the compaction iterator) are NOT recorded here; their
   // byte cost is already reflected in the source blob's existing metadata.
   std::unordered_map<uint64_t, uint64_t> new_blob_bytes_per_fn;
-  auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
+  auto trans_to_separate = [&](const Slice& key, LazyBuffer& value,
+                               SeparateHelper::ValueMetaData* value_meta) {
     Status s;
     TableBuilder* blob_builder = sub_compact->blob_builder.get();
     FileMetaData* blob_meta = &sub_compact->current_blob_output()->meta;
@@ -1752,15 +1775,30 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       }
     }
     if (s.ok()) {
-      s = blob_builder->Add(key, value);
+      if (value_meta == nullptr) {
+        s = blob_builder->Add(key, value);
+      } else {
+        s = blob_builder->Add(key, value, *value_meta);
+      }
     }
     if (s.ok()) {
       blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
       new_blob_bytes_per_fn[blob_meta->fd.GetNumber()] += raw_value_bytes;
-      s = SeparateHelper::TransToSeparate(
-          key, value, blob_meta->fd.GetNumber(), Slice(),
-          GetInternalKeyType(key) == kTypeMerge, false,
-          separate_helper.value_meta_extractor.get());
+      if (value_meta != nullptr &&
+          !mutable_cf_options->read_separated_value_by_handle) {
+        value_meta->block_handle = BlockHandle();
+      }
+      if (value_meta == nullptr) {
+        s = SeparateHelper::TransToSeparate(
+            key, value, blob_meta->fd.GetNumber(), Slice(),
+            GetInternalKeyType(key) == kTypeMerge, false,
+            separate_helper.value_meta_extractor.get());
+      } else {
+        s = SeparateHelper::TransToSeparate(
+            key, value, blob_meta->fd.GetNumber(), value_meta,
+            GetInternalKeyType(key) == kTypeMerge, false,
+            separate_helper.value_meta_extractor.get());
+      }
     }
     return s;
   };
@@ -1925,7 +1963,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     }
     assert(sub_compact->builder != nullptr);
     assert(sub_compact->current_output() != nullptr);
-    status = sub_compact->builder->Add(key, value);
+    status = sub_compact->builder->Add(key, value, c_iter->value_meta());
     if (!status.ok()) {
       break;
     }

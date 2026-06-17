@@ -2463,9 +2463,23 @@ void rocksdb_options_set_blob_size(rocksdb_options_t* opt, uint64_t v) {
   opt->rep.blob_size = v;
 }
 
+void rocksdb_options_set_middle_blob_size(rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.middle_blob_size = v;
+}
+
+void rocksdb_options_set_middle_combine_level(rocksdb_options_t* opt,
+                                              uint64_t v) {
+  opt->rep.middle_combine_level = v;
+}
+
 void rocksdb_options_set_blob_large_key_ratio(rocksdb_options_t* opt,
                                               double v) {
   opt->rep.blob_large_key_ratio = v;
+}
+
+void rocksdb_options_set_read_separated_value_by_handle(rocksdb_options_t* opt,
+                                                        int v) {
+  opt->rep.read_separated_value_by_handle = v;
 }
 
 void rocksdb_options_set_blob_gc_ratio(rocksdb_options_t* opt, double v) {

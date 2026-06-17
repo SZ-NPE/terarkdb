@@ -265,8 +265,17 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    max_subcompactions);
   ROCKS_LOG_HEADER(log, "                              Options.blob_size: %zd",
                    blob_size);
+  ROCKS_LOG_HEADER(log,
+                   "                       Options.middle_blob_size: %zd",
+                   middle_blob_size);
+  ROCKS_LOG_HEADER(log,
+                   "                    Options.middle_combine_level: %zd",
+                   middle_combine_level);
   ROCKS_LOG_HEADER(log, "                   Options.blob_large_key_ratio: %f",
                    blob_large_key_ratio);
+  ROCKS_LOG_HEADER(log,
+                   "        Options.read_separated_value_by_handle: %d",
+                   read_separated_value_by_handle);
   ROCKS_LOG_HEADER(log, "                          Options.blob_gc_ratio: %f",
                    blob_gc_ratio);
   ROCKS_LOG_HEADER(log,

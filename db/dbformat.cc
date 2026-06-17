@@ -203,13 +203,13 @@ Status SeparateHelper::TransToSeparate(
     const Slice& meta, bool is_merge, bool is_index,
     const ValueExtractor* value_meta_extractor) {
   assert(file_number != uint64_t(-1));
-  if (value_meta_extractor == nullptr || is_merge) {
-    value.reset(EncodeFileNumber(file_number), true, file_number);
-    return Status::OK();
-  }
   if (is_index) {
     Slice parts[] = {EncodeFileNumber(file_number), meta};
     value.reset(SliceParts(parts, 2), file_number);
+    return Status::OK();
+  }
+  if (value_meta_extractor == nullptr) {
+    value.reset(EncodeFileNumber(file_number), true, file_number);
     return Status::OK();
   } else {
     auto s = value.fetch();
@@ -217,14 +217,69 @@ Status SeparateHelper::TransToSeparate(
       return s;
     }
     std::string value_meta;
-    s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
-                                      value.slice(), &value_meta);
+    if (is_merge) {
+      s = value_meta_extractor->ExtractMergeOperand(
+          ExtractUserKey(internal_key), value.slice(), &value_meta);
+    } else {
+      s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
+                                        value.slice(), &value_meta);
+    }
     if (s.ok()) {
       Slice parts[] = {EncodeFileNumber(file_number), value_meta};
       value.reset(SliceParts(parts, 2), file_number);
+    } else if (s.IsNotSupported()) {
+      value.reset(EncodeFileNumber(file_number), true, file_number);
+      s = Status::OK();
     }
     return s;
   }
+}
+
+Status SeparateHelper::TransToSeparate(
+    const Slice& internal_key, LazyBuffer& value, uint64_t file_number,
+    ValueMetaData* meta, bool is_merge, bool is_index,
+    const ValueExtractor* value_meta_extractor) {
+  assert(file_number != uint64_t(-1));
+  assert(meta != nullptr);
+  Status s;
+  if (value_meta_extractor != nullptr && !is_index) {
+    s = value.fetch();
+    if (!s.ok()) {
+      return s;
+    }
+    std::string value_meta;
+    if (is_merge) {
+      s = value_meta_extractor->ExtractMergeOperand(
+          ExtractUserKey(internal_key), value.slice(), &value_meta);
+    } else {
+      s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
+                                        value.slice(), &value_meta);
+    }
+    if (s.ok()) {
+      meta->meta_data = std::move(value_meta);
+    } else if (s.IsNotSupported()) {
+      s = Status::OK();
+    } else {
+      return s;
+    }
+  } else if (!is_index) {
+    s = value.fetch();
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  if (value.valid() && meta->value_size == 0) {
+    meta->value_size = static_cast<uint32_t>(internal_key.size() + value.size());
+  }
+  if (!meta->block_handle.IsNull()) {
+    std::string handle_encode;
+    meta->block_handle.EncodeTo(&handle_encode);
+    Slice parts[] = {EncodeFileNumber(file_number), handle_encode};
+    value.reset(SliceParts(parts, 2), file_number);
+  } else {
+    value.reset(EncodeFileNumber(file_number), true, file_number);
+  }
+  return s;
 }
 
 Slice ArenaPinSlice(const Slice& slice, Arena* arena) {

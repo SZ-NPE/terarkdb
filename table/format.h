@@ -39,44 +39,6 @@ extern bool ShouldReportDetailedTime(Env* env, Statistics* stats);
 // the length of the magic number in bytes.
 const int kMagicNumberLengthByte = 8;
 
-// BlockHandle is a pointer to the extent of a file that stores a data
-// block or a meta block.
-class BlockHandle {
- public:
-  BlockHandle();
-  BlockHandle(uint64_t offset, uint64_t size);
-
-  // The offset of the block in the file.
-  uint64_t offset() const { return offset_; }
-  void set_offset(uint64_t _offset) { offset_ = _offset; }
-
-  // The size of the stored block
-  uint64_t size() const { return size_; }
-  void set_size(uint64_t _size) { size_ = _size; }
-
-  void EncodeTo(std::string* dst) const;
-  Status DecodeFrom(Slice* input);
-  Status DecodeSizeFrom(uint64_t offset, Slice* input);
-
-  // Return a string that contains the copy of handle.
-  std::string ToString(bool hex = true) const;
-
-  // if the block handle's offset and size are both "0", we will view it
-  // as a null block handle that points to no where.
-  bool IsNull() const { return offset_ == 0 && size_ == 0; }
-
-  static const BlockHandle& NullBlockHandle() { return kNullBlockHandle; }
-
-  // Maximum encoding length of a BlockHandle
-  enum { kMaxEncodedLength = 10 + 10 };
-
- private:
-  uint64_t offset_;
-  uint64_t size_;
-
-  static const BlockHandle kNullBlockHandle;
-};
-
 inline uint32_t GetCompressFormatForVersion(CompressionType compression_type,
                                             uint32_t version) {
 #ifdef NDEBUG
@@ -292,14 +254,5 @@ extern Status UncompressBlockContentsForCompressionType(
     const ImmutableCFOptions& ioptions, MemoryAllocator* allocator = nullptr);
 
 // Implementation details follow.  Clients should ignore,
-
-// TODO(andrewkr): we should prefer one way of representing a null/uninitialized
-// BlockHandle. Currently we use zeros for null and use negation-of-zeros for
-// uninitialized.
-inline BlockHandle::BlockHandle()
-    : BlockHandle(~static_cast<uint64_t>(0), ~static_cast<uint64_t>(0)) {}
-
-inline BlockHandle::BlockHandle(uint64_t _offset, uint64_t _size)
-    : offset_(_offset), size_(_size) {}
 
 }  // namespace TERARKDB_NAMESPACE

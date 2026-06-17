@@ -921,8 +921,14 @@ extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_pin_table_properties_in_reader(rocksdb_options_t*, int);
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_blob_size(
     rocksdb_options_t*, uint64_t);
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_middle_blob_size(
+    rocksdb_options_t*, uint64_t);
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_middle_combine_level(
+    rocksdb_options_t*, uint64_t);
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_blob_large_key_ratio(
     rocksdb_options_t*, double);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_read_separated_value_by_handle(rocksdb_options_t*, int);
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_blob_gc_ratio(
     rocksdb_options_t*, double);
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_target_blob_file_size(

@@ -959,22 +959,20 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     rep->table_properties_base = *rep->table_properties;
   }
 
-  if (rep->table_options.use_delta_block) {
-    bool found_delta_block;
-    BlockHandle delta_block_handle;
-    s = SeekToDeltaBlock(meta_iter.get(), &found_delta_block,
-                         &delta_block_handle);
+  bool found_delta_block;
+  BlockHandle delta_block_handle;
+  s = SeekToDeltaBlock(meta_iter.get(), &found_delta_block,
+                       &delta_block_handle);
+  if (!s.ok()) {
+    ROCKS_LOG_WARN(rep->ioptions.info_log,
+                   "Error when seeking to delta block from file: %s",
+                   s.ToString().c_str());
+  } else if (found_delta_block && !delta_block_handle.IsNull()) {
+    s = ReadDeltaBlock(rep, prefetch_buffer.get(), delta_block_handle);
     if (!s.ok()) {
       ROCKS_LOG_WARN(rep->ioptions.info_log,
-                     "Error when seeking to delta block from file: %s",
+                     "Encountered error while reading delta block %s",
                      s.ToString().c_str());
-    } else if (found_delta_block && !delta_block_handle.IsNull()) {
-      s = ReadDeltaBlock(rep, prefetch_buffer.get(), delta_block_handle);
-      if (!s.ok()) {
-        ROCKS_LOG_WARN(rep->ioptions.info_log,
-                       "Encountered error while reading delta block %s",
-                       s.ToString().c_str());
-      }
     }
   }
 
@@ -2455,6 +2453,13 @@ Status BlockBasedTableIteratorBase<TBlockIter, TValue>::GetProperty(
     std::string prop_name, std::string* prop) {
   if (prop == nullptr) {
     return Status::InvalidArgument("prop is nullptr");
+  }
+  if (prop_name == "rocksdb.table.data-block-handle") {
+    if (!index_iter_->Valid()) {
+      return Status::NotFound("data block handle is unavailable");
+    }
+    index_iter_->value().EncodeTo(prop);
+    return Status::OK();
   }
   if (delta_block_reader_ == nullptr || !delta_block_reader_->status().ok()) {
     return Status::NotFound("delta block is unavailable");

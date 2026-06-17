@@ -269,6 +269,7 @@ struct BlockBasedTableBuilder::Rep {
 
   bool closed = false;  // Either Finish() or Abandon() has been called.
   const bool use_delta_encoding_for_index_values;
+  const bool store_block_handle_in_sst;
   std::unique_ptr<FilterBlockBuilder> filter_builder;
   char compressed_cache_key_prefix[BlockBasedTable::kMaxCacheKeyPrefixSize];
   size_t compressed_cache_key_prefix_size;
@@ -312,6 +313,9 @@ struct BlockBasedTableBuilder::Rep {
                         builder_opt.compression_opts),
         use_delta_encoding_for_index_values(table_opt.format_version >= 4 &&
                                             !table_opt.block_align),
+        store_block_handle_in_sst(
+            builder_opt.moptions.read_separated_value_by_handle &&
+            builder_opt.skip_filters),
         compressed_cache_key_prefix_size(0),
         flush_block_policy(
             table_options.flush_block_policy_factory->NewFlushBlockPolicy(
@@ -439,6 +443,10 @@ Status BlockBasedTableBuilder::Add(
 
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
+  if (r->store_block_handle_in_sst) {
+    Flush();
+    value_meta.block_handle = r->pending_handle;
+  }
   const ValueType value_type = ExtractValueType(key);
   const bool is_separated =
       value_type == kTypeValueIndex || value_type == kTypeMergeIndex;

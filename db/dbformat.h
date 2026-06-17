@@ -20,6 +20,7 @@
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
+#include "rocksdb/status.h"
 #include "rocksdb/table.h"
 #include "rocksdb/terark_namespace.h"
 #include "rocksdb/types.h"
@@ -28,6 +29,44 @@
 #include "util/logging.h"
 
 namespace TERARKDB_NAMESPACE {
+
+// BlockHandle is a pointer to the extent of a file that stores a data
+// block or a meta block.
+class BlockHandle {
+ public:
+  BlockHandle();
+  BlockHandle(uint64_t offset, uint64_t size);
+
+  // The offset of the block in the file.
+  uint64_t offset() const { return offset_; }
+  void set_offset(uint64_t _offset) { offset_ = _offset; }
+
+  // The size of the stored block
+  uint64_t size() const { return size_; }
+  void set_size(uint64_t _size) { size_ = _size; }
+
+  void EncodeTo(std::string* dst) const;
+  Status DecodeFrom(Slice* input);
+  Status DecodeSizeFrom(uint64_t offset, Slice* input);
+
+  // Return a string that contains the copy of handle.
+  std::string ToString(bool hex = true) const;
+
+  // if the block handle's offset and size are both "0", we will view it
+  // as a null block handle that points to no where.
+  bool IsNull() const { return offset_ == 0 && size_ == 0; }
+
+  static const BlockHandle& NullBlockHandle() { return kNullBlockHandle; }
+
+  // Maximum encoding length of a BlockHandle
+  enum { kMaxEncodedLength = 10 + 10 };
+
+ private:
+  uint64_t offset_;
+  uint64_t size_;
+
+  static const BlockHandle kNullBlockHandle;
+};
 
 class InternalKey;
 
@@ -70,6 +109,15 @@ enum ValueType : unsigned char {
 // Defined in dbformat.cc
 extern const ValueType kValueTypeForSeek;
 extern const ValueType kValueTypeForSeekForPrev;
+
+// TODO(andrewkr): we should prefer one way of representing a null/uninitialized
+// BlockHandle. Currently we use zeros for null and use negation-of-zeros for
+// uninitialized.
+inline BlockHandle::BlockHandle()
+    : BlockHandle(~static_cast<uint64_t>(0), ~static_cast<uint64_t>(0)) {}
+
+inline BlockHandle::BlockHandle(uint64_t _offset, uint64_t _size)
+    : offset_(_offset), size_(_size) {}
 
 // Checks whether a type is an inline value type
 // (i.e. a type used in memtable skiplist and sst file datablock).
@@ -790,15 +838,21 @@ class SeparateHelper {
 
   struct ValueMetaData {
     uint32_t value_size;
+    mutable BlockHandle block_handle;
     std::string meta_data;
 
     ValueMetaData() { Reset(); }
 
     void Reset() {
       value_size = 0;
+      block_handle = BlockHandle();
       meta_data.clear();
     }
   };
+
+  static bool do_middle_separate(size_t value_size, size_t middle_blob_size) {
+    return value_size < middle_blob_size;
+  }
 
   static Slice EncodeFileNumber(uint64_t& file_number) {
     if (!port::kLittleEndian) {
@@ -825,9 +879,21 @@ class SeparateHelper {
                                 uint64_t file_number, const Slice& meta,
                                 bool is_merge, bool is_index,
                                 const ValueExtractor* value_meta_extractor);
+  static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
+                                uint64_t file_number, ValueMetaData* meta,
+                                bool is_merge, bool is_index,
+                                const ValueExtractor* value_meta_extractor);
 
   virtual Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                  const Slice& meta, bool is_merge,
+                                 bool is_index) {
+    assert(value.file_number() != uint64_t(-1));
+    return TransToSeparate(internal_key, value, value.file_number(), meta,
+                           is_merge, is_index, nullptr);
+  }
+
+  virtual Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
+                                 ValueMetaData* meta, bool is_merge,
                                  bool is_index) {
     assert(value.file_number() != uint64_t(-1));
     return TransToSeparate(internal_key, value, value.file_number(), meta,
@@ -838,6 +904,13 @@ class SeparateHelper {
                                  LazyBuffer& /*value*/) {
     return Status::NotSupported();
   }
+
+  virtual Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
+                                 ValueMetaData* /*meta*/) {
+    return TransToSeparate(internal_key, value);
+  }
+
+  virtual bool ShouldUpdateValueSize() const { return false; }
 
   virtual LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
                                      const LazyBuffer& value) const = 0;

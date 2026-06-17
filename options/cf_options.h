@@ -141,7 +141,10 @@ struct ImmutableCFOptions {
 
 struct BlobConfig {
   size_t blob_size;
+  size_t middle_blob_size;
+  size_t middle_combine_level;
   double large_key_ratio;
+  bool read_separated_value_by_handle;
 };
 
 struct MutableCFOptions {
@@ -159,12 +162,15 @@ struct MutableCFOptions {
         disable_auto_compactions(false),
         max_subcompactions(0),
         blob_size(0),
+        middle_blob_size(size_t(-1)),
+        middle_combine_level(size_t(-1)),
         hotness_window_capacity(0),
         hotness_hot_capacity(0),
         hotness_enable_write_window(false),
         hotness_enable_compaction_feedback(false),
         hotness_enable_drop_key_cache(false),
         blob_large_key_ratio(0),
+        read_separated_value_by_handle(true),
         blob_gc_ratio(0),
         precise_gc(false),
         target_blob_file_size(0),
@@ -193,7 +199,8 @@ struct MutableCFOptions {
   explicit MutableCFOptions(const Options& options);
 
   BlobConfig get_blob_config() const {
-    return BlobConfig{blob_size, blob_large_key_ratio};
+    return BlobConfig{blob_size, middle_blob_size, middle_combine_level,
+                      blob_large_key_ratio, read_separated_value_by_handle};
   }
 
   // Must be called after any change to MutableCFOptions
@@ -226,12 +233,15 @@ struct MutableCFOptions {
   bool disable_auto_compactions;
   uint32_t max_subcompactions;
   size_t blob_size;
+  size_t middle_blob_size;
+  size_t middle_combine_level;
   size_t hotness_window_capacity;
   size_t hotness_hot_capacity;
   bool hotness_enable_write_window;
   bool hotness_enable_compaction_feedback;
   bool hotness_enable_drop_key_cache;
   double blob_large_key_ratio;
+  bool read_separated_value_by_handle;
   double blob_gc_ratio;
   bool precise_gc;
   uint64_t target_blob_file_size;

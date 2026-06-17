@@ -307,6 +307,16 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // valid [8 , size_t(-1)]
   size_t blob_size = 512;
 
+  // Values in [blob_size, middle_blob_size) are treated as middle separated
+  // values. They may be combined back into normal SST files once compaction
+  // reaches middle_combine_level. Set middle_blob_size <= blob_size to disable
+  // the middle-value Delta Separate policy.
+  size_t middle_blob_size = size_t(-1);
+
+  // Combine middle separated values when the compaction input level reaches
+  // this level.
+  size_t middle_combine_level = size_t(-1);
+
   // Enable Hotness Tracker for Hot-Cold Separation
   bool enable_hotness_tracker = false;
 
@@ -330,6 +340,11 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Don't separate Value if key.size > value.size * blob_large_key_ratio
   // valid [0 , 1]
   double blob_large_key_ratio = 0.25;
+
+  // Encode the source data-block handle into separated value indexes when it
+  // is available. Readers that do not understand the handle still decode the
+  // leading file number and fall back to the normal blob lookup path.
+  bool read_separated_value_by_handle = true;
 
   // Key Value separation gc ratio
   // Startup GC when garbage ratio larger than blob_gc_ratio

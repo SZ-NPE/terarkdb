@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "rocksdb/status.h"
 #include "rocksdb/terark_namespace.h"
 #include "utilities/util/factory.h"
 
@@ -23,6 +24,13 @@ class ValueExtractor {
   // called when a value will trans to separate.
   virtual Status Extract(const Slice& key, const Slice& value,
                          std::string* output) const = 0;
+
+  // Extract custom info from a merge operand when it will be converted to a
+  // separate value. NotSupported means no meta is extracted for this operand.
+  virtual Status ExtractMergeOperand(const Slice& /*key*/, const Slice& /*op*/,
+                                     std::string* /*output*/) const {
+    return Status::NotSupported();
+  }
 };
 
 class ValueExtractorFactory

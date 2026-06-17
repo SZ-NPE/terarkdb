@@ -232,7 +232,8 @@ AJSON(CompactionFilterContext, is_full_compaction, is_manual_compaction,
 using NameParam = CompactionWorkerContext::NameParam;
 AJSON(NameParam, name, param);
 
-AJSON(BlobConfig, blob_size, large_key_ratio);
+AJSON(BlobConfig, blob_size, middle_blob_size, middle_combine_level,
+      large_key_ratio, read_separated_value_by_handle);
 
 AJSON(CompactionWorkerContext, user_comparator, merge_operator,
       merge_operator_data, value_meta_extractor_factory,
@@ -273,6 +274,14 @@ class WorkerSeparateHelper : public SeparateHelper, public LazyBufferState {
   using SeparateHelper::TransToSeparate;
   Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                          const Slice& meta, bool is_merge,
+                         bool is_index) override {
+    return SeparateHelper::TransToSeparate(
+        internal_key, value, value.file_number(), meta, is_merge, is_index,
+        value_meta_extractor_.get());
+  }
+
+  Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
+                         ValueMetaData* meta, bool is_merge,
                          bool is_index) override {
     return SeparateHelper::TransToSeparate(
         internal_key, value, value.file_number(), meta, is_merge, is_index,

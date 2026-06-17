@@ -179,11 +179,20 @@ Status BuildTable(
       BlobOutput blobs[3];  // warm, ephemeral, stable
       std::unique_ptr<ValueExtractor> value_meta_extractor;
       Status (*trans_to_separate_callback)(void* args, const Slice& key,
-                                           LazyBuffer& value) = nullptr;
+                                           LazyBuffer& value,
+                                           ValueMetaData* meta) = nullptr;
       void* trans_to_separate_callback_args = nullptr;
 
       Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                              const Slice& meta, bool is_merge,
+                             bool is_index) override {
+        return SeparateHelper::TransToSeparate(
+            internal_key, value, value.file_number(), meta, is_merge, is_index,
+            value_meta_extractor.get());
+      }
+
+      Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
+                             ValueMetaData* meta, bool is_merge,
                              bool is_index) override {
         return SeparateHelper::TransToSeparate(
             internal_key, value, value.file_number(), meta, is_merge, is_index,
@@ -196,7 +205,16 @@ Status BuildTable(
           return Status::NotSupported();
         }
         return trans_to_separate_callback(trans_to_separate_callback_args,
-                                          internal_key, value);
+                                          internal_key, value, nullptr);
+      }
+
+      Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
+                             ValueMetaData* meta) override {
+        if (trans_to_separate_callback == nullptr) {
+          return Status::NotSupported();
+        }
+        return trans_to_separate_callback(trans_to_separate_callback_args,
+                                          internal_key, value, meta);
       }
 
       LazyBuffer TransToCombined(const Slice& /*user_key*/,
@@ -284,7 +302,8 @@ Status BuildTable(
       hotness_tracker = cfd->hotness_tracker();
     }
 
-    auto trans_to_separate = [&](const Slice& key, LazyBuffer& value) {
+    auto trans_to_separate = [&](const Slice& key, LazyBuffer& value,
+                                 SeparateHelper::ValueMetaData* value_meta) {
       assert(value.file_number() == uint64_t(-1));
       Status status;
 
@@ -350,7 +369,11 @@ Status BuildTable(
         blob_builder = bstate.builder.get();
       }
       if (status.ok()) {
-        status = blob_builder->Add(key, value);
+        if (value_meta == nullptr) {
+          status = blob_builder->Add(key, value);
+        } else {
+          status = blob_builder->Add(key, value, *value_meta);
+        }
       }
       if (status.ok()) {
           const uint64_t route_record_bytes = key.size() + value.size();
@@ -366,10 +389,21 @@ Status BuildTable(
                        route_record_bytes);
           }
         blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
-        status = SeparateHelper::TransToSeparate(
-            key, value, blob_meta->fd.GetNumber(), Slice(),
-            GetInternalKeyType(key) == kTypeMerge, false,
+        if (value_meta != nullptr &&
+            !mutable_cf_options.read_separated_value_by_handle) {
+          value_meta->block_handle = BlockHandle();
+        }
+        if (value_meta == nullptr) {
+          status = SeparateHelper::TransToSeparate(
+              key, value, blob_meta->fd.GetNumber(), Slice(),
+              GetInternalKeyType(key) == kTypeMerge, false,
               separate_helper.value_meta_extractor.get());
+        } else {
+          status = SeparateHelper::TransToSeparate(
+              key, value, blob_meta->fd.GetNumber(), value_meta,
+              GetInternalKeyType(key) == kTypeMerge, false,
+              separate_helper.value_meta_extractor.get());
+        }
       }
       return status;
     };
@@ -444,7 +478,7 @@ Status BuildTable(
     }
     c_iter.SeekToFirst();
     for (; s.ok() && c_iter.Valid(); c_iter.Next()) {
-      s = builder->Add(c_iter.key(), c_iter.value());
+      s = builder->Add(c_iter.key(), c_iter.value(), c_iter.value_meta());
       sst_meta()->UpdateBoundaries(c_iter.key(), c_iter.ikey().sequence);
 
       // TODO(noetzli): Update stats after flush, too.
