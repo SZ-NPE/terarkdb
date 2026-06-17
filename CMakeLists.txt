@@ -547,6 +547,8 @@ endif()
 
 include_directories(${PROJECT_SOURCE_DIR})
 include_directories(${PROJECT_SOURCE_DIR}/include)
+include_directories(${PROJECT_SOURCE_DIR}/third-party/terark-zip/src)
+include_directories(${PROJECT_SOURCE_DIR}/third-party/terark-zip/3rdparty/boost-include)
 find_package(Threads REQUIRED)
 
 
