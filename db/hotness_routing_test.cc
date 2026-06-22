@@ -236,6 +236,38 @@ TEST_F(HotnessTrackerTest, WriteWindowDisabledDoesNotPromoteRepeatedWrites) {
             HotnessTracker::FlushRoute::kWarm);
 }
 
+TEST_F(HotnessTrackerTest, ZeroWindowCapacityDisablesWriteWindow) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.window_capacity = 0;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("zero_window_key");
+  tracker.RecordWrite(key);
+  tracker.RecordWrite(key);
+
+  ASSERT_FALSE(tracker.TEST_RecentWindowContains(key));
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kWarm);
+}
+
+TEST_F(HotnessTrackerTest, ZeroHotCapacityDisablesHotAndDropKeyCaches) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.hot_capacity = 0;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("zero_hot_key");
+  tracker.RecordCompactionFeedback(key, 123 /* seq */);
+  tracker.RecordWrite(key);
+  tracker.RecordWrite(key);
+
+  ASSERT_FALSE(tracker.DropKeyCacheEnabled());
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
+  ASSERT_FALSE(tracker.IsDropped(key, 123 /* seq */));
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kWarm);
+}
+
 TEST_F(HotnessTrackerTest, CompactionFeedbackDisabledDoesNotPromote) {
   HotnessTracker::Options options = MakeTestOptions();
   options.enable_compaction_feedback = false;
@@ -279,7 +311,7 @@ TEST_F(HotnessTrackerTest, ConcurrentSafetyBasicCheck) {
           tracker.RecordWrite(key);
           tracker.RecordWrite(key);
         } else {
-            tracker.ClassifyForFlush(key);
+          tracker.ClassifyForFlush(key);
         }
       }
     });

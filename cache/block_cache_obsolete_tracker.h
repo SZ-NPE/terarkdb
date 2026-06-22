@@ -28,6 +28,11 @@ class BlockCacheObsoleteTracker {
                          Logger* info_log);
   void LogSample(const char* reason, uint64_t job_id, Logger* info_log);
 
+  size_t TEST_FileCount() const;
+  uint64_t TEST_TrackedBlocks() const;
+  uint64_t TEST_TrackedBytes() const;
+  uint64_t TEST_ObsoleteBytes() const;
+
  private:
   struct Entry {
     uint64_t file_number = 0;

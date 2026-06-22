@@ -541,6 +541,10 @@ class TableFactory
 
   // Return if table builder need second pass iter
   virtual bool IsBuilderNeedSecondPass() const { return false; }
+
+  // Return whether this table format persists per-entry separated value sizes
+  // needed by precise Blob GC.
+  virtual bool IsExactGarbageCollectionSupported() const { return false; }
 };
 
 #ifndef ROCKSDB_LITE

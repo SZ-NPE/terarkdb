@@ -92,7 +92,12 @@ void BlockCacheObsoleteTracker::RecordErase(const void* handle) {
     assert(obsolete_bytes_ >= charge);
     --obsolete_blocks_;
     obsolete_bytes_ -= charge;
-    MaybeEmitDrainLocked(file_number, &file, env_->NowMicros());
+  }
+  if (file.blocks == 0) {
+    if (file.obsolete) {
+      MaybeEmitDrainLocked(file_number, &file, env_->NowMicros());
+    }
+    files_.erase(file_it);
   }
 }
 
@@ -115,7 +120,11 @@ void BlockCacheObsoleteTracker::MarkFilesObsolete(
     }
     const uint64_t now_us = env_->NowMicros();
     for (uint64_t file_number : file_numbers) {
-      FileResidency& file = files_[file_number];
+      auto file_it = files_.find(file_number);
+      if (file_it == files_.end()) {
+        continue;
+      }
+      FileResidency& file = file_it->second;
       if (file.obsolete) {
         continue;
       }
@@ -198,7 +207,7 @@ BlockCacheObsoleteTracker::BuildSampleLocked() {
   sample.mean_obsolete_byte_ratio = ratio_sample_sum_ / ratio_sample_count_;
   sample.peak_obsolete_byte_ratio = peak_obsolete_byte_ratio_;
   for (const auto& kv : files_) {
-    if (kv.second.obsolete) {
+    if (kv.second.obsolete && kv.second.blocks > 0) {
       ++sample.obsolete_file_count;
     }
   }
@@ -258,25 +267,34 @@ std::string BlockCacheObsoleteTracker::FilesToString(
 
 std::string BlockCacheObsoleteTracker::BuildTopObsoleteFilesLocked() const {
   std::vector<std::pair<uint64_t, FileResidency>> obsolete_files;
-  obsolete_files.reserve(files_.size());
   for (const auto& kv : files_) {
     if (kv.second.obsolete && kv.second.bytes > 0) {
       obsolete_files.emplace_back(kv.first, kv.second);
     }
   }
-  std::sort(obsolete_files.begin(), obsolete_files.end(),
-            [](const std::pair<uint64_t, FileResidency>& a,
-               const std::pair<uint64_t, FileResidency>& b) {
-              if (a.second.bytes != b.second.bytes) {
-                return a.second.bytes > b.second.bytes;
-              }
-              return a.first < b.first;
-            });
+
+  const size_t limit = std::min<size_t>(options_.topk_files,
+                                        obsolete_files.size());
+  if (limit == 0) {
+    return "[]";
+  }
+
+  auto more_resident = [](const std::pair<uint64_t, FileResidency>& a,
+                          const std::pair<uint64_t, FileResidency>& b) {
+    if (a.second.bytes != b.second.bytes) {
+      return a.second.bytes > b.second.bytes;
+    }
+    return a.first < b.first;
+  };
+  if (obsolete_files.size() > limit) {
+    std::nth_element(obsolete_files.begin(), obsolete_files.begin() + limit,
+                     obsolete_files.end(), more_resident);
+    obsolete_files.resize(limit);
+  }
+  std::sort(obsolete_files.begin(), obsolete_files.end(), more_resident);
 
   std::ostringstream oss;
   oss << "[";
-  const size_t limit = std::min<size_t>(options_.topk_files,
-                                        obsolete_files.size());
   for (size_t i = 0; i < limit; ++i) {
     if (i != 0) {
       oss << ",";
@@ -286,6 +304,26 @@ std::string BlockCacheObsoleteTracker::BuildTopObsoleteFilesLocked() const {
   }
   oss << "]";
   return oss.str();
+}
+
+size_t BlockCacheObsoleteTracker::TEST_FileCount() const {
+  MutexLock l(&mutex_);
+  return files_.size();
+}
+
+uint64_t BlockCacheObsoleteTracker::TEST_TrackedBlocks() const {
+  MutexLock l(&mutex_);
+  return tracked_blocks_;
+}
+
+uint64_t BlockCacheObsoleteTracker::TEST_TrackedBytes() const {
+  MutexLock l(&mutex_);
+  return tracked_bytes_;
+}
+
+uint64_t BlockCacheObsoleteTracker::TEST_ObsoleteBytes() const {
+  MutexLock l(&mutex_);
+  return obsolete_bytes_;
 }
 
 }  // namespace TERARKDB_NAMESPACE

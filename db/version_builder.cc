@@ -301,7 +301,7 @@ class VersionBuilder::Rep {
     }
     uint64_t num_entries = std::max<uint64_t>(1, item->f->prop.num_entries);
     return static_cast<double>(dep.entry_count) *
-           static_cast<double>(item->f->fd.GetFileSize()) /
+           static_cast<double>(item->f->BlobGcAccountingBytes()) /
            static_cast<double>(num_entries);
   }
 
@@ -334,8 +334,8 @@ class VersionBuilder::Rep {
         if (!item->f->prop.dependence.empty()) {
           uint64_t num_entries =
               std::max<uint64_t>(1, item->f->prop.num_entries);
-          uint64_t file_size =
-              std::max<uint64_t>(1, item->f->fd.GetFileSize());
+          uint64_t file_size = std::max<uint64_t>(
+              1, item->f->BlobGcAccountingBytes());
           double child_entry_ratio =
               entry_ratio * dependence.entry_count / num_entries;
           double dep_bytes = ResolveDepBytes(dependence, item);
@@ -406,10 +406,11 @@ class VersionBuilder::Rep {
           uint64_t num_antiquation = item.f->prop.num_entries - entry_depended;
           uint64_t bytes_depended =
               std::max<uint64_t>(1, item.bytes_depended);
-          bytes_depended =
-              std::min(item.f->fd.GetFileSize(), bytes_depended);
+          const uint64_t blob_gc_accounting_bytes =
+              item.f->BlobGcAccountingBytes();
+          bytes_depended = std::min(blob_gc_accounting_bytes, bytes_depended);
           uint64_t num_antiquation_bytes =
-              item.f->fd.GetFileSize() - bytes_depended;
+              blob_gc_accounting_bytes - bytes_depended;
           switch (item.f->gc_status) {
             case FileMetaData::kGarbageCollectionForbidden:
               if (item.gc_forbidden_version == dependence_version) {

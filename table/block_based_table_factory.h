@@ -77,6 +77,10 @@ class BlockBasedTableFactory : public TableFactory {
 
   bool IsDeleteRangeSupported() const override { return true; }
 
+  bool IsExactGarbageCollectionSupported() const override {
+    return table_options_.use_delta_block;
+  }
+
   static const std::string kName;
 
  private:

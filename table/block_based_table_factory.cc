@@ -260,6 +260,14 @@ Status BlockBasedTableFactory::SanitizeOptions(
         "data_block_hash_table_util_ratio should be greater than 0 when "
         "data_block_index_type is set to kDataBlockBinaryAndHash");
   }
+  if (table_options_.index_type != BlockBasedTableOptions::kBinarySearch &&
+      table_options_.index_type != BlockBasedTableOptions::kHashSearch &&
+      table_options_.use_delta_block) {
+    return Status::InvalidArgument(
+        "Do not support delta block and precise_gc in this index type. Please "
+        "disable both use_delta_block in table_options and precise_gc in "
+        "cf_options.");
+  }
   if (cf_opts.precise_gc && !table_options_.use_delta_block) {
     return Status::InvalidArgument(
         "precise_gc requires BlockBasedTableOptions::use_delta_block");

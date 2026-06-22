@@ -79,6 +79,17 @@ class VersionBuilderTest : public testing::Test {
     vstorage_.UpdateAccumulatedStats(f);
   }
 
+  void AddBlobFile(int level, uint32_t file_number, const char* smallest,
+                   const char* largest, uint64_t file_size,
+                   uint64_t raw_value_size, uint64_t num_entries) {
+    TablePropertyCache prop;
+    prop.raw_value_size = raw_value_size;
+    Add(level, file_number, smallest, largest, file_size, 0 /* path_id */,
+        100 /* smallest_seq */, 100 /* largest_seq */, num_entries,
+        0 /* num_deletions */, 100 /* smallest_seqno */,
+        100 /* largest_seqno */, prop);
+  }
+
   void UpdateVersionStorageInfo() {
     vstorage_.UpdateFilesByCompactionPri(ioptions_.compaction_pri);
     vstorage_.UpdateNumNonEmptyLevels();
@@ -582,6 +593,39 @@ TEST_F(VersionBuilderTest, PreciseGcByteCountFallbackWhenZero) {
   FileMetaData* b = it->second;
   ASSERT_EQ(30U, b->num_antiquation);
   ASSERT_EQ(3000U, b->num_antiquation_bytes);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, PreciseGcUsesRawValueBytesAsDenominator) {
+  // Blob B has 10000 physical SST bytes but only 8000 user value bytes. Since
+  // dependence.byte_count is value payload bytes, precise GC should use the
+  // same value-byte domain for both numerator and denominator:
+  //   live value bytes = 6000
+  //   obsolete value bytes = 8000 - 6000 = 2000
+  AddBlobFile(-1, 102U, "100", "199", 10000U /* file_size */,
+              8000U /* raw_value_size */, 100U /* num_entries */);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  version_edit.AddFile(
+      2, 202U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200,
+      200, false, GetPropCacheWithBytes(
+                      0, {std::make_tuple(102U, 70U, 6000U)}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto& dep_map = new_vstorage.dependence_map();
+  auto it = dep_map.find(102U);
+  ASSERT_TRUE(it != dep_map.end());
+  FileMetaData* b = it->second;
+  ASSERT_EQ(30U, b->num_antiquation);
+  ASSERT_EQ(2000U, b->num_antiquation_bytes);
 
   UnrefFilesInVersion(&new_vstorage);
 }

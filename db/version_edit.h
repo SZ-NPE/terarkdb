@@ -173,6 +173,14 @@ struct FileMetaData {
     return old_refs == 1;
   }
 
+  // Bytes used as the denominator for precise Blob GC. Prefer value payload
+  // bytes when table properties provide them because dependence.byte_count is
+  // recorded from separated value sizes, not from the physical SST file size.
+  // Fall back to file size for legacy metadata that does not carry raw values.
+  uint64_t BlobGcAccountingBytes() const {
+    return prop.raw_value_size > 0 ? prop.raw_value_size : fd.GetFileSize();
+  }
+
   std::vector<SequenceNumber> ShrinkSnapshot(
       const std::vector<SequenceNumber>& snapshots) const;
 

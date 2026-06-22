@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "cache/block_cache_obsolete_tracker.h"
 #include "cache/clock_cache.h"
 #include "cache/garbage_aware_cache.h"
 #include "cache/lru_cache.h"
@@ -778,6 +779,46 @@ TEST(GarbageAwareCacheTest, HonorsShardBits) {
   auto* sharded = dynamic_cast<ShardedCache*>(cache.get());
   ASSERT_NE(nullptr, sharded);
   ASSERT_EQ(2, sharded->GetNumShardBits());
+}
+
+TEST(BlockCacheObsoleteTrackerTest, MarkNonResidentFileDoesNotCreateState) {
+  BlockCacheObsoleteTrackingOptions options;
+  options.enabled = true;
+  options.sample_interval_sec = 0;
+  BlockCacheObsoleteTracker tracker(options);
+
+  tracker.MarkFilesObsolete({100}, {} /* output_file_numbers */, "test",
+                            1 /* job_id */, nullptr /* info_log */);
+
+  ASSERT_EQ(0U, tracker.TEST_FileCount());
+  ASSERT_EQ(0U, tracker.TEST_TrackedBlocks());
+  ASSERT_EQ(0U, tracker.TEST_TrackedBytes());
+  ASSERT_EQ(0U, tracker.TEST_ObsoleteBytes());
+}
+
+TEST(BlockCacheObsoleteTrackerTest, EraseLastBlockDropsFileResidency) {
+  BlockCacheObsoleteTrackingOptions options;
+  options.enabled = true;
+  options.sample_interval_sec = 0;
+  BlockCacheObsoleteTracker tracker(options);
+
+  BlockCacheMetadata metadata;
+  metadata.is_data_block = true;
+  metadata.file_number = 101;
+  int handle;
+
+  tracker.RecordInsert(&handle, &metadata, 4096);
+  tracker.MarkFilesObsolete({101}, {} /* output_file_numbers */, "test",
+                            2 /* job_id */, nullptr /* info_log */);
+  ASSERT_EQ(1U, tracker.TEST_FileCount());
+  ASSERT_EQ(4096U, tracker.TEST_ObsoleteBytes());
+
+  tracker.RecordErase(&handle);
+
+  ASSERT_EQ(0U, tracker.TEST_FileCount());
+  ASSERT_EQ(0U, tracker.TEST_TrackedBlocks());
+  ASSERT_EQ(0U, tracker.TEST_TrackedBytes());
+  ASSERT_EQ(0U, tracker.TEST_ObsoleteBytes());
 }
 
 #ifdef SUPPORT_CLOCK_CACHE

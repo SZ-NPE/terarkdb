@@ -90,14 +90,19 @@ class HotnessTracker {
   };
 
   explicit HotnessTracker(const Options& options, int num_shard_bits = 6)
-      : enable_write_window_(options.enable_write_window),
-        enable_compaction_feedback_(options.enable_compaction_feedback),
-        enable_drop_key_cache_(options.enable_drop_key_cache) {
+      : enable_write_window_(options.enable_write_window &&
+                             options.window_capacity > 0),
+        enable_compaction_feedback_(options.enable_compaction_feedback &&
+                                    options.hot_capacity > 0),
+        enable_drop_key_cache_(options.enable_drop_key_cache &&
+                               options.hot_capacity > 0) {
     if (enable_write_window_) {
       window_cache_ =
           NewFIFOCache(options.window_capacity, num_shard_bits, false, 0.0);
     }
-    if (options.hot_capacity > 0) {
+    if (options.hot_capacity > 0 &&
+        (enable_write_window_ || enable_compaction_feedback_ ||
+         enable_drop_key_cache_)) {
       hot_cache_ =
           NewLRUCache(options.hot_capacity, num_shard_bits, false, 0.0);
     }

@@ -933,6 +933,7 @@ void BlockBasedTableBuilder::WriteDeltaBlock(
     }
     if (ok()) {
       meta_index_builder->Add(kDeltaBlock, delta_block_handle);
+      rep_->props.delta_block_size = rep_->delta_block.size();
     }
   }
 }

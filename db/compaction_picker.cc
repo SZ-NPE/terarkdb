@@ -85,7 +85,8 @@ struct GarbageFileInfo {
     if (f == nullptr) return 0.0;
     if (precise) {
       return std::min(1.0, f->num_antiquation_bytes /
-                               std::max<double>(1, f->fd.file_size));
+                               std::max<double>(
+                                   1, f->BlobGcAccountingBytes()));
     }
     return std::min(1.0, f->num_antiquation /
                              std::max<double>(1, f->prop.num_entries));

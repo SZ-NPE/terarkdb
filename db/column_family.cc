@@ -336,6 +336,11 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
       }
     }
   }
+  if (result.precise_gc &&
+      (!result.table_factory ||
+       !result.table_factory->IsExactGarbageCollectionSupported())) {
+    result.precise_gc = false;
+  }
   if (result.middle_blob_size != size_t(-1) &&
       result.middle_blob_size < result.blob_size) {
     result.middle_blob_size = result.blob_size;

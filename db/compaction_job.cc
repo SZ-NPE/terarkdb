@@ -1763,7 +1763,13 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       return separate_helper->TransToCombined(user_key, sequence, value);
     }
   } separate_helper;
-  separate_helper.update_value_size = mutable_cf_options->precise_gc;
+  // precise_gc mirrors the upstream exact GC "enabled" mode: use value-size
+  // metadata that is already available from delta blocks, but do not fetch blob
+  // values during compaction just to repair missing sizes.  Fetching here is
+  // the upstream kExactGCUpdateValueSize heavy mode and can turn overwrite-heavy
+  // compactions into random blob reads.  Missing sizes stay zero and are handled
+  // later by VersionBuilder's average-size fallback.
+  separate_helper.update_value_size = false;
   if (compact_->compaction->immutable_cf_options()
           ->value_meta_extractor_factory != nullptr) {
     ValueExtractorContext context = {cfd->GetID()};

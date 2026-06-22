@@ -80,6 +80,9 @@ void PropertyBlockBuilder::Add(
 void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kRawKeySize, props.raw_key_size);
   Add(TablePropertiesNames::kRawValueSize, props.raw_value_size);
+  if (props.delta_block_size != 0) {
+    Add(TablePropertiesNames::kDeltaBlockSize, props.delta_block_size);
+  }
   Add(TablePropertiesNames::kDataSize, props.data_size);
   Add(TablePropertiesNames::kIndexSize, props.index_size);
   if (props.index_partitions != 0) {
@@ -274,6 +277,8 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       {TablePropertiesNames::kRawKeySize, &new_table_properties->raw_key_size},
       {TablePropertiesNames::kRawValueSize,
        &new_table_properties->raw_value_size},
+      {TablePropertiesNames::kDeltaBlockSize,
+       &new_table_properties->delta_block_size},
       {TablePropertiesNames::kNumDataBlocks,
        &new_table_properties->num_data_blocks},
       {TablePropertiesNames::kNumEntries, &new_table_properties->num_entries},
