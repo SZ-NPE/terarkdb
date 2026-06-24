@@ -90,6 +90,7 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       blob_gc_collect_block_stats(options.blob_gc_collect_block_stats),
       blob_gc_collect_latency_stats(options.blob_gc_collect_latency_stats),
       blob_gc_collect_bytes_stats(options.blob_gc_collect_bytes_stats),
+      blob_gc_diagnostics(options.blob_gc_diagnostics),
       block_cache_obsolete_tracking(options.block_cache_obsolete_tracking),
       block_cache_obsolete_sample_interval_sec(
           options.block_cache_obsolete_sample_interval_sec),
@@ -246,6 +247,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    blob_gc_collect_latency_stats);
   ROCKS_LOG_HEADER(log, "             Options.blob_gc_collect_bytes_stats: %d",
                    blob_gc_collect_bytes_stats);
+  ROCKS_LOG_HEADER(log, "                    Options.blob_gc_diagnostics: %d",
+                   blob_gc_diagnostics);
   ROCKS_LOG_HEADER(log, "          Options.block_cache_obsolete_tracking: %d",
                    block_cache_obsolete_tracking);
   ROCKS_LOG_HEADER(

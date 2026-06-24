@@ -141,6 +141,7 @@ DBOptions BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
       immutable_db_options.blob_gc_collect_latency_stats;
   options.blob_gc_collect_bytes_stats =
       immutable_db_options.blob_gc_collect_bytes_stats;
+  options.blob_gc_diagnostics = immutable_db_options.blob_gc_diagnostics;
   options.block_cache_obsolete_tracking =
       immutable_db_options.block_cache_obsolete_tracking;
   options.block_cache_obsolete_sample_interval_sec =
@@ -1782,6 +1783,9 @@ std::unordered_map<std::string, OptionTypeInfo>
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"blob_gc_collect_bytes_stats",
          {offsetof(struct DBOptions, blob_gc_collect_bytes_stats),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"blob_gc_diagnostics",
+         {offsetof(struct DBOptions, blob_gc_diagnostics),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
          {"block_cache_obsolete_tracking",
           {offsetof(struct DBOptions, block_cache_obsolete_tracking),

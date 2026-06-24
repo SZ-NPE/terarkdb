@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1500" viewBox="0 0 1400 1500">
+  <rect width="1400" height="1500" fill="#ffffff"/>
+  <style>
+    .title { font-family: Arial, sans-serif; font-size: 25px; font-weight: 700; fill: #111; }
+    .subtitle { font-family: Arial, sans-serif; font-size: 14px; fill: #555; }
+    .panel-title { font-family: Arial, sans-serif; font-size: 18px; font-weight: 700; fill: #111; }
+    .axis-label { font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; fill: #333; }
+    .tick { font-family: Arial, sans-serif; font-size: 11px; fill: #333; }
+    .legend { font-family: Arial, sans-serif; font-size: 12px; fill: #333; }
+    .note { font-family: Arial, sans-serif; font-size: 12px; fill: #555; }
+    .grid { stroke: #e9e9e9; stroke-width: 1; }
+    .axis { stroke: #222; stroke-width: 1.8; }
+  </style>
+
+  <text x="700" y="36" text-anchor="middle" class="title">TerarkDB Motivation Figures：M1/M2/M4/M5/M6 预期样式</text>
+  <text x="700" y="62" text-anchor="middle" class="subtitle">这些是论文动机图的版式示意，不是实验真实数据；颜色、坐标和相对趋势按 FAST 风格设计</text>
+
+  <!-- ================= M1 ================= -->
+  <g transform="translate(55,95)">
+    <rect x="0" y="0" width="620" height="380" fill="#fbfbfb" stroke="#ddd"/>
+    <text x="18" y="32" class="panel-title">M1. vSST 垃圾率分布 CDF</text>
+    <text x="18" y="54" class="note">hot/cold 混写导致大量 vSST 只有中低垃圾率；冷热路由使垃圾更集中</text>
+    <g transform="translate(70,80)">
+      <rect x="0" y="0" width="490" height="240" fill="#fff" stroke="#eee"/>
+      <g class="grid">
+        <line x1="0" y1="192" x2="490" y2="192"/><line x1="0" y1="144" x2="490" y2="144"/>
+        <line x1="0" y1="96" x2="490" y2="96"/><line x1="0" y1="48" x2="490" y2="48"/>
+        <line x1="98" y1="0" x2="98" y2="240"/><line x1="196" y1="0" x2="196" y2="240"/>
+        <line x1="294" y1="0" x2="294" y2="240"/><line x1="392" y1="0" x2="392" y2="240"/>
+      </g>
+      <line x1="0" y1="240" x2="490" y2="240" class="axis"/><line x1="0" y1="0" x2="0" y2="240" class="axis"/>
+      <polyline fill="none" stroke="#2f80ed" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"
+        points="0,238 45,230 90,214 135,188 180,158 225,130 270,104 315,82 360,58 405,35 490,6"/>
+      <polyline fill="none" stroke="#d13f2f" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"
+        points="0,238 60,236 120,232 180,224 240,208 300,182 350,140 390,95 430,48 490,6"/>
+      <g class="tick">
+        <text x="0" y="260" text-anchor="middle">0</text><text x="98" y="260" text-anchor="middle">0.2</text>
+        <text x="196" y="260" text-anchor="middle">0.4</text><text x="294" y="260" text-anchor="middle">0.6</text>
+        <text x="392" y="260" text-anchor="middle">0.8</text><text x="490" y="260" text-anchor="middle">1.0</text>
+        <text x="-10" y="244" text-anchor="end">0</text><text x="-10" y="148" text-anchor="end">0.4</text>
+        <text x="-10" y="52" text-anchor="end">0.8</text><text x="-10" y="4" text-anchor="end">1.0</text>
+      </g>
+      <text x="245" y="292" text-anchor="middle" class="axis-label">vSST garbage ratio</text>
+      <text x="-48" y="120" transform="rotate(-90 -48 120)" text-anchor="middle" class="axis-label">CDF of vSST files</text>
+      <line x1="305" y1="24" x2="335" y2="24" stroke="#2f80ed" stroke-width="4"/><text x="343" y="28" class="legend">baseline</text>
+      <line x1="305" y1="48" x2="335" y2="48" stroke="#d13f2f" stroke-width="4"/><text x="343" y="52" class="legend">hot/cold routing</text>
+    </g>
+  </g>
+
+  <!-- ================= M2 ================= -->
+  <g transform="translate(725,95)">
+    <rect x="0" y="0" width="620" height="380" fill="#fbfbfb" stroke="#ddd"/>
+    <text x="18" y="32" class="panel-title">M2. GC I/O 分解堆叠柱</text>
+    <text x="18" y="54" class="note">GC 代价不仅是搬迁 live value，还包括 vSST 扫描、无效读和 kSST 反查</text>
+    <g transform="translate(75,80)">
+      <rect x="0" y="0" width="490" height="240" fill="#fff" stroke="#eee"/>
+      <g class="grid"><line x1="0" y1="192" x2="490" y2="192"/><line x1="0" y1="144" x2="490" y2="144"/><line x1="0" y1="96" x2="490" y2="96"/><line x1="0" y1="48" x2="490" y2="48"/></g>
+      <line x1="0" y1="240" x2="490" y2="240" class="axis"/><line x1="0" y1="0" x2="0" y2="240" class="axis"/>
+      <!-- stacked bars: y = 240 - total -->
+      <g>
+        <rect x="45" y="116" width="50" height="124" fill="#2f80ed"/><rect x="45" y="78" width="50" height="38" fill="#56ccf2"/><rect x="45" y="52" width="50" height="26" fill="#f2c94c"/><rect x="45" y="33" width="50" height="19" fill="#27ae60"/>
+        <rect x="155" y="104" width="50" height="136" fill="#2f80ed"/><rect x="155" y="54" width="50" height="50" fill="#56ccf2"/><rect x="155" y="24" width="50" height="30" fill="#f2c94c"/><rect x="155" y="6" width="50" height="18" fill="#27ae60"/>
+        <rect x="265" y="124" width="50" height="116" fill="#2f80ed"/><rect x="265" y="102" width="50" height="22" fill="#56ccf2"/><rect x="265" y="85" width="50" height="17" fill="#f2c94c"/><rect x="265" y="68" width="50" height="17" fill="#27ae60"/>
+        <rect x="375" y="138" width="50" height="102" fill="#2f80ed"/><rect x="375" y="122" width="50" height="16" fill="#56ccf2"/><rect x="375" y="110" width="50" height="12" fill="#f2c94c"/><rect x="375" y="94" width="50" height="16" fill="#27ae60"/>
+      </g>
+      <g class="tick">
+        <text x="70" y="260" text-anchor="middle">uniform</text><text x="180" y="260" text-anchor="middle">zipf</text>
+        <text x="290" y="260" text-anchor="middle">hotspot</text><text x="400" y="260" text-anchor="middle">routing</text>
+        <text x="-10" y="244" text-anchor="end">0</text><text x="-10" y="148" text-anchor="end">2</text><text x="-10" y="52" text-anchor="end">4</text>
+      </g>
+      <text x="245" y="292" text-anchor="middle" class="axis-label">overwrite workload / policy</text>
+      <text x="-48" y="120" transform="rotate(-90 -48 120)" text-anchor="middle" class="axis-label">GC I/O bytes (GB)</text>
+      <rect x="308" y="18" width="12" height="12" fill="#2f80ed"/><text x="326" y="28" class="legend">vSST read</text>
+      <rect x="408" y="18" width="12" height="12" fill="#56ccf2"/><text x="426" y="28" class="legend">invalid read</text>
+      <rect x="308" y="39" width="12" height="12" fill="#f2c94c"/><text x="326" y="49" class="legend">kSST lookup</text>
+      <rect x="408" y="39" width="12" height="12" fill="#27ae60"/><text x="426" y="49" class="legend">relocation write</text>
+    </g>
+  </g>
+
+  <!-- ================= M4 ================= -->
+  <g transform="translate(55,540)">
+    <rect x="0" y="0" width="1290" height="350" fill="#fbfbfb" stroke="#ddd"/>
+    <text x="18" y="32" class="panel-title">M4. Block Cache 中 obsolete blocks 占比时间线</text>
+    <text x="18" y="54" class="note">compaction/GC 后，已失效文件的 blocks 仍长期驻留；GC-aware eviction 应快速压低这条曲线</text>
+    <g transform="translate(75,80)">
+      <rect x="0" y="0" width="1125" height="210" fill="#fff" stroke="#eee"/>
+      <g class="grid">
+        <line x1="0" y1="168" x2="1125" y2="168"/><line x1="0" y1="126" x2="1125" y2="126"/><line x1="0" y1="84" x2="1125" y2="84"/><line x1="0" y1="42" x2="1125" y2="42"/>
+        <line x1="187" y1="0" x2="187" y2="210"/><line x1="375" y1="0" x2="375" y2="210"/><line x1="562" y1="0" x2="562" y2="210"/><line x1="750" y1="0" x2="750" y2="210"/><line x1="937" y1="0" x2="937" y2="210"/>
+      </g>
+      <rect x="210" y="0" width="55" height="210" fill="#ffd9b3" opacity="0.36"/><rect x="610" y="0" width="75" height="210" fill="#ffd9b3" opacity="0.36"/>
+      <text x="237" y="18" text-anchor="middle" class="note" fill="#9a4b00">GC</text><text x="647" y="18" text-anchor="middle" class="note" fill="#9a4b00">GC</text>
+      <line x1="0" y1="210" x2="1125" y2="210" class="axis"/><line x1="0" y1="0" x2="0" y2="210" class="axis"/>
+      <path d="M0,204 C95,202 160,199 205,198 C215,142 230,88 260,55 C330,58 405,70 500,83 C565,88 600,92 610,94 C620,54 650,30 690,28 C760,33 830,55 930,73 C1015,88 1080,102 1125,111 L1125,210 L0,210 Z" fill="#2f80ed" opacity="0.15"/>
+      <polyline fill="none" stroke="#2f80ed" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"
+        points="0,204 90,202 180,199 210,198 225,125 245,70 265,55 350,60 450,75 560,88 610,94 625,56 655,32 685,28 760,35 850,58 960,78 1045,96 1125,111"/>
+      <polyline fill="none" stroke="#d13f2f" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"
+        points="0,204 90,203 180,201 210,199 225,160 245,128 265,120 350,153 450,178 560,192 610,194 625,150 655,118 685,112 760,150 850,180 960,196 1045,202 1125,204"/>
+      <g class="tick">
+        <text x="0" y="230" text-anchor="middle">0</text><text x="187" y="230" text-anchor="middle">5</text><text x="375" y="230" text-anchor="middle">10</text><text x="562" y="230" text-anchor="middle">15</text><text x="750" y="230" text-anchor="middle">20</text><text x="937" y="230" text-anchor="middle">25</text><text x="1125" y="230" text-anchor="middle">30</text>
+        <text x="-10" y="214" text-anchor="end">0</text><text x="-10" y="130" text-anchor="end">0.4</text><text x="-10" y="46" text-anchor="end">0.8</text>
+      </g>
+      <text x="562" y="262" text-anchor="middle" class="axis-label">时间（min）</text>
+      <text x="-48" y="105" transform="rotate(-90 -48 105)" text-anchor="middle" class="axis-label">obsolete byte ratio</text>
+      <line x1="820" y1="20" x2="850" y2="20" stroke="#2f80ed" stroke-width="4"/><text x="858" y="24" class="legend">LRU cache</text>
+      <line x1="930" y1="20" x2="960" y2="20" stroke="#d13f2f" stroke-width="4"/><text x="968" y="24" class="legend">GC-aware cache</text>
+    </g>
+  </g>
+
+  <!-- ================= M5 ================= -->
+  <g transform="translate(55,955)">
+    <rect x="0" y="0" width="620" height="420" fill="#fbfbfb" stroke="#ddd"/>
+    <text x="18" y="32" class="panel-title">M5. Entry-based vs Byte-based 垃圾率散点</text>
+    <text x="18" y="54" class="note">不定长 value 下，entry 比例无法代表真实可回收字节比例</text>
+    <g transform="translate(80,82)">
+      <rect x="0" y="0" width="450" height="260" fill="#fff" stroke="#eee"/>
+      <g class="grid"><line x1="0" y1="208" x2="450" y2="208"/><line x1="0" y1="156" x2="450" y2="156"/><line x1="0" y1="104" x2="450" y2="104"/><line x1="0" y1="52" x2="450" y2="52"/><line x1="90" y1="0" x2="90" y2="260"/><line x1="180" y1="0" x2="180" y2="260"/><line x1="270" y1="0" x2="270" y2="260"/><line x1="360" y1="0" x2="360" y2="260"/></g>
+      <line x1="0" y1="260" x2="450" y2="260" class="axis"/><line x1="0" y1="0" x2="0" y2="260" class="axis"/>
+      <line x1="0" y1="260" x2="450" y2="0" stroke="#777" stroke-width="2" stroke-dasharray="6 5"/>
+      <text x="350" y="42" class="note">y = x</text>
+      <g opacity="0.82">
+        <circle cx="62" cy="210" r="5" fill="#2f80ed"/><circle cx="92" cy="185" r="5" fill="#2f80ed"/><circle cx="125" cy="165" r="5" fill="#2f80ed"/><circle cx="170" cy="126" r="5" fill="#2f80ed"/><circle cx="210" cy="96" r="5" fill="#2f80ed"/><circle cx="245" cy="82" r="5" fill="#2f80ed"/><circle cx="292" cy="52" r="5" fill="#2f80ed"/>
+        <circle cx="85" cy="234" r="5" fill="#d13f2f"/><circle cx="130" cy="226" r="5" fill="#d13f2f"/><circle cx="165" cy="212" r="5" fill="#d13f2f"/><circle cx="205" cy="198" r="5" fill="#d13f2f"/><circle cx="255" cy="185" r="5" fill="#d13f2f"/><circle cx="305" cy="164" r="5" fill="#d13f2f"/><circle cx="365" cy="126" r="5" fill="#d13f2f"/>
+        <circle cx="110" cy="120" r="5" fill="#f2994a"/><circle cx="150" cy="70" r="5" fill="#f2994a"/><circle cx="230" cy="44" r="5" fill="#f2994a"/><circle cx="315" cy="35" r="5" fill="#f2994a"/><circle cx="390" cy="22" r="5" fill="#f2994a"/>
+      </g>
+      <g class="tick">
+        <text x="0" y="280" text-anchor="middle">0</text><text x="90" y="280" text-anchor="middle">0.2</text><text x="180" y="280" text-anchor="middle">0.4</text><text x="270" y="280" text-anchor="middle">0.6</text><text x="360" y="280" text-anchor="middle">0.8</text><text x="450" y="280" text-anchor="middle">1.0</text>
+        <text x="-10" y="264" text-anchor="end">0</text><text x="-10" y="160" text-anchor="end">0.4</text><text x="-10" y="56" text-anchor="end">0.8</text><text x="-10" y="4" text-anchor="end">1.0</text>
+      </g>
+      <text x="225" y="314" text-anchor="middle" class="axis-label">entry-based garbage ratio</text>
+      <text x="-50" y="130" transform="rotate(-90 -50 130)" text-anchor="middle" class="axis-label">byte-based garbage ratio</text>
+      <circle cx="270" cy="302" r="5" fill="#2f80ed"/><text x="282" y="306" class="legend">fixed</text>
+      <circle cx="330" cy="302" r="5" fill="#d13f2f"/><text x="342" y="306" class="legend">Pareto-small dead</text>
+      <circle cx="455" cy="302" r="5" fill="#f2994a"/><text x="467" y="306" class="legend">Pareto-large dead</text>
+    </g>
+  </g>
+
+  <!-- ================= M6 ================= -->
+  <g transform="translate(725,955)">
+    <rect x="0" y="0" width="620" height="420" fill="#fbfbfb" stroke="#ddd"/>
+    <text x="18" y="32" class="panel-title">M6. GC scan bytes / reclaimed bytes</text>
+    <text x="18" y="54" class="note">entry-based GC 在不定长 value 下会选错文件，单位回收成本升高</text>
+    <g transform="translate(75,82)">
+      <rect x="0" y="0" width="490" height="260" fill="#fff" stroke="#eee"/>
+      <g class="grid"><line x1="0" y1="208" x2="490" y2="208"/><line x1="0" y1="156" x2="490" y2="156"/><line x1="0" y1="104" x2="490" y2="104"/><line x1="0" y1="52" x2="490" y2="52"/></g>
+      <line x1="0" y1="260" x2="490" y2="260" class="axis"/><line x1="0" y1="0" x2="0" y2="260" class="axis"/>
+      <g>
+        <rect x="45" y="166" width="42" height="94" fill="#2f80ed"/><rect x="92" y="176" width="42" height="84" fill="#d13f2f"/>
+        <rect x="190" y="52" width="42" height="208" fill="#2f80ed"/><rect x="237" y="124" width="42" height="136" fill="#d13f2f"/>
+        <rect x="335" y="21" width="42" height="239" fill="#2f80ed"/><rect x="382" y="104" width="42" height="156" fill="#d13f2f"/>
+      </g>
+      <g class="tick">
+        <text x="90" y="280" text-anchor="middle">fixed</text><text x="235" y="280" text-anchor="middle">Pareto</text><text x="380" y="280" text-anchor="middle">Pareto+zipf</text>
+        <text x="-10" y="264" text-anchor="end">0</text><text x="-10" y="212" text-anchor="end">1</text><text x="-10" y="160" text-anchor="end">2</text><text x="-10" y="108" text-anchor="end">3</text><text x="-10" y="56" text-anchor="end">4</text><text x="-10" y="4" text-anchor="end">5</text>
+      </g>
+      <text x="245" y="314" text-anchor="middle" class="axis-label">value size distribution / workload</text>
+      <text x="-50" y="130" transform="rotate(-90 -50 130)" text-anchor="middle" class="axis-label">GC total read / reclaimed bytes</text>
+      <rect x="292" y="24" width="13" height="13" fill="#2f80ed"/><text x="313" y="35" class="legend">entry-based picker</text>
+      <rect x="292" y="48" width="13" height="13" fill="#d13f2f"/><text x="313" y="59" class="legend">byte-precise picker</text>
+      <path d="M307 88 C370 78 405 70 420 38" fill="none" stroke="#666" stroke-dasharray="4 4"/>
+      <text x="310" y="96" class="note">越低表示单位空间回收成本越小</text>
+    </g>
+  </g>
+</svg>

@@ -2697,6 +2697,81 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
                      counter.dropped_key_cache_hit,
                      counter.dropped_key_cache_miss,
                      counter.dropped_key_cache_hit);
+      if (db_options_.blob_gc_diagnostics) {
+        uint64_t input_file_bytes = 0;
+        uint64_t input_accounting_bytes = 0;
+        uint64_t output_file_bytes = 0;
+        uint64_t output_accounting_bytes = 0;
+        uint64_t output_entries = 0;
+        size_t input_file_count = 0;
+        const auto& gc_inputs_ref = *sub_compact->compaction->inputs();
+        for (const auto& input_level : gc_inputs_ref) {
+          for (const auto* f : input_level.files) {
+            ++input_file_count;
+            input_file_bytes = input_file_bytes >
+                                       std::numeric_limits<uint64_t>::max() -
+                                           f->fd.GetFileSize()
+                                   ? std::numeric_limits<uint64_t>::max()
+                                   : input_file_bytes + f->fd.GetFileSize();
+            const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
+            input_accounting_bytes =
+                input_accounting_bytes >
+                        std::numeric_limits<uint64_t>::max() - accounting_bytes
+                    ? std::numeric_limits<uint64_t>::max()
+                    : input_accounting_bytes + accounting_bytes;
+          }
+        }
+        for (const auto& output : sub_compact->blob_outputs) {
+          output_file_bytes = output_file_bytes >
+                                      std::numeric_limits<uint64_t>::max() -
+                                          output.meta.fd.GetFileSize()
+                                  ? std::numeric_limits<uint64_t>::max()
+                                  : output_file_bytes +
+                                        output.meta.fd.GetFileSize();
+          const uint64_t accounting_bytes = output.meta.BlobGcAccountingBytes();
+          output_accounting_bytes =
+              output_accounting_bytes >
+                      std::numeric_limits<uint64_t>::max() - accounting_bytes
+                  ? std::numeric_limits<uint64_t>::max()
+                  : output_accounting_bytes + accounting_bytes;
+          output_entries = output_entries >
+                                   std::numeric_limits<uint64_t>::max() -
+                                       output.meta.prop.num_entries
+                               ? std::numeric_limits<uint64_t>::max()
+                               : output_entries + output.meta.prop.num_entries;
+        }
+        const uint64_t physical_reclaimed_bytes =
+            input_file_bytes > output_file_bytes
+                ? input_file_bytes - output_file_bytes
+                : 0;
+        const uint64_t accounting_reclaimed_bytes =
+            input_accounting_bytes > output_accounting_bytes
+                ? input_accounting_bytes - output_accounting_bytes
+                : 0;
+        ROCKS_LOG_INFO(
+            db_options_.info_log,
+            "[%s] [JOB %d] [BLOB_GC_RECLAIM_STATS] input_files=%zu"
+            " output_files=%zu input_file_bytes=%" PRIu64
+            " output_file_bytes=%" PRIu64
+            " physical_reclaimed_bytes=%" PRIu64
+            " input_accounting_bytes=%" PRIu64
+            " output_accounting_bytes=%" PRIu64
+            " accounting_reclaimed_bytes=%" PRIu64
+            " estimated_garbage_bytes=%" PRIu64
+            " vsst_read_bytes=%" PRIu64 " invalid_read_bytes=%" PRIu64
+            " ksst_read_bytes=%" PRIu64
+            " relocation_write_bytes=%" PRIu64
+            " input_records=%" PRIu64 " live_records=%" PRIu64
+            " dead_records=%" PRIu64 " output_entries=%" PRIu64,
+            cfd->GetName().c_str(), job_id_, input_file_count,
+            sub_compact->blob_outputs.size(), input_file_bytes,
+            output_file_bytes, physical_reclaimed_bytes, input_accounting_bytes,
+            output_accounting_bytes, accounting_reclaimed_bytes,
+            sub_compact->compaction->size_antiquated(), gc_vsst_read_bytes_,
+            gc_invalid_read_bytes_, gc_ksst_read_bytes_,
+            gc_relocation_write_bytes_, counter.input, counter.live,
+            counter.dead, output_entries);
+      }
     if (counter.has_run && counter.run_live) {
       counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
     }

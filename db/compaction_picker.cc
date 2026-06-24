@@ -902,6 +902,29 @@ Compaction* CompactionPicker::PickGarbageCollection(
     }
     ++permitted_blobs;
     GarbageFileInfo info{f, mutable_cf_options.precise_gc};
+    if (ioptions_.blob_gc_diagnostics && ioptions_.info_log != nullptr) {
+      const uint64_t entries = f->prop.num_entries;
+      const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
+      const double entry_ratio =
+          std::min(1.0, f->num_antiquation / std::max<double>(1, entries));
+      const double byte_ratio = std::min(
+          1.0,
+          f->num_antiquation_bytes / std::max<double>(1, accounting_bytes));
+      ROCKS_LOG_INFO(
+          ioptions_.info_log,
+          "[%s] [BLOB_GC_FILE_GARBAGE_STATS] ts_us=%" PRIu64
+          " file_number=%" PRIu64 " file_size=%" PRIu64
+          " accounting_bytes=%" PRIu64 " entries=%" PRIu64
+          " dead_entries=%" PRIu64 " dead_bytes=%" PRIu64
+          " entry_ratio=%.9f byte_ratio=%.9f picker_score=%.9f"
+          " precise_gc=%d gc_status=%d marked_for_compaction=%u"
+          " being_compacted=%d",
+          cf_name.c_str(), ioptions_.env->NowMicros(), f->fd.GetNumber(),
+          f->fd.GetFileSize(), accounting_bytes, entries, f->num_antiquation,
+          f->num_antiquation_bytes, entry_ratio, byte_ratio, info.score,
+          mutable_cf_options.precise_gc ? 1 : 0, static_cast<int>(f->gc_status),
+          f->marked_for_compaction, f->being_compacted ? 1 : 0);
+    }
     ++garbage_ratio_buckets[bucket_idx(info.score)];
     // candidate_cmp is less comparator
     if (dirtiest_blob.f == nullptr || candidate_cmp(dirtiest_blob, info)) {

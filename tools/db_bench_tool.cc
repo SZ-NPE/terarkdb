@@ -1050,6 +1050,10 @@ DEFINE_bool(blob_gc_collect_latency_stats, false,
             "Collect blob GC latency breakdown in INFO LOG.");
 DEFINE_bool(blob_gc_collect_bytes_stats, false,
             "Collect blob GC byte counters in statistics and INFO LOG.");
+DEFINE_bool(blob_gc_diagnostics, false,
+            "Enable heavyweight Blob GC diagnostic instrumentation. This "
+            "implies GC byte/latency/block stats and obsolete block-cache "
+            "tracking in db_bench.");
 DEFINE_bool(block_cache_obsolete_tracking, false,
             "Track obsolete-file residency in the block cache for motivation "
             "tests. Intended for default LRU block cache.");
@@ -3710,11 +3714,16 @@ class Benchmark {
     options.hotness_admit_threshold = FLAGS_hotness_admit_threshold;
     options.hotness_decay_interval = FLAGS_hotness_decay_interval;
     options.hotness_decay_window = FLAGS_hotness_decay_window;
-    options.blob_gc_collect_block_stats = FLAGS_blob_gc_collect_block_stats;
-    options.blob_gc_collect_latency_stats = FLAGS_blob_gc_collect_latency_stats;
-    options.blob_gc_collect_bytes_stats = FLAGS_blob_gc_collect_bytes_stats;
+    options.blob_gc_collect_block_stats =
+        FLAGS_blob_gc_collect_block_stats || FLAGS_blob_gc_diagnostics;
+    options.blob_gc_collect_latency_stats =
+        FLAGS_blob_gc_collect_latency_stats || FLAGS_blob_gc_diagnostics;
+    options.blob_gc_collect_bytes_stats =
+        FLAGS_blob_gc_collect_bytes_stats || FLAGS_blob_gc_diagnostics;
+    options.blob_gc_diagnostics = FLAGS_blob_gc_diagnostics;
     options.block_cache_obsolete_tracking =
-        FLAGS_block_cache_obsolete_tracking || FLAGS_use_gc_aware_block_cache;
+        FLAGS_block_cache_obsolete_tracking || FLAGS_use_gc_aware_block_cache ||
+        FLAGS_blob_gc_diagnostics;
     options.block_cache_obsolete_sample_interval_sec =
         FLAGS_block_cache_obsolete_sample_interval_sec;
     options.block_cache_obsolete_topk_files =

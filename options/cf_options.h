@@ -128,6 +128,7 @@ struct ImmutableCFOptions {
   std::vector<std::shared_ptr<EventListener>> listeners;
 
   bool blob_gc_collect_bytes_stats;
+  bool blob_gc_diagnostics;
 
   std::shared_ptr<Cache> row_cache;
 

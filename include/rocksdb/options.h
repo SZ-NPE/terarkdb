@@ -1088,6 +1088,14 @@ struct DBOptions {
   // DEFAULT: false
   bool blob_gc_collect_bytes_stats = false;
 
+  // If true, enable heavyweight Blob GC diagnostics. This switch is
+  // intentionally off by default because it may emit per-file INFO LOG records
+  // and additional per-GC accounting. Benchmark tools should use it only for
+  // offline diagnosis and should also enable the narrower GC byte/latency/block
+  // and block-cache obsolete counters needed by the diagnostics.
+  // DEFAULT: false
+  bool blob_gc_diagnostics = false;
+
   // If true, enable experimental block-cache obsolete-file residency tracking.
   // A block is obsolete when its cached file number has been replaced by a
   // successful compaction or Blob GC install. Intended for motivation tests.
