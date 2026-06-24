@@ -1,5 +1,7 @@
 #include "table/delta_builder.h"
 
+#include <limits>
+
 #include "util/coding.h"
 
 namespace TERARKDB_NAMESPACE {
@@ -38,15 +40,19 @@ void DeltaBuilder::Reset() {
   num_entries_.clear();
 }
 
-void DeltaBuilder::Add(bool is_separated, uint32_t separated_value_size,
-                       const std::string* value_meta) {
+Status DeltaBuilder::Add(bool is_separated, uint32_t separated_value_size,
+                         const std::string* value_meta) {
   if (!is_separated) {
     assert(separated_value_size == 0);
     bitmap_.push_back(false);
-    return;
+    return Status::OK();
   }
   PutVarint32(&buffer_, separated_value_size);
   if (value_meta != nullptr && !value_meta->empty()) {
+    if (value_meta->size() > std::numeric_limits<uint32_t>::max()) {
+      return Status::InvalidArgument(
+          "delta-block value metadata is too large");
+    }
     PutVarint32(&buffer_, static_cast<uint32_t>(value_meta->size()));
     buffer_.append(*value_meta);
   } else {
@@ -54,6 +60,7 @@ void DeltaBuilder::Add(bool is_separated, uint32_t separated_value_size,
   }
   bitmap_.push_back(true);
   ++counter_;
+  return Status::OK();
 }
 
 void DeltaBuilder::AddIndexEntry(uint32_t block_number, uint32_t num_entry,

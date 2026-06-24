@@ -32,8 +32,8 @@ class DeltaBuilder {
 
   void Reset();
 
-  void Add(bool is_separated, uint32_t separated_value_size,
-           const std::string* value_meta = nullptr);
+  Status Add(bool is_separated, uint32_t separated_value_size,
+             const std::string* value_meta = nullptr);
 
   Status Finish(LazyBuffer* block_content);
   Status Finish(LazyBuffer* block_content,

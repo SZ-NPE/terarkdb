@@ -207,6 +207,8 @@ struct GarbageAwareCacheOptions {
   double admission_ratio = 0.7;
   double demote_score_threshold = 0.0;
   uint64_t log_interval = 10000;
+  bool enable_aging = false;
+  uint64_t aging_interval = 10000;
   std::shared_ptr<MemoryAllocator> memory_allocator;
 };
 
@@ -218,6 +220,12 @@ extern std::shared_ptr<Cache> NewGarbageAwareCache(
     bool strict_capacity_limit = false, double admission_ratio = 0.7,
     double demote_score_threshold = 0.0, uint64_t log_interval = 10000,
     std::shared_ptr<MemoryAllocator> memory_allocator = nullptr);
+
+extern std::shared_ptr<Cache> NewGarbageAwareCache(
+    size_t capacity, int num_shard_bits, bool strict_capacity_limit,
+    double admission_ratio, double demote_score_threshold, uint64_t log_interval,
+    std::shared_ptr<MemoryAllocator> memory_allocator, bool enable_aging,
+    uint64_t aging_interval);
 
 class Cache {
  public:
@@ -297,7 +305,13 @@ class Cache {
   // If record_hit is false, it won't be promoted to the head of the LRU.
   virtual Handle* Lookup(const Slice& key, Statistics* stats = nullptr) = 0;
 
-  virtual Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true, Statistics* stats = nullptr) {
+  Handle* Lookup(const Slice& key, uint32_t hash, Statistics* stats) {
+    return Lookup(key, hash, true /* record_hit */, stats);
+  }
+
+  virtual Handle* Lookup(const Slice& key, uint32_t hash,
+                         bool record_hit = true,
+                         Statistics* stats = nullptr) {
     (void)hash;
     (void)record_hit;
     return Lookup(key, stats);

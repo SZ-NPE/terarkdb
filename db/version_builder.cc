@@ -30,6 +30,7 @@
 #include "util/c_style_callback.h"
 #include "util/chash_map.h"
 #include "util/chash_set.h"
+#include "util/logging.h"
 
 #define ROCKS_VERSION_BUILDER_DEBUG 0
 
@@ -128,6 +129,19 @@ struct VersionBuilderContextImpl : VersionBuilder::Context {
     double entry_depended;
     double bytes_depended;
   };
+  struct PreciseGcMetadataStats {
+    uint64_t exact_dependence_count = 0;
+    uint64_t estimated_dependence_count = 0;
+    double exact_dependence_bytes = 0;
+    double estimated_dependence_bytes = 0;
+
+    void Reset() {
+      exact_dependence_count = 0;
+      estimated_dependence_count = 0;
+      exact_dependence_bytes = 0;
+      estimated_dependence_bytes = 0;
+    }
+  };
   struct InheritanceItem {
     size_t depended : 1;
     size_t count : sizeof(size_t) * 8 - 1;
@@ -152,6 +166,7 @@ struct VersionBuilderContextImpl : VersionBuilder::Context {
   uint64_t maintainer_job_limit;
   chash_map<uint64_t, DependenceItem> dependence_map;
   chash_map<uint64_t, InheritanceItem> inheritance_counter;
+  PreciseGcMetadataStats precise_gc_metadata_stats;
 };
 
 class VersionBuilder::Rep {
@@ -290,19 +305,89 @@ class VersionBuilder::Rep {
     return nullptr;
   }
 
+  static uint64_t ExactByteEntryCount(const Dependence& dep) {
+    if (dep.byte_count == 0) {
+      return 0;
+    }
+    // Older manifests/table properties persisted byte_count before the
+    // completeness field existed. Preserve their historical semantics by
+    // treating a non-zero byte_count with an unknown entry count as complete.
+    if (dep.byte_count_entry_count == 0) {
+      return dep.entry_count;
+    }
+    return std::min(dep.entry_count, dep.byte_count_entry_count);
+  }
+
   // precise_gc: resolve the per-dependence byte cost charged to `item`.
-  // Prefer the byte_count persisted in SST/Manifest; otherwise fall back to an
-  // averaged estimate based on (entry_count, source file size, num_entries).
-  // Keeping this in one place avoids drift between the recursive paths below.
+  // Combine exact bytes for entries with persisted value_size metadata and an
+  // averaged estimate for legacy/missing entries in the same dependence. Keeping
+  // this in one place avoids drift between recursive paths below.
   static double ResolveDepBytes(const Dependence& dep,
                                 const DependenceItem* item) {
-    if (dep.byte_count > 0) {
-      return static_cast<double>(dep.byte_count);
+    const uint64_t exact_entries = ExactByteEntryCount(dep);
+    const uint64_t estimated_entries = dep.entry_count - exact_entries;
+    const uint64_t num_entries = std::max<uint64_t>(1, item->f->prop.num_entries);
+    const double average_bytes =
+        static_cast<double>(item->f->BlobGcAccountingBytes()) /
+        static_cast<double>(num_entries);
+    return static_cast<double>(dep.byte_count) +
+           static_cast<double>(estimated_entries) * average_bytes;
+  }
+
+  static uint64_t ClampPositiveBytesDepended(double bytes_depended,
+                                             uint64_t upper_bound) {
+    if (upper_bound == 0 || !(bytes_depended > 0)) {
+      return 0;
     }
-    uint64_t num_entries = std::max<uint64_t>(1, item->f->prop.num_entries);
-    return static_cast<double>(dep.entry_count) *
-           static_cast<double>(item->f->BlobGcAccountingBytes()) /
-           static_cast<double>(num_entries);
+    const double max_safe = static_cast<double>(upper_bound);
+    if (bytes_depended >= max_safe) {
+      return upper_bound;
+    }
+    return std::max<uint64_t>(1, static_cast<uint64_t>(bytes_depended));
+  }
+
+  static uint64_t ClampPositiveEntriesDepended(double entries_depended,
+                                               uint64_t upper_bound) {
+    if (upper_bound == 0 || !(entries_depended > 0)) {
+      return 0;
+    }
+    const double max_safe = static_cast<double>(upper_bound);
+    if (entries_depended >= max_safe) {
+      return upper_bound;
+    }
+    return std::max<uint64_t>(1, static_cast<uint64_t>(entries_depended));
+  }
+
+  void RecordPreciseGcMetadata(const Dependence& dep, double charged_bytes) {
+    auto& stats = context_->precise_gc_metadata_stats;
+    if (ExactByteEntryCount(dep) == dep.entry_count) {
+      ++stats.exact_dependence_count;
+      stats.exact_dependence_bytes += charged_bytes;
+    } else {
+      ++stats.estimated_dependence_count;
+      stats.estimated_dependence_bytes += charged_bytes;
+    }
+  }
+
+  void LogPreciseGcMetadataStats() const {
+    const auto& stats = context_->precise_gc_metadata_stats;
+    const uint64_t total_deps = stats.exact_dependence_count +
+                                stats.estimated_dependence_count;
+    if (total_deps == 0) {
+      return;
+    }
+    const double total_bytes = stats.exact_dependence_bytes +
+                               stats.estimated_dependence_bytes;
+    const double exact_byte_ratio =
+        total_bytes > 0 ? stats.exact_dependence_bytes / total_bytes : 1.0;
+    ROCKS_LOG_INFO(
+        info_log_,
+        "[PRECISE_GC_METADATA] exact_deps=%" PRIu64
+        " estimated_deps=%" PRIu64 " exact_bytes=%.0f estimated_bytes=%.0f"
+        " exact_byte_ratio=%.6f dependence_files=%zu",
+        stats.exact_dependence_count, stats.estimated_dependence_count,
+        stats.exact_dependence_bytes, stats.estimated_dependence_bytes,
+        exact_byte_ratio, context_->dependence_map.size());
   }
 
   void SetDependence(FileMetaData* f, bool is_map, bool is_estimation,
@@ -327,6 +412,7 @@ class VersionBuilder::Rep {
         item->entry_depended += dependence.entry_count * entry_ratio;
         double dep_bytes = ResolveDepBytes(dependence, item);
         item->bytes_depended += dep_bytes * bytes_ratio;
+        RecordPreciseGcMetadata(dependence, dep_bytes * bytes_ratio);
       }
       item->dependence_version = dependence_version;
       if (is_map) {
@@ -356,6 +442,9 @@ class VersionBuilder::Rep {
     auto& dependence_map = context_->dependence_map;
     auto& inheritance_counter = context_->inheritance_counter;
     auto dependence_version = ++context_->dependence_version;
+    if (finish) {
+      context_->precise_gc_metadata_stats.Reset();
+    }
     for (int level = 0; level < num_levels_; ++level) {
       for (auto& pair : context_->levels[level]) {
         auto file_number = pair.first;
@@ -401,14 +490,13 @@ class VersionBuilder::Rep {
                inheritance_counter.find(it->first)->second.item_pos ==
                    it.pos());
         if (finish) {
-          uint64_t entry_depended = std::max<uint64_t>(1, item.entry_depended);
-          entry_depended = std::min(item.f->prop.num_entries, entry_depended);
+          uint64_t entry_depended = ClampPositiveEntriesDepended(
+              item.entry_depended, item.f->prop.num_entries);
           uint64_t num_antiquation = item.f->prop.num_entries - entry_depended;
-          uint64_t bytes_depended =
-              std::max<uint64_t>(1, item.bytes_depended);
           const uint64_t blob_gc_accounting_bytes =
               item.f->BlobGcAccountingBytes();
-          bytes_depended = std::min(blob_gc_accounting_bytes, bytes_depended);
+          uint64_t bytes_depended = ClampPositiveBytesDepended(
+              item.bytes_depended, blob_gc_accounting_bytes);
           uint64_t num_antiquation_bytes =
               blob_gc_accounting_bytes - bytes_depended;
           switch (item.f->gc_status) {
@@ -719,6 +807,7 @@ class VersionBuilder::Rep {
     Init();
     CheckConsistency(vstorage, true);
     CalculateDependence(true, false, maintainer_job_ratio);
+    LogPreciseGcMetadataStats();
     auto exists = [&](uint64_t file_number) {
       auto find = context_->inheritance_counter.find(file_number);
       assert(find != context_->inheritance_counter.end());

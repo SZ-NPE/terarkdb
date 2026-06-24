@@ -213,6 +213,12 @@ void MutableCFOptions::Dump(Logger* log) const {
                  hotness_enable_compaction_feedback);
   ROCKS_LOG_INFO(log, "          hotness_enable_drop_key_cache: %d",
                  hotness_enable_drop_key_cache);
+  ROCKS_LOG_INFO(log, "              hotness_admit_threshold: %u",
+                 hotness_admit_threshold);
+  ROCKS_LOG_INFO(log, "               hotness_decay_interval: %" PRIu64,
+                 hotness_decay_interval);
+  ROCKS_LOG_INFO(log, "                 hotness_decay_window: %" PRIu64,
+                 hotness_decay_window);
   ROCKS_LOG_INFO(log, "                     blob_large_key_ratio: %f",
                  blob_large_key_ratio);
   ROCKS_LOG_INFO(log, "          read_separated_value_by_handle: %d",
@@ -323,6 +329,9 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       hotness_enable_compaction_feedback(
           options.hotness_enable_compaction_feedback),
       hotness_enable_drop_key_cache(options.hotness_enable_drop_key_cache),
+      hotness_admit_threshold(options.hotness_admit_threshold),
+      hotness_decay_interval(options.hotness_decay_interval),
+      hotness_decay_window(options.hotness_decay_window),
       blob_large_key_ratio(options.blob_large_key_ratio),
       read_separated_value_by_handle(options.read_separated_value_by_handle),
       blob_gc_ratio(options.blob_gc_ratio),

@@ -342,6 +342,17 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // can evaluate drop-key cache without promoting keys to the hot flush route.
   bool hotness_enable_drop_key_cache = true;
 
+  // Number of writes in the recent write window required before a key is
+  // admitted to the hot flush route. Default 2 preserves legacy behavior.
+  uint32_t hotness_admit_threshold = 2;
+
+  // Simple hotness decay controls. Every hotness_decay_interval RecordWrite
+  // calls advances a global epoch. If hotness_decay_window is non-zero, admitted
+  // hot keys idle for more than that many epochs become cold again. Set either
+  // value to 0 to disable decay (default, for compatibility).
+  uint64_t hotness_decay_interval = 0;
+  uint64_t hotness_decay_window = 0;
+
   // Don't separate Value if key.size > value.size * blob_large_key_ratio
   // valid [0 , 1]
   double blob_large_key_ratio = 0.25;

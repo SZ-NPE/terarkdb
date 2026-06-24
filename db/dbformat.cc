@@ -15,6 +15,8 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#include <limits>
+
 #include "monitoring/perf_context_imp.h"
 #include "port/port.h"
 #include "rocksdb/terark_namespace.h"
@@ -269,6 +271,13 @@ Status SeparateHelper::TransToSeparate(
     }
   }
   if (value.valid() && meta->value_size == 0) {
+    const size_t max_delta_value_size =
+        std::numeric_limits<uint32_t>::max();
+    if (internal_key.size() > max_delta_value_size ||
+        value.size() > max_delta_value_size - internal_key.size()) {
+      return Status::InvalidArgument(
+          "separated value is too large for delta-block value_size metadata");
+    }
     meta->value_size = static_cast<uint32_t>(internal_key.size() + value.size());
   }
   if (!meta->block_handle.IsInvalid() && !meta->block_handle.IsNull()) {

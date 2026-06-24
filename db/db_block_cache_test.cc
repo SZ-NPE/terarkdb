@@ -389,6 +389,8 @@ namespace {
 // inserted for each priority.
 class MockCache : public LRUCache {
  public:
+  using LRUCache::Insert;
+
   static uint32_t high_pri_insert_count;
   static uint32_t low_pri_insert_count;
 
@@ -406,6 +408,20 @@ class MockCache : public LRUCache {
       high_pri_insert_count++;
     }
     return LRUCache::Insert(key, value, charge, deleter, handle, priority);
+  }
+
+  virtual Status InsertWithMetadata(
+      const Slice& key, void* value, size_t charge,
+      void (*deleter)(const Slice& key, void* value),
+      const BlockCacheMetadata* metadata, Handle** handle,
+      Priority priority) override {
+    if (priority == Priority::LOW) {
+      low_pri_insert_count++;
+    } else {
+      high_pri_insert_count++;
+    }
+    return LRUCache::InsertWithMetadata(key, value, charge, deleter, metadata,
+                                        handle, priority);
   }
 };
 

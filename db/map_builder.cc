@@ -1687,7 +1687,7 @@ Status MapBuilder::WriteOutputFile(
     // precise_gc: MapSST only records dependence relations and never creates
     // new blob files, so byte_count stays 0 (VersionBuilder falls back to an
     // averaged estimate from the source blob).
-    dependence.emplace_back(Dependence{pair.first, pair.second, 0});
+    dependence.emplace_back(Dependence{pair.first, pair.second, 0, 0});
   }
   std::sort(dependence.begin(), dependence.end(), TERARK_CMP(file_number, <));
 

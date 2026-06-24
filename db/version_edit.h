@@ -10,6 +10,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <set>
 #include <string>
 #include <utility>
@@ -173,12 +174,19 @@ struct FileMetaData {
     return old_refs == 1;
   }
 
-  // Bytes used as the denominator for precise Blob GC. Prefer value payload
-  // bytes when table properties provide them because dependence.byte_count is
-  // recorded from separated value sizes, not from the physical SST file size.
-  // Fall back to file size for legacy metadata that does not carry raw values.
+  // Bytes used as the denominator for precise Blob GC. Dependence::byte_count
+  // is charged in the same accounting domain as separated value_size metadata:
+  // raw key bytes plus raw value bytes. Fall back to file size for legacy
+  // metadata that does not carry raw key/value sizes.
   uint64_t BlobGcAccountingBytes() const {
-    return prop.raw_value_size > 0 ? prop.raw_value_size : fd.GetFileSize();
+    if (prop.raw_key_size > 0 || prop.raw_value_size > 0) {
+      if (prop.raw_key_size >
+          std::numeric_limits<uint64_t>::max() - prop.raw_value_size) {
+        return std::numeric_limits<uint64_t>::max();
+      }
+      return prop.raw_key_size + prop.raw_value_size;
+    }
+    return fd.GetFileSize();
   }
 
   std::vector<SequenceNumber> ShrinkSnapshot(

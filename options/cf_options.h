@@ -171,6 +171,9 @@ struct MutableCFOptions {
         hotness_enable_write_window(false),
         hotness_enable_compaction_feedback(false),
         hotness_enable_drop_key_cache(false),
+        hotness_admit_threshold(2),
+        hotness_decay_interval(0),
+        hotness_decay_window(0),
         blob_large_key_ratio(0),
         read_separated_value_by_handle(true),
         blob_gc_ratio(0),
@@ -247,6 +250,9 @@ struct MutableCFOptions {
   bool hotness_enable_write_window;
   bool hotness_enable_compaction_feedback;
   bool hotness_enable_drop_key_cache;
+  uint32_t hotness_admit_threshold;
+  uint64_t hotness_decay_interval;
+  uint64_t hotness_decay_window;
   double blob_large_key_ratio;
   bool read_separated_value_by_handle;
   double blob_gc_ratio;

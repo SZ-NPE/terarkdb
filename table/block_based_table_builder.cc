@@ -13,6 +13,7 @@
 #include <stdio.h>
 
 #include <list>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -401,6 +402,11 @@ Status BlockBasedTableBuilder::Add(
     const Slice& key, const LazyBuffer& lazy_value,
     const SeparateHelper::ValueMetaData& value_meta) {
   Rep* r = rep_;
+  auto delta_index_fits = [&](uint64_t pending_entries = 0) {
+    return r->props.num_data_blocks <= std::numeric_limits<uint32_t>::max() &&
+           r->props.num_entries <=
+               std::numeric_limits<uint32_t>::max() - pending_entries;
+  };
   assert(!r->closed);
   assert(ok());
   auto s = lazy_value.fetch();
@@ -429,6 +435,11 @@ Status BlockBasedTableBuilder::Add(
     if (ok()) {
       r->index_builder->AddIndexEntry(&r->last_key, &key, r->pending_handle);
       if (r->table_options.use_delta_block) {
+        if (!delta_index_fits()) {
+          r->status = Status::InvalidArgument(
+              "SST is too large for delta-block index metadata");
+          return r->status;
+        }
         r->delta_block.AddIndexEntry(r->props.num_data_blocks,
                                      static_cast<uint32_t>(r->props.num_entries));
       }
@@ -449,17 +460,25 @@ Status BlockBasedTableBuilder::Add(
   }
   r->data_block.Add(key, value);
   if (r->table_options.use_delta_block) {
-    r->delta_block.Add(is_separated,
-                       is_separated ? value_meta.value_size : 0,
-                       value_meta.meta_data.empty() ? nullptr
-                                                     : &value_meta.meta_data);
+    Status delta_status = r->delta_block.Add(
+        is_separated, is_separated ? value_meta.value_size : 0,
+        value_meta.meta_data.empty() ? nullptr : &value_meta.meta_data);
+    if (!delta_status.ok()) {
+      r->status = delta_status;
+      return delta_status;
+    }
   }
   if (r->store_block_handle_in_sst) {
     Flush();
     value_meta.block_handle = r->pending_handle;
     if (r->table_options.use_delta_block) {
+      if (!delta_index_fits(1)) {
+        r->status = Status::InvalidArgument(
+            "SST is too large for delta-block index metadata");
+        return r->status;
+      }
       r->delta_block.AddIndexEntry(r->props.num_data_blocks,
-                                   static_cast<uint32_t>(r->props.num_entries));
+                                   static_cast<uint32_t>(r->props.num_entries + 1));
     }
   }
   r->last_key.assign(key.data(), key.size());
@@ -968,10 +987,16 @@ Status BlockBasedTableBuilder::Finish(
     r->index_builder->AddIndexEntry(
         &r->last_key, nullptr /* no next data block */, r->pending_handle);
   }
-  if (r->table_options.use_delta_block) {
+  if (ok() && r->table_options.use_delta_block) {
+    if (r->props.num_data_blocks > std::numeric_limits<uint32_t>::max() ||
+        r->props.num_entries > std::numeric_limits<uint32_t>::max()) {
+      r->status = Status::InvalidArgument(
+          "SST is too large for delta-block index metadata");
+    } else {
     r->delta_block.AddIndexEntry(r->props.num_data_blocks,
                                  static_cast<uint32_t>(r->props.num_entries),
                                  true);
+    }
   }
 
   // Write meta blocks and metaindex block with the following order.

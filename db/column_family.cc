@@ -438,6 +438,9 @@ HotnessTracker::Options MakeHotnessTrackerOptions(
   options.enable_compaction_feedback =
       cf_options.hotness_enable_compaction_feedback;
   options.enable_drop_key_cache = cf_options.hotness_enable_drop_key_cache;
+  options.admit_threshold = cf_options.hotness_admit_threshold;
+  options.decay_interval = cf_options.hotness_decay_interval;
+  options.decay_window = cf_options.hotness_decay_window;
   return options;
 }
 }  // anonymous namespace

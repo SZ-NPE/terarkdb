@@ -19,9 +19,13 @@ typedef uint64_t SequenceNumber;
 
 // Dependence pair
 struct Dependence {
-  uint64_t file_number;
-  uint64_t entry_count;
-  uint64_t byte_count;
+  uint64_t file_number = 0;
+  uint64_t entry_count = 0;
+  uint64_t byte_count = 0;
+  // Number of entries covered by byte_count. A zero value on an old manifest or
+  // table property means "unknown"; readers treat non-zero byte_count with an
+  // unknown exact-entry count as complete for backward compatibility.
+  uint64_t byte_count_entry_count = 0;
 };
 
 // User-oriented representation of internal key types.

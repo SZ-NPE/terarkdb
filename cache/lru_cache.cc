@@ -14,6 +14,7 @@
 #include "cache/lru_cache.h"
 
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -22,6 +23,28 @@
 #include "rocksdb/terark_namespace.h"
 
 namespace TERARKDB_NAMESPACE {
+
+namespace {
+
+bool IsNoHitHandle(Cache::Handle* handle) {
+  return (reinterpret_cast<uintptr_t>(handle) & uintptr_t{1}) != 0;
+}
+
+LRUHandle* UnwrapHandle(Cache::Handle* handle) {
+  return reinterpret_cast<LRUHandle*>(reinterpret_cast<uintptr_t>(handle) &
+                                      ~uintptr_t{1});
+}
+
+Cache::Handle* EncodeHandle(LRUHandle* handle, bool no_hit) {
+  uintptr_t raw = reinterpret_cast<uintptr_t>(handle);
+  assert((raw & uintptr_t{1}) == 0);
+  if (no_hit) {
+    raw |= uintptr_t{1};
+  }
+  return reinterpret_cast<Cache::Handle*>(raw);
+}
+
+}  // namespace
 
 LRUHandleTable::LRUHandleTable() : list_(nullptr), length_(0), elems_(0) {
   Resize();
@@ -210,10 +233,11 @@ void LRUCacheShardTemplate<CacheMonitor>::LRU_Remove(LRUHandle* e) {
 }
 
 template <class CacheMonitor>
-void LRUCacheShardTemplate<CacheMonitor>::LRU_Insert(LRUHandle* e) {
+void LRUCacheShardTemplate<CacheMonitor>::LRU_Insert(LRUHandle* e,
+                                                     bool promote) {
   assert(e->next == nullptr);
   assert(e->prev == nullptr);
-  if (high_pri_pool_ratio_ > 0 && (e->IsHighPri() || e->HasHit())) {
+  if (promote && high_pri_pool_ratio_ > 0 && (e->IsHighPri() || e->HasHit())) {
     // Inset "e" to head of LRU list.
     e->next = &lru_;
     e->prev = lru_.prev;
@@ -222,15 +246,38 @@ void LRUCacheShardTemplate<CacheMonitor>::LRU_Insert(LRUHandle* e) {
     e->SetInHighPriPool(true);
     HighPriPoolUsageAdd(e);
     MaintainPoolSize();
-  } else {
-    // Insert "e" to the head of low-pri pool. Note that when
-    // high_pri_pool_ratio is 0, head of low-pri pool is also head of LRU list.
+  } else if (!promote && high_pri_pool_ratio_ > 0 && e->InHighPriPool()) {
+    // No-hit lookups must not refresh recency, but they also must not demote a
+    // high-priority entry out of the protected pool. Put it at the cold end of
+    // the high-pri pool, preserving priority while avoiding promotion.
     e->next = lru_low_pri_->next;
     e->prev = lru_low_pri_;
     e->prev->next = e;
     e->next->prev = e;
+    e->SetInHighPriPool(true);
+    HighPriPoolUsageAdd(e);
+    MaintainPoolSize();
+  } else {
+    if (promote) {
+      // Insert "e" to the head of low-pri pool. Note that when
+      // high_pri_pool_ratio is 0, head of low-pri pool is also head of LRU list.
+      e->next = lru_low_pri_->next;
+      e->prev = lru_low_pri_;
+      e->prev->next = e;
+      e->next->prev = e;
+      lru_low_pri_ = e;
+    } else {
+      // No-hit lookups pin the entry but must not refresh recency. Reinsert at
+      // the cold end so probes do not promote entries in the eviction order.
+      e->next = lru_.next;
+      e->prev = &lru_;
+      e->prev->next = e;
+      e->next->prev = e;
+      if (lru_low_pri_ == &lru_) {
+        lru_low_pri_ = e;
+      }
+    }
     e->SetInHighPriPool(false);
-    lru_low_pri_ = e;
   }
   LRUUsageAdd(e);
 }
@@ -251,6 +298,12 @@ void LRUCacheShardTemplate<CacheMonitor>::EvictFromLRU(
     size_t charge, autovector<LRUHandle*>* deleted) {
   while (usage_ + charge > capacity_ && lru_.next != &lru_) {
     LRUHandle* old = lru_.next;
+    while (old != &lru_ && old->refs > 1) {
+      old = old->next;
+    }
+    if (old == &lru_) {
+      break;
+    }
     assert(old->InCache());
     assert(old->refs == 1);  // LRU list contains elements which may be evicted
     LRU_Remove(old);
@@ -294,7 +347,7 @@ Cache::Handle* LRUCacheShardTemplate<CacheMonitor>::Lookup(const Slice& key,
   LRUHandle* e = table_.Lookup(key, hash);
   if (e != nullptr) {
     assert(e->InCache());
-    if (e->refs == 1 && record_hit) {
+    if (e->refs == 1) {
       LRU_Remove(e);
     }
     e->refs++;
@@ -302,12 +355,12 @@ Cache::Handle* LRUCacheShardTemplate<CacheMonitor>::Lookup(const Slice& key,
       e->SetHit();
     }
   }
-  return reinterpret_cast<Cache::Handle*>(e);
+  return e == nullptr ? nullptr : EncodeHandle(e, !record_hit);
 }
 
 template <class CacheMonitor>
 bool LRUCacheShardTemplate<CacheMonitor>::Ref(Cache::Handle* h) {
-  LRUHandle* handle = reinterpret_cast<LRUHandle*>(h);
+  LRUHandle* handle = UnwrapHandle(h);
   MutexLock l(&mutex_);
   if (handle->InCache() && handle->refs == 1) {
     LRU_Remove(handle);
@@ -331,8 +384,9 @@ bool LRUCacheShardTemplate<CacheMonitor>::Release(Cache::Handle* handle,
   if (handle == nullptr) {
     return false;
   }
-  LRUHandle* e = reinterpret_cast<LRUHandle*>(handle);
+  LRUHandle* e = UnwrapHandle(handle);
   bool last_reference = false;
+  bool no_hit_release = IsNoHitHandle(handle);
   {
     MutexLock l(&mutex_);
     last_reference = Unref(e);
@@ -353,9 +407,10 @@ bool LRUCacheShardTemplate<CacheMonitor>::Release(Cache::Handle* handle,
           TrackErase(e);
         last_reference = true;
       } else if (e->next == nullptr && e->prev == nullptr) {
-        // Entries returned by Lookup(record_hit = false) stay on the LRU list.
-        // Only reinsert entries that were detached earlier.
-        LRU_Insert(e);
+        // Lookup(record_hit=false) suppresses hit/promotion accounting, but it
+        // still detaches a newly referenced entry from the evictable LRU list
+        // to preserve the invariant that LRU entries have refs == 1.
+        LRU_Insert(e, !no_hit_release /* promote */);
       }
     }
   }
@@ -656,17 +711,17 @@ const CacheShard* LRUCacheBase<LRUCacheShardType>::GetShard(int shard) const {
 
 template <class LRUCacheShardType>
 void* LRUCacheBase<LRUCacheShardType>::Value(Handle* handle) {
-  return reinterpret_cast<const LRUHandle*>(handle)->value;
+  return UnwrapHandle(handle)->value;
 }
 
 template <class LRUCacheShardType>
 size_t LRUCacheBase<LRUCacheShardType>::GetCharge(Handle* handle) const {
-  return reinterpret_cast<const LRUHandle*>(handle)->charge;
+  return UnwrapHandle(handle)->charge;
 }
 
 template <class LRUCacheShardType>
 uint32_t LRUCacheBase<LRUCacheShardType>::GetHash(Handle* handle) const {
-  return reinterpret_cast<const LRUHandle*>(handle)->hash;
+  return UnwrapHandle(handle)->hash;
 }
 
 template <class LRUCacheShardType>

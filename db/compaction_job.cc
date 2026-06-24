@@ -35,6 +35,7 @@
 #endif
 
 #include <functional>
+#include <limits>
 #include <memory>
 #include <set>
 #include <thread>
@@ -212,6 +213,8 @@ struct CompactionJob::SubcompactionState {
   uint64_t num_input_records;
   uint64_t num_output_records;
   CompactionJobStats compaction_job_stats;
+  std::vector<std::pair<std::string, SequenceNumber>> dropped_keys;
+  size_t dropped_keys_bytes = 0;
   uint64_t approx_size;
   // An index that used to speed up ShouldStopBefore().
   size_t grandparent_index = 0;
@@ -261,6 +264,8 @@ struct CompactionJob::SubcompactionState {
     num_input_records = std::move(o.num_input_records);
     num_output_records = std::move(o.num_output_records);
     compaction_job_stats = std::move(o.compaction_job_stats);
+    dropped_keys = std::move(o.dropped_keys);
+    dropped_keys_bytes = std::move(o.dropped_keys_bytes);
     approx_size = std::move(o.approx_size);
     grandparent_index = std::move(o.grandparent_index);
     overlapped_bytes = std::move(o.overlapped_bytes);
@@ -336,6 +341,12 @@ struct CompactionJob::SubcompactionState {
     auto user_cmp = [ucmp](const InternalKey& k1, const InternalKey& k2) {
       return ucmp->Compare(k1.user_key(), k2.user_key());
     };
+    auto saturating_add = [](uint64_t a, uint64_t b) {
+      if (a > std::numeric_limits<uint64_t>::max() - b) {
+        return std::numeric_limits<uint64_t>::max();
+      }
+      return a + b;
+    };
 
     // get all blob of inputs, and sort it
     InputBlobInfo input_blob_info;
@@ -401,7 +412,8 @@ struct CompactionJob::SubcompactionState {
         for (auto& b : end_queue.data()) {
           auto ib = rebuild_blob_set.emplace(b->file_number);
           if (ib.second) {
-            total_compaction_bytes += b->ref_bytes;
+            total_compaction_bytes =
+                saturating_add(total_compaction_bytes, b->ref_bytes);
             auto find = score_map.find(b->file_number);
             assert(find != score_map.end());
             double global_score = 1;
@@ -409,7 +421,8 @@ struct CompactionJob::SubcompactionState {
               global_score = find->second;
             }
             target_range_blob_heap.push(TargetRangeBlobItem{
-                b->file_number, b->ref_bytes, global_score / b->ref_bytes});
+                b->file_number, b->ref_bytes,
+                global_score / std::max<uint64_t>(1, b->ref_bytes)});
           }
         }
       }
@@ -439,7 +452,8 @@ struct CompactionJob::SubcompactionState {
 
     uint64_t target_compaction_bytes =
         std::max(max_compaction_bytes,
-                 input_blob_info.input_bytes + target_blob_file_size);
+                 saturating_add(input_blob_info.input_bytes,
+                                target_blob_file_size));
     while (total_compaction_bytes > target_compaction_bytes &&
            target_range_blob_heap.size() > 1) {
       total_compaction_bytes -= target_range_blob_heap.top().ref_bytes;
@@ -544,7 +558,30 @@ struct CompactionJob::SubcompactionState {
       }
       return Status::OK();
     };
-    chash_map<uint64_t, std::pair<FileMetaData*, uint64_t>> blob_map;
+    struct BlobDependenceAccumulator {
+      FileMetaData* meta = nullptr;
+      uint64_t entry_count = 0;
+      uint64_t byte_count = 0;
+      uint64_t byte_count_entry_count = 0;
+    };
+    auto saturating_add = [](uint64_t a, uint64_t b) {
+      if (a > std::numeric_limits<uint64_t>::max() - b) {
+        return std::numeric_limits<uint64_t>::max();
+      }
+      return a + b;
+    };
+    auto mul_div_clamped = [](uint64_t a, uint64_t b, uint64_t denom,
+                              uint64_t upper_bound) {
+      if (denom == 0 || a == 0 || b == 0 || upper_bound == 0) {
+        return uint64_t{0};
+      }
+      unsigned __int128 scaled = static_cast<unsigned __int128>(a) * b / denom;
+      if (scaled > upper_bound) {
+        return upper_bound;
+      }
+      return static_cast<uint64_t>(scaled);
+    };
+    chash_map<uint64_t, BlobDependenceAccumulator> blob_map;
     // collect and sort blob_map of sst
     for (auto& fn : input_sst) {
       auto find = dependence_map.find(fn);
@@ -567,26 +604,57 @@ struct CompactionJob::SubcompactionState {
         }
       }
       assert(start_offset <= end_offset);
-      output->input_bytes += std::max(start_offset, end_offset) - start_offset;
+      output->input_bytes = saturating_add(
+          output->input_bytes,
+          std::max(start_offset, end_offset) - start_offset);
       for (auto& pair : file->prop.dependence) {
         find = dependence_map.find(pair.file_number);
         if (find == dependence_map.end() || find->second->is_gc_forbidden()) {
           continue;
         }
-        auto ib =
-            blob_map.emplace(find->second->fd.GetNumber(),
-                             std::make_pair(find->second, pair.entry_count));
-        if (!ib.second) {
-          ib.first->second.second += pair.entry_count;
-        }
+        auto ib = blob_map.emplace(find->second->fd.GetNumber(),
+                                   BlobDependenceAccumulator{find->second});
+        auto& acc = ib.first->second;
+        acc.entry_count = saturating_add(acc.entry_count, pair.entry_count);
+        acc.byte_count = saturating_add(acc.byte_count, pair.byte_count);
+        // Resolve exact-byte coverage per dependence before aggregating. A
+        // legacy dependence with byte_count != 0 and byte_count_entry_count == 0
+        // means all entries in that dependence have exact bytes; aggregating raw
+        // byte_count_entry_count first would charge those entries again through
+        // average-size fallback when mixed with newer dependences.
+        const uint64_t exact_entries =
+            pair.byte_count == 0
+                ? uint64_t{0}
+                : (pair.byte_count_entry_count == 0
+                       ? pair.entry_count
+                       : std::min(pair.entry_count,
+                                  pair.byte_count_entry_count));
+        acc.byte_count_entry_count =
+            saturating_add(acc.byte_count_entry_count, exact_entries);
       }
     }
     output->blobs.reserve(blob_map.size());
     for (auto& pair : blob_map) {
-      auto meta = pair.second.first;
-      uint64_t total_bytes = meta->fd.GetFileSize();
-      uint64_t ref_bytes =
-          total_bytes * pair.second.second / meta->prop.num_entries;
+      const auto& acc = pair.second;
+      auto meta = acc.meta;
+      const uint64_t total_bytes = meta->fd.GetFileSize();
+      const uint64_t num_entries = meta->prop.num_entries;
+      if (num_entries == 0) {
+        return Status::Corruption(
+            "blob file has zero entries while calculating references");
+      }
+      const uint64_t accounting_bytes = meta->BlobGcAccountingBytes();
+      const uint64_t exact_entries =
+          std::min(acc.entry_count, acc.byte_count_entry_count);
+      const uint64_t missing_entries = acc.entry_count - exact_entries;
+      uint64_t ref_accounting_bytes = std::min(acc.byte_count, accounting_bytes);
+      ref_accounting_bytes = saturating_add(
+          ref_accounting_bytes,
+          mul_div_clamped(accounting_bytes, missing_entries, num_entries,
+                          accounting_bytes));
+      ref_accounting_bytes = std::min(ref_accounting_bytes, accounting_bytes);
+      uint64_t ref_bytes = mul_div_clamped(total_bytes, ref_accounting_bytes,
+                                           accounting_bytes, total_bytes);
       output->blobs.emplace_back(BlobRefInfo{pair.first, meta, ref_bytes});
     }
     std::sort(output->blobs.begin(), output->blobs.end(),
@@ -1443,9 +1511,9 @@ Status CompactionJob::VerifyFiles() {
       // Verify that the table is usable
       // We set for_compaction to false and don't OptimizeForCompactionTableRead
       // here because this is a special case after we finish the table building
-      // No matter whether use_direct_io_for_flush_and_compaction is true, we
-      // will regard this verification as user reads since the goal is to cache
-      // it here for further user reads
+      // Verification is a background sequential read.  Do not populate the
+      // user block cache here; otherwise compaction output verification can
+      // evict foreground hot blocks and hide GC-aware cache behavior.
       auto output_level = compact_->compaction->output_level();
       ReadOptions ro;
       ro.fill_cache = false;
@@ -1500,6 +1568,17 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
 
   if (status.ok()) {
     status = InstallCompactionResults(mutable_cf_options);
+  }
+  if (status.ok()) {
+    auto* hotness_tracker = cfd->hotness_tracker().get();
+    if (hotness_tracker != nullptr) {
+      for (const auto& sub_compact : compact_->sub_compact_states) {
+        for (const auto& dropped_key : sub_compact.dropped_keys) {
+          hotness_tracker->RecordCompactionFeedback(Slice(dropped_key.first),
+                                                    dropped_key.second);
+        }
+      }
+    }
   }
   if (status.ok() && db_options_.block_cache_obsolete_tracking) {
     Compaction* compaction = compact_->compaction;
@@ -1867,7 +1946,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       ShouldReportDetailedTime(env_, stats_), false, &range_del_agg,
       sub_compact->compaction, mutable_cf_options->get_blob_config(),
       compaction_filter, shutting_down_, preserve_deletes_seqnum_,
-      &rebuild_blobs_info.blobs, cfd->hotness_tracker().get()));
+      &rebuild_blobs_info.blobs, cfd->hotness_tracker().get(),
+      &sub_compact->dropped_keys, &sub_compact->dropped_keys_bytes));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
 
@@ -1945,10 +2025,13 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     dict_sample_data.reserve(kSampleBytes);
   }
   // For KV separation, record how many entries and bytes in each blob SST are
-  // still referenced by this output kSST. The byte component is filled from
-  // delta-block value_size metadata and is the key input for precise Blob GC.
-  std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> dependence;
-  const bool precise_gc = mutable_cf_options->precise_gc;
+  // still referenced by this output kSST. Dependence.byte_count is
+  // opportunistic exact metadata: whenever the input iterator can expose
+  // separated value_size (for example from delta-block metadata), persist it
+  // with byte_count_entry_count regardless of the current precise_gc scoring
+  // switch. If precise_gc is enabled later, VersionBuilder can consume the
+  // already-persisted bytes and estimate only legacy/missing entries.
+  std::unordered_map<uint64_t, DependenceAccumulator> dependence;
 
   size_t yield_count = 0;
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid()) {
@@ -1959,12 +2042,17 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     if (c_iter->ikey().type == kTypeValueIndex ||
         c_iter->ikey().type == kTypeMergeIndex) {
       assert(value.file_number() != uint64_t(-1));
-      const uint64_t value_size = precise_gc ? c_iter->value_size() : 0;
-      auto ib = dependence.emplace(value.file_number(),
-                                   std::make_pair(uint64_t{1}, value_size));
-      if (!ib.second) {
-        ++ib.first->second.first;
-        ib.first->second.second += value_size;
+      auto& acc = dependence[value.file_number()];
+      ++acc.entry_count;
+      const uint64_t value_size = c_iter->value_size();
+      if (value_size > 0) {
+        if (acc.byte_count >
+            std::numeric_limits<uint64_t>::max() - value_size) {
+          acc.byte_count = std::numeric_limits<uint64_t>::max();
+        } else {
+          acc.byte_count += value_size;
+        }
+        ++acc.byte_count_entry_count;
       }
     }
 
@@ -2707,8 +2795,7 @@ Status CompactionJob::FinishCompactionOutputFile(
     const Status& input_status, SubcompactionState* sub_compact,
     CompactionRangeDelAggregator* range_del_agg,
     CompactionIterationStats* range_del_out_stats,
-    const std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>>&
-        dependence,
+    const std::unordered_map<uint64_t, DependenceAccumulator>& dependence,
     const Slice* next_table_min_key /* = nullptr */) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_SYNC_FILE);
@@ -2826,7 +2913,9 @@ Status CompactionJob::FinishCompactionOutputFile(
     meta->prop.num_entries = sub_compact->builder->NumEntries();
     for (auto& pair : dependence) {
       meta->prop.dependence.emplace_back(
-          Dependence{pair.first, pair.second.first, pair.second.second});
+          Dependence{pair.first, pair.second.entry_count,
+                     pair.second.byte_count,
+                     pair.second.byte_count_entry_count});
     }
     std::sort(meta->prop.dependence.begin(), meta->prop.dependence.end(),
               TERARK_CMP(file_number, <));

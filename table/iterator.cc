@@ -194,14 +194,16 @@ LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
     }
   }
   if (block_handle != nullptr && value_index.valid()) {
+    // Only newer SSTs that carry delta metadata are known to store a block
+    // handle in value-meta. Legacy value-meta can coincidentally decode as two
+    // varints, so do not infer handle-bearing format from DecodeFrom() alone.
     std::string delta_value_size;
     Status s =
         iter_->GetProperty("rocksdb.delta.value-size", &delta_value_size);
     if (s.ok()) {
       Slice handle_slice = SeparateHelper::DecodeValueMeta(value_index.slice());
       BlockHandle decoded_handle;
-      if (!handle_slice.empty() &&
-          decoded_handle.DecodeFrom(&handle_slice).ok() &&
+      if (!handle_slice.empty() && decoded_handle.DecodeFrom(&handle_slice).ok() &&
           handle_slice.empty()) {
         *block_handle = decoded_handle;
       }

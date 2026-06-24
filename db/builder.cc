@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <limits>
 #include <vector>
 
 #include "db/compaction_iterator.h"
@@ -169,8 +170,10 @@ Status BuildTable(
       TableProperties tp;
       std::unique_ptr<WritableFileWriter> file_writer;
       std::unique_ptr<TableBuilder> builder;
-      FileMetaData* current_output = nullptr;
-      TableProperties* current_prop = nullptr;
+      size_t current_output_index = size_t(-1);
+      size_t current_prop_index = size_t(-1);
+      bool has_current_output = false;
+      bool has_current_prop = false;
     };
 
     struct BuilderSeparateHelper : public SeparateHelper {
@@ -224,6 +227,22 @@ Status BuildTable(
         return LazyBuffer();
       }
     } separate_helper;
+
+    auto current_blob_meta = [&](BlobOutput& bstate) -> FileMetaData& {
+      assert(separate_helper.output != nullptr);
+      assert(bstate.has_current_output);
+      assert(bstate.current_output_index < separate_helper.output->size());
+      return (*separate_helper.output)[bstate.current_output_index];
+    };
+
+    auto current_blob_properties = [&](BlobOutput& bstate) -> TableProperties& {
+      if (separate_helper.prop == nullptr) {
+        return bstate.tp;
+      }
+      assert(bstate.has_current_prop);
+      assert(bstate.current_prop_index < separate_helper.prop->size());
+      return (*separate_helper.prop)[bstate.current_prop_index];
+    };
     if (ioptions.value_meta_extractor_factory != nullptr) {
       ValueExtractorContext context = {column_family_id};
       separate_helper.value_meta_extractor =
@@ -258,18 +277,19 @@ Status BuildTable(
       Status status;
       auto& bstate = separate_helper.blobs[hot_idx];
       TableBuilder* blob_builder = bstate.builder.get();
-      FileMetaData* blob_meta = bstate.current_output;
-      blob_meta->prop.num_entries = blob_builder->NumEntries();
-      blob_meta->prop.num_deletions = 0;
-      blob_meta->prop.purpose = kEssenceSst;
-      blob_meta->prop.flags |= TablePropertyCache::kNoRangeDeletions;
-      status = blob_builder->Finish(&blob_meta->prop, nullptr);
-      TableProperties& tp = *bstate.current_prop;
+      assert(blob_builder != nullptr);
+      FileMetaData& blob_meta = current_blob_meta(bstate);
+      blob_meta.prop.num_entries = blob_builder->NumEntries();
+      blob_meta.prop.num_deletions = 0;
+      blob_meta.prop.purpose = kEssenceSst;
+      blob_meta.prop.flags |= TablePropertyCache::kNoRangeDeletions;
+      status = blob_builder->Finish(&blob_meta.prop, nullptr);
+      TableProperties& tp = current_blob_properties(bstate);
       if (status.ok()) {
-        blob_meta->fd.file_size = blob_builder->FileSize();
+        blob_meta.fd.file_size = blob_builder->FileSize();
         tp = blob_builder->GetTableProperties();
-        blob_meta->prop.raw_key_size = tp.raw_key_size;
-        blob_meta->prop.raw_value_size = tp.raw_value_size;
+        blob_meta.prop.raw_key_size = tp.raw_key_size;
+        blob_meta.prop.raw_value_size = tp.raw_value_size;
         StopWatch sw(env, ioptions.statistics, TABLE_SYNC_MICROS);
         status = bstate.file_writer->Sync(ioptions.use_fsync);
       }
@@ -281,12 +301,12 @@ Status BuildTable(
             "[%s] [JOB %d] [HOTNESS_FLUSH_ROUTE] route:%s file:%" PRIu64
             " entries:%" PRIu64 " bytes:%" PRIu64,
             column_family_name.c_str(), job_id, flush_route_name(hot_idx),
-            blob_meta->fd.GetNumber(), flush_route_keys[hot_idx],
+            blob_meta.fd.GetNumber(), flush_route_keys[hot_idx],
             flush_route_bytes[hot_idx]);
       bstate.file_writer.reset();
       EventHelpers::LogAndNotifyTableFileCreationFinished(
           event_logger, ioptions.listeners, dbname, column_family_name,
-          bstate.fname, job_id, blob_meta->fd, tp,
+          bstate.fname, job_id, blob_meta.fd, tp,
           TableFileCreationReason::kFlush, status);
 
       bstate.builder.reset();
@@ -316,7 +336,6 @@ Status BuildTable(
       auto& bstate = separate_helper.blobs[hot_idx];
 
       TableBuilder* blob_builder = bstate.builder.get();
-      FileMetaData* blob_meta = bstate.current_output;
       auto s = value.fetch();
       if (!s.ok()) {
         return s;
@@ -333,25 +352,28 @@ Status BuildTable(
         TEST_SYNC_POINT_CALLBACK("BuildTable:create_file", &use_direct_writes);
 #endif  // !NDEBUG
         separate_helper.output->emplace_back();
-        blob_meta = bstate.current_output =
-            &separate_helper.output->back();
+        bstate.current_output_index = separate_helper.output->size() - 1;
+        bstate.has_current_output = true;
         if (separate_helper.prop == nullptr) {
-          bstate.current_prop = &bstate.tp;
+          bstate.current_prop_index = size_t(-1);
+          bstate.has_current_prop = false;
         } else {
           separate_helper.prop->emplace_back();
-          bstate.current_prop = &separate_helper.prop->back();
+          bstate.current_prop_index = separate_helper.prop->size() - 1;
+          bstate.has_current_prop = true;
         }
-        blob_meta->fd = FileDescriptor(versions_->NewFileNumber(),
-                                       sst_meta()->fd.GetPathId(), 0);
+        FileMetaData& blob_meta = current_blob_meta(bstate);
+        blob_meta.fd = FileDescriptor(versions_->NewFileNumber(),
+                                      sst_meta()->fd.GetPathId(), 0);
         bstate.fname =
-            TableFileName(ioptions.cf_paths, blob_meta->fd.GetNumber(),
-                          blob_meta->fd.GetPathId());
+            TableFileName(ioptions.cf_paths, blob_meta.fd.GetNumber(),
+                          blob_meta.fd.GetPathId());
         status = NewWritableFile(env, bstate.fname, &blob_file,
                                  env_options);
         if (!status.ok()) {
           EventHelpers::LogAndNotifyTableFileCreationFinished(
               event_logger, ioptions.listeners, dbname, column_family_name,
-              bstate.fname, job_id, blob_meta->fd, TableProperties(), reason, status);
+              bstate.fname, job_id, blob_meta.fd, TableProperties(), reason, status);
           return status;
         }
         blob_file->SetIOPriority(io_priority);
@@ -388,19 +410,20 @@ Status BuildTable(
             RecordTick(ioptions.statistics, HOTNESS_FLUSH_WARM_BYTES,
                        route_record_bytes);
           }
-        blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
+        FileMetaData& blob_meta = current_blob_meta(bstate);
+        blob_meta.UpdateBoundaries(key, GetInternalKeySeqno(key));
         if (value_meta != nullptr &&
             !mutable_cf_options.read_separated_value_by_handle) {
           value_meta->block_handle = BlockHandle();
         }
         if (value_meta == nullptr) {
           status = SeparateHelper::TransToSeparate(
-              key, value, blob_meta->fd.GetNumber(), Slice(),
+              key, value, blob_meta.fd.GetNumber(), Slice(),
               GetInternalKeyType(key) == kTypeMerge, false,
               separate_helper.value_meta_extractor.get());
         } else {
           status = SeparateHelper::TransToSeparate(
-              key, value, blob_meta->fd.GetNumber(), value_meta,
+              key, value, blob_meta.fd.GetNumber(), value_meta,
               GetInternalKeyType(key) == kTypeMerge, false,
               separate_helper.value_meta_extractor.get());
         }
@@ -410,6 +433,9 @@ Status BuildTable(
 
     separate_helper.output = meta_vec;
     separate_helper.prop = table_properties_vec;
+    // Allocation hint only: each flush route can roll over independently and
+    // append more than one blob file, so route state must not depend on vector
+    // element pointer stability.
     separate_helper.output->reserve(separate_helper.output->size() + 3);
     if (separate_helper.prop != nullptr) {
       separate_helper.prop->reserve(separate_helper.prop->size() + 3);
@@ -526,9 +552,15 @@ Status BuildTable(
         assert(sst_meta()->prop.dependence.empty() ||
                blob.fd.GetNumber() >
                    sst_meta()->prop.dependence.back().file_number);
+        const uint64_t accounting_bytes =
+            blob.prop.raw_key_size >
+                    std::numeric_limits<uint64_t>::max() -
+                        blob.prop.raw_value_size
+                ? std::numeric_limits<uint64_t>::max()
+                : blob.prop.raw_key_size + blob.prop.raw_value_size;
         sst_meta()->prop.dependence.emplace_back(
             Dependence{blob.fd.GetNumber(), blob.prop.num_entries,
-                       blob.prop.raw_key_size + blob.prop.raw_value_size});
+                       accounting_bytes, blob.prop.num_entries});
       }
       auto shrinked_snapshots = sst_meta()->ShrinkSnapshot(snapshots);
       s = builder->Finish(&sst_meta()->prop, &shrinked_snapshots);
@@ -569,9 +601,9 @@ Status BuildTable(
       // Verify that the table is usable
       // We set for_compaction to false and don't OptimizeForCompactionTableRead
       // here because this is a special case after we finish the table building
-      // No matter whether use_direct_io_for_flush_and_compaction is true,
-      // we will regrad this verification as user reads since the goal is
-      // to cache it here for further user reads
+      // This is a background verification read. Keep it out of the user block
+      // cache so flush verification does not evict foreground hot blocks or
+      // bias cache-sensitive benchmarks.
       ReadOptions ro;
       ro.fill_cache = false;
       for (auto& meta : *meta_vec) {

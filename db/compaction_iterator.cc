@@ -5,6 +5,8 @@
 
 #include "db/compaction_iterator.h"
 
+#include <limits>
+
 #include "db/snapshot_checker.h"
 #include "port/likely.h"
 #include "rocksdb/listener.h"
@@ -118,7 +120,9 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
     const chash_set<uint64_t>* need_rebuild_blobs,
-    HotnessTracker* hotness_tracker)
+    HotnessTracker* hotness_tracker,
+    std::vector<std::pair<std::string, SequenceNumber>>* dropped_keys,
+    size_t* dropped_keys_bytes)
     : CompactionIterator(
           input, separate_helper, end, cmp, merge_helper, last_sequence,
           snapshots, earliest_write_conflict_snapshot, snapshot_checker, env,
@@ -126,7 +130,8 @@ CompactionIterator::CompactionIterator(
           std::unique_ptr<CompactionProxy>(
               compaction ? new CompactionProxy(compaction) : nullptr),
           blob_config, compaction_filter, shutting_down,
-          preserve_deletes_seqnum, need_rebuild_blobs, hotness_tracker) {}
+          preserve_deletes_seqnum, need_rebuild_blobs, hotness_tracker,
+          dropped_keys, dropped_keys_bytes) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, SeparateHelper* separate_helper, const Slice* end,
@@ -141,7 +146,9 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
     const chash_set<uint64_t>* need_rebuild_blobs,
-    HotnessTracker* hotness_tracker)
+    HotnessTracker* hotness_tracker,
+    std::vector<std::pair<std::string, SequenceNumber>>* dropped_keys,
+    size_t* dropped_keys_bytes)
     : input_(input, separate_helper),
       end_(end),
       cmp_(cmp),
@@ -165,7 +172,9 @@ CompactionIterator::CompactionIterator(
       merge_out_iter_(merge_helper_),
       current_key_committed_(false),
       rebuild_blob_set_(need_rebuild_blobs),
-      hotness_tracker_(hotness_tracker) {
+      hotness_tracker_(hotness_tracker),
+      dropped_keys_(dropped_keys),
+      dropped_keys_bytes_(dropped_keys_bytes) {
   assert(compaction_filter_ == nullptr || compaction_ != nullptr);
   bottommost_level_ =
       compaction_ == nullptr ? false : compaction_->bottommost_level();
@@ -220,7 +229,7 @@ void CompactionIterator::MaybeRecordDroppedKey() {
 }
 
 void CompactionIterator::MaybeRecordDroppedKey(const ParsedInternalKey& ikey) {
-  if (hotness_tracker_ == nullptr) {
+  if (hotness_tracker_ == nullptr || dropped_keys_ == nullptr) {
     return;
   }
   // Only separated values carry a vSST record that blob GC reverse-looks-up
@@ -228,7 +237,33 @@ void CompactionIterator::MaybeRecordDroppedKey(const ParsedInternalKey& ikey) {
   if (ikey.type != kTypeValueIndex && ikey.type != kTypeMergeIndex) {
     return;
   }
-  hotness_tracker_->RecordCompactionFeedback(ikey.user_key, ikey.sequence);
+  // Sequence zero is intentionally reused for bottommost-level rewritten live
+  // keys. A correctness-sensitive drop-key cache entry keyed only by
+  // (user_key, sequence) would therefore be ambiguous for seq==0.
+  if (ikey.sequence == 0) {
+    return;
+  }
+  // This feedback is an opportunistic optimization; a miss only falls back to
+  // the legacy GC reverse lookup. Keep the pre-install staging bounded so a
+  // large overwrite-heavy compaction cannot grow memory without limit before
+  // InstallCompactionResults() succeeds and publishes the entries.
+  constexpr size_t kMaxPendingDroppedKeys = 4096;
+  constexpr size_t kMaxPendingDroppedKeyBytes = 4 * 1024 * 1024;
+  const size_t key_size = ikey.user_key.size();
+  const size_t entry_charge = key_size + sizeof(std::string) +
+                              sizeof(SequenceNumber);
+  if (dropped_keys_->size() >= kMaxPendingDroppedKeys) {
+    return;
+  }
+  if (dropped_keys_bytes_ != nullptr &&
+      (*dropped_keys_bytes_ > kMaxPendingDroppedKeyBytes ||
+       entry_charge > kMaxPendingDroppedKeyBytes - *dropped_keys_bytes_)) {
+    return;
+  }
+  dropped_keys_->emplace_back(ikey.user_key.ToString(), ikey.sequence);
+  if (dropped_keys_bytes_ != nullptr) {
+    *dropped_keys_bytes_ += entry_charge;
+  }
 }
 
 void CompactionIterator::ResetRecordCounts() {
@@ -808,6 +843,20 @@ void CompactionIterator::PrepareOutput() {
       current_key_.UpdateInternalKey(0, ikey_.type);
     }
   };
+  auto set_output_value_size = [this]() -> bool {
+    const size_t internal_key_size = current_key_.GetInternalKey().size();
+    const size_t max_value_size = std::numeric_limits<uint32_t>::max();
+    if (internal_key_size > max_value_size ||
+        value_.size() > max_value_size - internal_key_size) {
+      valid_ = false;
+      status_ = Status::InvalidArgument(
+          "separated value is too large for delta-block value_size metadata");
+      return false;
+    }
+    output_value_meta_.value_size =
+        static_cast<uint32_t>(internal_key_size + value_.size());
+    return true;
+  };
   assert(!do_rebuild_blob_ || compaction_ != nullptr);
   bool do_rebuild_blob =
       do_rebuild_blob_ && rebuild_blob_set_->count(value_.file_number()) > 0;
@@ -866,8 +915,9 @@ void CompactionIterator::PrepareOutput() {
       if (!blob_config_.read_separated_value_by_handle) {
         output_value_meta_.block_handle = BlockHandle();
       }
-      output_value_meta_.value_size =
-          current_key_.GetInternalKey().size() + value_.size();
+      if (!set_output_value_size()) {
+        return;
+      }
       s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_, &output_value_meta_,
           ikey_.type == kTypeMergeIndex, false);
@@ -919,8 +969,9 @@ void CompactionIterator::PrepareOutput() {
           status_ = std::move(s);
           return;
         }
-        output_value_meta_.value_size =
-            current_key_.GetInternalKey().size() + value_.size();
+        if (!set_output_value_size()) {
+          return;
+        }
       }
       auto s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_, &output_value_meta_,

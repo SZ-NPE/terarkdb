@@ -454,6 +454,14 @@ DEFINE_uint64(gc_aware_cache_log_interval, 10000,
               "Log garbage-aware block cache state every N demote/evict "
               "events. 0 disables periodic cache logs.");
 
+DEFINE_bool(enable_gc_aware_cache_aging, false,
+            "Enable epoch-based access frequency aging in garbage-aware block "
+            "cache.");
+
+DEFINE_uint64(gc_aware_cache_aging_interval, 10000,
+              "Advance one garbage-aware cache aging epoch every N cache "
+              "operations.");
+
 DEFINE_int64(simcache_size, -1,
              "Number of bytes to use as a simcache of "
              "uncompressed data. Nagative value disables simcache.");
@@ -1026,6 +1034,15 @@ DEFINE_bool(hotness_enable_compaction_feedback, true,
             "Enable compaction obsolete-version feedback for HotnessTracker");
 DEFINE_bool(hotness_enable_drop_key_cache, true,
             "Enable compaction drop-key cache for blob GC GetKey avoidance");
+DEFINE_uint32(hotness_admit_threshold, 2,
+              "Number of writes within HotnessTracker's recent window before "
+              "admitting a key to the hot flush route");
+DEFINE_uint64(hotness_decay_interval, 0,
+              "Advance one HotnessTracker decay epoch every N RecordWrite "
+              "calls. 0 disables decay");
+DEFINE_uint64(hotness_decay_window, 0,
+              "Mark admitted hot keys cold after this many idle decay epochs. "
+              "0 disables decay");
 
 DEFINE_bool(blob_gc_collect_block_stats, false,
             "Collect blob GC per-block garbage ratio distribution.");
@@ -2446,7 +2463,8 @@ class Benchmark {
   };
 
   std::shared_ptr<Cache> NewCache(int64_t capacity,
-                                  bool enable_obsolete_tracking) {
+                                  bool enable_obsolete_tracking,
+                                  bool allow_gc_aware_cache) {
     if (capacity <= 0) {
       return nullptr;
     }
@@ -2457,13 +2475,18 @@ class Benchmark {
         exit(1);
       }
       return cache;
-    } else if (FLAGS_use_gc_aware_block_cache) {
-      return NewGarbageAwareCache(
-          (size_t)capacity, FLAGS_cache_numshardbits,
-          false /* strict_capacity_limit */,
-          FLAGS_gc_aware_cache_admission_ratio,
-          FLAGS_gc_aware_cache_demote_score_threshold,
-          FLAGS_gc_aware_cache_log_interval);
+    } else if (allow_gc_aware_cache && FLAGS_use_gc_aware_block_cache) {
+      GarbageAwareCacheOptions cache_opts;
+      cache_opts.capacity = static_cast<size_t>(capacity);
+      cache_opts.num_shard_bits = FLAGS_cache_numshardbits;
+      cache_opts.strict_capacity_limit = false;
+      cache_opts.admission_ratio = FLAGS_gc_aware_cache_admission_ratio;
+      cache_opts.demote_score_threshold =
+          FLAGS_gc_aware_cache_demote_score_threshold;
+      cache_opts.log_interval = FLAGS_gc_aware_cache_log_interval;
+      cache_opts.enable_aging = FLAGS_enable_gc_aware_cache_aging;
+      cache_opts.aging_interval = FLAGS_gc_aware_cache_aging_interval;
+      return NewGarbageAwareCache(cache_opts);
     } else {
       LRUCacheOptions cache_opts;
       cache_opts.capacity = static_cast<size_t>(capacity);
@@ -2482,9 +2505,11 @@ class Benchmark {
 
  public:
   Benchmark()
-      : cache_(NewCache(FLAGS_cache_size, true /* enable_obsolete_tracking */)),
+      : cache_(NewCache(FLAGS_cache_size, true /* enable_obsolete_tracking */,
+                        true /* allow_gc_aware_cache */)),
         compressed_cache_(NewCache(FLAGS_compressed_cache_size,
-                                   false /* enable_obsolete_tracking */)),
+                                   false /* enable_obsolete_tracking */,
+                                   false /* allow_gc_aware_cache */)),
         filter_policy_(FLAGS_bloom_bits >= 0
                            ? NewBloomFilterPolicy(FLAGS_bloom_bits,
                                                   FLAGS_use_block_based_filter)
@@ -3682,11 +3707,14 @@ class Benchmark {
     options.hotness_enable_compaction_feedback =
         FLAGS_hotness_enable_compaction_feedback;
     options.hotness_enable_drop_key_cache = FLAGS_hotness_enable_drop_key_cache;
+    options.hotness_admit_threshold = FLAGS_hotness_admit_threshold;
+    options.hotness_decay_interval = FLAGS_hotness_decay_interval;
+    options.hotness_decay_window = FLAGS_hotness_decay_window;
     options.blob_gc_collect_block_stats = FLAGS_blob_gc_collect_block_stats;
     options.blob_gc_collect_latency_stats = FLAGS_blob_gc_collect_latency_stats;
     options.blob_gc_collect_bytes_stats = FLAGS_blob_gc_collect_bytes_stats;
     options.block_cache_obsolete_tracking =
-        FLAGS_block_cache_obsolete_tracking;
+        FLAGS_block_cache_obsolete_tracking || FLAGS_use_gc_aware_block_cache;
     options.block_cache_obsolete_sample_interval_sec =
         FLAGS_block_cache_obsolete_sample_interval_sec;
     options.block_cache_obsolete_topk_files =

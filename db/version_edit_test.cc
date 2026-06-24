@@ -20,7 +20,7 @@ TablePropertyCache GetPropCache(
     uint8_t purpose, std::initializer_list<uint64_t> dependence = {},
     std::initializer_list<uint64_t> inheritance = {}) {
   std::vector<Dependence> dep;
-  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, 0});
+  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, 0, 0});
   return TablePropertyCache{0, 0, 1, 1, 0, purpose, 0, 0, dep, inheritance};
 }
 
@@ -31,7 +31,8 @@ TablePropertyCache GetPropCacheWithBytes(
     std::initializer_list<std::tuple<uint64_t, uint64_t, uint64_t>> dep_list) {
   std::vector<Dependence> dep;
   for (auto& t : dep_list) {
-    dep.emplace_back(Dependence{std::get<0>(t), std::get<1>(t), std::get<2>(t)});
+    dep.emplace_back(Dependence{std::get<0>(t), std::get<1>(t),
+                                std::get<2>(t), std::get<1>(t)});
   }
   return TablePropertyCache{0, 0, 1, 1, 0, purpose, 0, 0, dep, {}};
 }
@@ -262,15 +263,18 @@ TEST_F(VersionEditTest, DependenceByteCountRoundTrip) {
   ASSERT_EQ(10U, dep0[0].file_number);
   ASSERT_EQ(5U, dep0[0].entry_count);
   ASSERT_EQ(4096U, dep0[0].byte_count);
+  ASSERT_EQ(5U, dep0[0].byte_count_entry_count);
   ASSERT_EQ(11U, dep0[1].file_number);
   ASSERT_EQ(3U, dep0[1].entry_count);
   ASSERT_EQ(2048U, dep0[1].byte_count);
+  ASSERT_EQ(3U, dep0[1].byte_count_entry_count);
 
   auto& dep1 = new_files[1].second.prop.dependence;
   ASSERT_EQ(1U, dep1.size());
   ASSERT_EQ(10U, dep1[0].file_number);
   ASSERT_EQ(1U, dep1[0].entry_count);
   ASSERT_EQ(1024U, dep1[0].byte_count);
+  ASSERT_EQ(1U, dep1[0].byte_count_entry_count);
 }
 
 // precise_gc: verify that a pre-byte_count manifest (byte_count==0) decodes
@@ -290,6 +294,8 @@ TEST_F(VersionEditTest, DependenceByteCountDefaultsToZero) {
   ASSERT_EQ(2U, dep.size());
   ASSERT_EQ(0U, dep[0].byte_count);
   ASSERT_EQ(0U, dep[1].byte_count);
+  ASSERT_EQ(0U, dep[0].byte_count_entry_count);
+  ASSERT_EQ(0U, dep[1].byte_count_entry_count);
 }
 
 }  // namespace TERARKDB_NAMESPACE

@@ -236,6 +236,9 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
       for (auto& dependence : f.prop.dependence) {
         PutVarint64(&encode_property_cache, dependence.byte_count);
       }
+      for (auto& dependence : f.prop.dependence) {
+        PutVarint64(&encode_property_cache, dependence.byte_count_entry_count);
+      }
       PutLengthPrefixedSlice(dst, encode_property_cache);
     }
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
@@ -361,7 +364,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &file_number)) {
                 return error_msg;
               }
-              f.prop.dependence.emplace_back(Dependence{file_number, 0, 0});
+              f.prop.dependence.emplace_back(Dependence{file_number, 0, 0, 0});
             }
             if (!field.empty()) {
               if (!GetVarint64(&field, &f.prop.num_entries)) {
@@ -421,6 +424,14 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               // so VersionBuilder falls back to averaged estimation.
               for (auto& dependence : f.prop.dependence) {
                 if (!GetVarint64(&field, &dependence.byte_count)) {
+                  return error_msg;
+                }
+              }
+            }
+            if (!field.empty()) {
+              for (auto& dependence : f.prop.dependence) {
+                if (!GetVarint64(&field,
+                                 &dependence.byte_count_entry_count)) {
                   return error_msg;
                 }
               }

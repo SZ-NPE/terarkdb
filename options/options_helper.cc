@@ -192,6 +192,9 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
       mutable_cf_options.hotness_enable_compaction_feedback;
   cf_opts.hotness_enable_drop_key_cache =
       mutable_cf_options.hotness_enable_drop_key_cache;
+  cf_opts.hotness_admit_threshold = mutable_cf_options.hotness_admit_threshold;
+  cf_opts.hotness_decay_interval = mutable_cf_options.hotness_decay_interval;
+  cf_opts.hotness_decay_window = mutable_cf_options.hotness_decay_window;
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.read_separated_value_by_handle =
       mutable_cf_options.read_separated_value_by_handle;
@@ -2002,6 +2005,15 @@ std::unordered_map<std::string, OptionTypeInfo>
         {"hotness_enable_drop_key_cache",
          {offset_of(&ColumnFamilyOptions::hotness_enable_drop_key_cache),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"hotness_admit_threshold",
+         {offset_of(&ColumnFamilyOptions::hotness_admit_threshold),
+          OptionType::kUInt32T, OptionVerificationType::kNormal, false, 0}},
+        {"hotness_decay_interval",
+         {offset_of(&ColumnFamilyOptions::hotness_decay_interval),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, false, 0}},
+        {"hotness_decay_window",
+         {offset_of(&ColumnFamilyOptions::hotness_decay_window),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, false, 0}},
         {"blob_large_key_ratio",
          {offset_of(&ColumnFamilyOptions::blob_large_key_ratio),
           OptionType::kDouble, OptionVerificationType::kNormal, true,

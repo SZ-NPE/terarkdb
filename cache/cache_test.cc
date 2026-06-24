@@ -753,6 +753,324 @@ TEST(GarbageAwareCacheTest, ProbationEvictsLowestScore) {
   ASSERT_EQ(1U, stats->getTickerCount(GC_AWARE_CACHE_EVICT_LOW_SCORE));
 }
 
+TEST(GarbageAwareCacheTest, AccessFrequencyAgingLetsNewHotReplaceOldHot) {
+  auto run_phase = [](bool enable_aging) {
+    GarbageAwareCacheOptions options;
+    options.capacity = 4;
+    options.admission_ratio = 0.25;
+    options.log_interval = 0;
+    options.enable_aging = enable_aging;
+    options.aging_interval = 1;
+    auto cache = NewGarbageAwareCache(options);
+
+    BlockCacheMetadata old_meta;
+    old_meta.is_blob_file = true;
+    old_meta.is_data_block = true;
+    old_meta.garbage_ratio = 0.9;
+
+    BlockCacheMetadata fresh_meta;
+    fresh_meta.is_blob_file = true;
+    fresh_meta.is_data_block = true;
+    fresh_meta.garbage_ratio = 0.1;
+
+    ASSERT_OK(cache->InsertWithMetadata("old-hot", EncodeValue(1), 1,
+                                        dumbDeleter, &old_meta));
+    ASSERT_OK(cache->InsertWithMetadata("keep", EncodeValue(2), 1,
+                                        dumbDeleter, &fresh_meta));
+
+    // `old-hot` is now in probation. Make it a strong historical hotspot even
+    // though its file is mostly garbage.
+    for (int i = 0; i < 16; ++i) {
+      Cache::Handle* h = cache->Lookup("old-hot");
+      ASSERT_NE(nullptr, h);
+      cache->Release(h);
+    }
+
+    ASSERT_OK(cache->InsertWithMetadata("dummy", EncodeValue(3), 1,
+                                        dumbDeleter, &fresh_meta));
+
+    if (enable_aging) {
+      // Advance epochs through unrelated activity. The old hotspot is idle, so
+      // its access_freq will be aged lazily when eviction pressure refreshes
+      // probation scores.
+      for (int i = 0; i < 8; ++i) {
+        Cache::Handle* h = cache->Lookup("dummy");
+        ASSERT_NE(nullptr, h);
+        cache->Release(h);
+      }
+    }
+
+    ASSERT_OK(cache->InsertWithMetadata("new-hot", EncodeValue(4), 1,
+                                        dumbDeleter, &fresh_meta));
+    for (int i = 0; i < 4; ++i) {
+      Cache::Handle* h = cache->Lookup("new-hot");
+      ASSERT_NE(nullptr, h);
+      cache->Release(h);
+    }
+    ASSERT_OK(cache->InsertWithMetadata("pressure", EncodeValue(5), 1,
+                                        dumbDeleter, &fresh_meta));
+
+    Cache::Handle* old = cache->Lookup("old-hot");
+    Cache::Handle* fresh = cache->Lookup("keep");
+    Cache::Handle* new_hot = cache->Lookup("new-hot");
+    if (enable_aging) {
+      EXPECT_EQ(nullptr, old);
+      ASSERT_NE(nullptr, fresh);
+      ASSERT_NE(nullptr, new_hot);
+    } else {
+      ASSERT_NE(nullptr, old);
+      EXPECT_EQ(nullptr, fresh);
+      ASSERT_NE(nullptr, new_hot);
+    }
+    if (old != nullptr) cache->Release(old);
+    if (fresh != nullptr) cache->Release(fresh);
+    if (new_hot != nullptr) cache->Release(new_hot);
+  };
+
+  run_phase(false /* enable_aging */);
+  run_phase(true /* enable_aging */);
+}
+
+TEST(GarbageAwareCacheTest, AdmissionOverflowProtectsHighPriorityBlocks) {
+  GarbageAwareCacheOptions options;
+  options.capacity = 4;
+  options.admission_ratio = 0.5;
+  options.log_interval = 0;
+  auto cache = NewGarbageAwareCache(options);
+  auto* ga_cache = dynamic_cast<GarbageAwareCache*>(cache.get());
+  ASSERT_NE(nullptr, ga_cache);
+
+  BlockCacheMetadata meta;
+  meta.is_blob_file = true;
+  meta.is_data_block = true;
+  meta.garbage_ratio = 0.9;
+
+  ASSERT_OK(cache->Insert("high", EncodeValue(100), 1, dumbDeleter, nullptr,
+                          Cache::Priority::HIGH));
+  ASSERT_OK(cache->InsertWithMetadata("low-garbage", EncodeValue(1), 1,
+                                      dumbDeleter, &meta));
+  ASSERT_OK(cache->Insert("low-normal", EncodeValue(2), 1, dumbDeleter));
+
+  // Admission capacity is 2. The old policy inspected the LRU tail and evicted
+  // the high-priority block directly. The fixed policy scans for a low-priority
+  // garbage-aware block to demote first.
+  ASSERT_EQ(2U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(1U, ga_cache->TEST_GetProbationSize());
+
+  Cache::Handle* high = cache->Lookup("high");
+  ASSERT_NE(nullptr, high);
+  ASSERT_EQ(100, DecodeValue(cache->Value(high)));
+  cache->Release(high);
+}
+
+TEST(GarbageAwareCacheTest, AdmissionOverflowEvictsLowPriorityBeforeHigh) {
+  GarbageAwareCacheOptions options;
+  options.capacity = 4;
+  options.admission_ratio = 0.5;
+  options.log_interval = 0;
+  auto cache = NewGarbageAwareCache(options);
+
+  ASSERT_OK(cache->Insert("high", EncodeValue(100), 1, dumbDeleter, nullptr,
+                          Cache::Priority::HIGH));
+  ASSERT_OK(cache->Insert("low0", EncodeValue(1), 1, dumbDeleter));
+  ASSERT_OK(cache->Insert("low1", EncodeValue(2), 1, dumbDeleter));
+
+  Cache::Handle* high = cache->Lookup("high");
+  ASSERT_NE(nullptr, high);
+  ASSERT_EQ(100, DecodeValue(cache->Value(high)));
+  cache->Release(high);
+
+  ASSERT_EQ(nullptr, cache->Lookup("low0"));
+  Cache::Handle* low1 = cache->Lookup("low1");
+  ASSERT_NE(nullptr, low1);
+  cache->Release(low1);
+}
+
+TEST(GarbageAwareCacheTest, ObsoleteFileMarksBlocksForProbationAndEviction) {
+  GarbageAwareCacheOptions options;
+  options.capacity = 5;
+  options.admission_ratio = 0.2;
+  options.log_interval = 0;
+  auto cache = NewGarbageAwareCache(options);
+  auto* ga_cache = dynamic_cast<GarbageAwareCache*>(cache.get());
+  ASSERT_NE(nullptr, ga_cache);
+
+  BlockCacheMetadata meta;
+  meta.is_blob_file = true;
+  meta.is_data_block = true;
+  meta.file_number = 100;
+  meta.garbage_ratio = 0.0;
+
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(cache->InsertWithMetadata(std::string("old") + ToString(i),
+                                        EncodeValue(i), 1, dumbDeleter,
+                                        &meta));
+  }
+
+  // Make obsolete-file blocks hot enough that insertion-time score alone would
+  // not evict them before fresh blocks. MarkBlockCacheFilesObsolete should
+  // reset their garbage ratio to 1.0 and move them to probation.
+  for (int round = 0; round < 3; ++round) {
+    for (int i = 0; i < 4; ++i) {
+      Cache::Handle* h = cache->Lookup(std::string("old") + ToString(i));
+      ASSERT_NE(nullptr, h);
+      cache->Release(h);
+    }
+  }
+
+  cache->MarkBlockCacheFilesObsolete({100}, {}, "unit-test", 7);
+  ASSERT_EQ(0U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(4U, ga_cache->TEST_GetProbationSize());
+
+  meta.file_number = 200;
+  ASSERT_OK(cache->InsertWithMetadata("fresh0", EncodeValue(100), 1,
+                                      dumbDeleter, &meta));
+  ASSERT_OK(cache->InsertWithMetadata("fresh1", EncodeValue(101), 1,
+                                      dumbDeleter, &meta));
+
+  int old_resident = 0;
+  for (int i = 0; i < 4; ++i) {
+    Cache::Handle* h = cache->Lookup(std::string("old") + ToString(i),
+                                     nullptr);
+    if (h != nullptr) {
+      ++old_resident;
+      cache->Release(h);
+    }
+  }
+  ASSERT_LT(old_resident, 4);
+
+  Cache::Handle* fresh = cache->Lookup("fresh1");
+  ASSERT_NE(nullptr, fresh);
+  ASSERT_EQ(101, DecodeValue(cache->Value(fresh)));
+  cache->Release(fresh);
+}
+
+TEST(GarbageAwareCacheTest, ObsoletePinnedBlockRemainsSafeUntilRelease) {
+  auto cache = NewGarbageAwareCache(3, 0, false, 0.34, 0.0, 0);
+
+  BlockCacheMetadata meta;
+  meta.is_blob_file = true;
+  meta.is_data_block = true;
+  meta.file_number = 100;
+  meta.garbage_ratio = 0.0;
+
+  Cache::Handle* pinned = nullptr;
+  ASSERT_OK(cache->InsertWithMetadata("pinned", EncodeValue(1), 1, dumbDeleter,
+                                      &meta, &pinned));
+  ASSERT_NE(nullptr, pinned);
+
+  cache->MarkBlockCacheFilesObsolete({100}, {}, "unit-test", 8);
+  ASSERT_EQ(1, DecodeValue(cache->Value(pinned)));
+
+  cache->Release(pinned);
+  ASSERT_OK(cache->InsertWithMetadata("new0", EncodeValue(2), 1, dumbDeleter,
+                                      &meta));
+  ASSERT_OK(cache->InsertWithMetadata("new1", EncodeValue(3), 1, dumbDeleter,
+                                      &meta));
+}
+
+TEST(GarbageAwareCacheTest, LookupWithoutRecordHitDoesNotRefreshAdmissionLru) {
+  auto cache = NewGarbageAwareCache(2, 0, false, 1.0, 0.0, 0);
+  ASSERT_OK(cache->Insert("a", EncodeValue(1), 1, dumbDeleter));
+  ASSERT_OK(cache->Insert("b", EncodeValue(2), 1, dumbDeleter));
+
+  Cache::Handle* a = cache->Lookup("a", 0 /* hash */, false /* record_hit */);
+  ASSERT_NE(nullptr, a);
+  cache->Release(a);
+
+  ASSERT_OK(cache->Insert("c", EncodeValue(3), 1, dumbDeleter));
+
+  ASSERT_EQ(nullptr, cache->Lookup("a"));
+  Cache::Handle* b = cache->Lookup("b");
+  ASSERT_NE(nullptr, b);
+  cache->Release(b);
+}
+
+TEST(GarbageAwareCacheTest, LookupWithoutRecordHitDoesNotDemote) {
+  auto cache = NewGarbageAwareCache(2, 0, false, 1.0, 0.0, 0);
+  auto* ga_cache = dynamic_cast<GarbageAwareCache*>(cache.get());
+  ASSERT_NE(nullptr, ga_cache);
+
+  BlockCacheMetadata meta;
+  meta.is_blob_file = true;
+  meta.is_data_block = true;
+  meta.garbage_ratio = 1.0;
+
+  ASSERT_OK(cache->InsertWithMetadata("a", EncodeValue(1), 1, dumbDeleter,
+                                      &meta));
+  ASSERT_EQ(1U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(0U, ga_cache->TEST_GetProbationSize());
+
+  Cache::Handle* no_hit =
+      cache->Lookup("a", 0 /* hash */, false /* record_hit */);
+  ASSERT_NE(nullptr, no_hit);
+  cache->Release(no_hit);
+  ASSERT_EQ(1U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(0U, ga_cache->TEST_GetProbationSize());
+
+  Cache::Handle* hit = cache->Lookup("a");
+  ASSERT_NE(nullptr, hit);
+  cache->Release(hit);
+  ASSERT_EQ(0U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(1U, ga_cache->TEST_GetProbationSize());
+}
+
+TEST(GarbageAwareCacheTest, OverlappingHitDoesNotClearNoHitLookupState) {
+  auto cache = NewGarbageAwareCache(2, 0, false, 1.0, 0.0, 0);
+  auto* ga_cache = dynamic_cast<GarbageAwareCache*>(cache.get());
+  ASSERT_NE(nullptr, ga_cache);
+
+  BlockCacheMetadata meta;
+  meta.is_blob_file = true;
+  meta.is_data_block = true;
+  meta.garbage_ratio = 1.0;
+
+  ASSERT_OK(cache->InsertWithMetadata("a", EncodeValue(1), 1, dumbDeleter,
+                                      &meta));
+
+  Cache::Handle* no_hit =
+      cache->Lookup("a", 0 /* hash */, false /* record_hit */);
+  ASSERT_NE(nullptr, no_hit);
+  Cache::Handle* hit = cache->Lookup("a");
+  ASSERT_NE(nullptr, hit);
+
+  cache->Release(no_hit);
+  ASSERT_EQ(0U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(0U, ga_cache->TEST_GetProbationSize());
+
+  cache->Release(hit);
+  ASSERT_EQ(0U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(1U, ga_cache->TEST_GetProbationSize());
+}
+
+TEST(GarbageAwareCacheTest, NoHitReleaseStaysNoHitWhenReleasedAfterHit) {
+  auto cache = NewGarbageAwareCache(2, 0, false, 1.0, 0.0, 0);
+  auto* ga_cache = dynamic_cast<GarbageAwareCache*>(cache.get());
+  ASSERT_NE(nullptr, ga_cache);
+
+  BlockCacheMetadata meta;
+  meta.is_blob_file = true;
+  meta.is_data_block = true;
+  meta.garbage_ratio = 1.0;
+
+  ASSERT_OK(cache->InsertWithMetadata("a", EncodeValue(1), 1, dumbDeleter,
+                                      &meta));
+
+  Cache::Handle* no_hit =
+      cache->Lookup("a", 0 /* hash */, false /* record_hit */);
+  ASSERT_NE(nullptr, no_hit);
+  Cache::Handle* hit = cache->Lookup("a");
+  ASSERT_NE(nullptr, hit);
+
+  cache->Release(hit);
+  ASSERT_EQ(0U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(0U, ga_cache->TEST_GetProbationSize());
+
+  cache->Release(no_hit);
+  ASSERT_EQ(1U, ga_cache->TEST_GetAdmissionSize());
+  ASSERT_EQ(0U, ga_cache->TEST_GetProbationSize());
+}
+
 TEST(GarbageAwareCacheTest, StrictCapacityRejectsPinnedOverflow) {
   auto cache = NewGarbageAwareCache(1, 0, true);
 
@@ -772,6 +1090,22 @@ TEST(GarbageAwareCacheTest, StrictCapacityRejectsPinnedOverflow) {
   ASSERT_EQ(nullptr, cache->Lookup("b"));
 
   cache->Release(first);
+}
+
+TEST(GarbageAwareCacheTest, StrictCapacityFailedSameKeyInsertKeepsOldEntry) {
+  auto cache = NewGarbageAwareCache(1, 0, true, 1.0, 0.0, 0);
+
+  ASSERT_OK(cache->Insert("a", EncodeValue(1), 1, dumbDeleter));
+
+  Cache::Handle* oversized = nullptr;
+  Status s = cache->Insert("a", EncodeValue(2), 2, dumbDeleter, &oversized);
+  ASSERT_TRUE(s.IsIncomplete());
+  ASSERT_EQ(nullptr, oversized);
+
+  Cache::Handle* old = cache->Lookup("a");
+  ASSERT_NE(nullptr, old);
+  ASSERT_EQ(1, DecodeValue(cache->Value(old)));
+  cache->Release(old);
 }
 
 TEST(GarbageAwareCacheTest, HonorsShardBits) {

@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -69,6 +70,78 @@ TEST_F(HotnessTrackerTest, RepeatedWritesBecomeHot) {
   ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kEphemeral);
+}
+
+TEST_F(HotnessTrackerTest, ThresholdTwoPreservesSecondWriteHot) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.admit_threshold = 2;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("threshold_two_key");
+  tracker.RecordWrite(key);
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
+  tracker.RecordWrite(key);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kEphemeral);
+}
+
+TEST_F(HotnessTrackerTest, ThresholdThreeNeedsThirdWrite) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.admit_threshold = 3;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice key("threshold_three_key");
+  tracker.RecordWrite(key);
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
+  tracker.RecordWrite(key);
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
+  ASSERT_EQ(tracker.ClassifyForFlush(key), HotnessTracker::FlushRoute::kWarm);
+  tracker.RecordWrite(key);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kEphemeral);
+}
+
+TEST_F(HotnessTrackerTest, DecayExpiresIdleHotKey) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.admit_threshold = 2;
+  options.decay_interval = 1;
+  options.decay_window = 2;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice hot_key("decay_hot_key");
+  tracker.RecordWrite(hot_key);
+  tracker.RecordWrite(hot_key);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(hot_key));
+
+  tracker.RecordWrite("phase_shift_1");
+  tracker.RecordWrite("phase_shift_2");
+  tracker.RecordWrite("phase_shift_3");
+
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(hot_key));
+  ASSERT_EQ(tracker.ClassifyForFlush(hot_key),
+            HotnessTracker::FlushRoute::kWarm);
+}
+
+TEST_F(HotnessTrackerTest, DecayAdvancesWhenWriteWindowDisabled) {
+  HotnessTracker::Options options = MakeTestOptions();
+  options.enable_write_window = false;
+  options.decay_interval = 1;
+  options.decay_window = 2;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  Slice hot_key("feedback_hot_key");
+  tracker.RecordCompactionFeedback(hot_key);
+  ASSERT_TRUE(tracker.TEST_HotCacheContains(hot_key));
+
+  tracker.RecordWrite("phase_shift_1");
+  tracker.RecordWrite("phase_shift_2");
+  tracker.RecordWrite("phase_shift_3");
+
+  ASSERT_FALSE(tracker.TEST_HotCacheContains(hot_key));
+  ASSERT_EQ(tracker.ClassifyForFlush(hot_key),
+            HotnessTracker::FlushRoute::kWarm);
 }
 
 // (c) Compaction feedback is confirmed overwrite evidence and promotes directly.
@@ -262,6 +335,7 @@ TEST_F(HotnessTrackerTest, ZeroHotCapacityDisablesHotAndDropKeyCaches) {
   tracker.RecordWrite(key);
 
   ASSERT_FALSE(tracker.DropKeyCacheEnabled());
+  ASSERT_FALSE(tracker.TEST_RecentWindowContains(key));
   ASSERT_FALSE(tracker.TEST_HotCacheContains(key));
   ASSERT_FALSE(tracker.IsDropped(key, 123 /* seq */));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
@@ -453,6 +527,20 @@ void CollectSstHints(TrackHintEnv* track_env, bool* found_short,
   }
 }
 
+int CountSstHints(TrackHintEnv* track_env, Env::WriteLifeTimeHint hint) {
+  int count = 0;
+  MutexLock l(&track_env->mutex_);
+  for (const auto& pair : track_env->file_hints_) {
+    if (pair.first.find(".sst") == std::string::npos) {
+      continue;
+    }
+    if (pair.second == hint) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 void TrackHintWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
   {
     MutexLock l(&env_->mutex_);
@@ -508,6 +596,143 @@ TEST_F(AdaptiveHotnessRoutingTest, RepeatedWritesRouteToHotBlob) {
   Close();
   ASSERT_TRUE(found_short);
   ASSERT_TRUE(found_medium);
+}
+
+TEST_F(AdaptiveHotnessRoutingTest, InterleavedRoutesRollBlobFilesSafely) {
+  TrackHintEnv track_env(env_);
+  Options options = CurrentOptions();
+  options.env = &track_env;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+
+  options.blob_size = 0;
+  options.enable_hotness_tracker = true;
+  options.hotness_window_capacity = 1 << 20;
+  options.hotness_hot_capacity = 1 << 20;
+  options.hotness_enable_write_window = true;
+  options.hotness_enable_compaction_feedback = true;
+  options.target_blob_file_size = 1024;
+
+  DestroyAndReopen(options);
+
+  const std::string large_value(4096, 'v');
+  std::vector<std::string> keys;
+  keys.reserve(24);
+  for (int i = 0; i < 24; ++i) {
+    std::string key = std::string("k") + (i < 10 ? "0" : "") +
+                      std::to_string(i);
+    keys.push_back(key);
+    if (i % 2 == 0) {
+      ASSERT_OK(Put(key, "old" + large_value));
+      ASSERT_OK(Put(key, "new" + large_value));
+    } else {
+      ASSERT_OK(Put(key, "cold" + large_value));
+    }
+  }
+
+  {
+    MutexLock l(&track_env.mutex_);
+    track_env.file_hints_.clear();
+  }
+
+  Flush();
+
+  // The tiny target blob size plus interleaved key order keeps both hot and
+  // warm routes open while each route rolls to additional blob files. This used
+  // to invalidate BlobOutput's saved vector element pointers when metadata
+  // vectors reallocated.
+  ASSERT_EQ(12U, options.statistics->getTickerCount(HOTNESS_FLUSH_HOT_KEYS));
+  ASSERT_EQ(12U, options.statistics->getTickerCount(HOTNESS_FLUSH_WARM_KEYS));
+  ASSERT_GT(options.statistics->getTickerCount(HOTNESS_FLUSH_HOT_BYTES), 0U);
+  ASSERT_GT(options.statistics->getTickerCount(HOTNESS_FLUSH_WARM_BYTES), 0U);
+
+  auto* cfd = dbfull()
+                  ->TEST_GetVersionSet()
+                  ->GetColumnFamilySet()
+                  ->GetColumnFamily("default");
+  ASSERT_NE(nullptr, cfd);
+  auto* vstorage = cfd->current()->storage_info();
+  const auto& l0_files = vstorage->LevelFiles(0);
+  ASSERT_EQ(1U, l0_files.size());
+
+  const auto& dependence = l0_files[0]->prop.dependence;
+  ASSERT_GE(dependence.size(), 4U);
+  ASSERT_GE(NumTableFilesAtLevel(-1), static_cast<int>(dependence.size()));
+
+  const auto& dependence_map = vstorage->dependence_map();
+  std::set<uint64_t> seen_blob_numbers;
+  uint64_t prev_blob_number = 0;
+  for (const auto& dep : dependence) {
+    ASSERT_GT(dep.file_number, prev_blob_number);
+    ASSERT_TRUE(seen_blob_numbers.insert(dep.file_number).second);
+    ASSERT_GT(dep.entry_count, 0U);
+    ASSERT_GT(dep.byte_count, 0U);
+
+    auto found = dependence_map.find(dep.file_number);
+    ASSERT_NE(dependence_map.end(), found);
+    ASSERT_NE(nullptr, found->second);
+    ASSERT_EQ(dep.file_number, found->second->fd.GetNumber());
+    ASSERT_EQ(kEssenceSst, found->second->prop.purpose);
+    ASSERT_GT(found->second->fd.GetFileSize(), 0U);
+    ASSERT_GT(found->second->prop.num_entries, 0U);
+    ASSERT_LE(found->second->smallest.user_key().ToString(),
+              found->second->largest.user_key().ToString());
+    prev_blob_number = dep.file_number;
+  }
+
+  int hot_blob_count = 0;
+  int warm_blob_count = 0;
+  {
+    MutexLock l(&track_env.mutex_);
+    for (const auto& pair : track_env.file_hints_) {
+      size_t pos = pair.first.find_last_of('/');
+      const std::string basename =
+          (pos == std::string::npos) ? pair.first : pair.first.substr(pos + 1);
+      uint64_t file_number = 0;
+      FileType file_type;
+      if (!ParseFileName(basename, &file_number, &file_type) ||
+          file_type != kTableFile || seen_blob_numbers.count(file_number) == 0) {
+        continue;
+      }
+      if (pair.second == Env::WLTH_SHORT) {
+        ++hot_blob_count;
+      } else if (pair.second == Env::WLTH_MEDIUM) {
+        ++warm_blob_count;
+      }
+    }
+  }
+  ASSERT_GE(hot_blob_count, 2);
+  ASSERT_GE(warm_blob_count, 2);
+  ASSERT_EQ(dependence.size(),
+            static_cast<size_t>(hot_blob_count + warm_blob_count));
+
+  for (int i = 0; i < 24; ++i) {
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), keys[i], &value));
+    if (i % 2 == 0) {
+      ASSERT_EQ("new" + large_value, value);
+    } else {
+      ASSERT_EQ("cold" + large_value, value);
+    }
+  }
+
+  // Reopen forces manifest/table metadata to round-trip. If blob metadata was
+  // corrupted by dangling vector element pointers, this tends to fail either at
+  // open time or when resolving separated values below.
+  Options reopen_options = options;
+  reopen_options.env = env_;
+  ASSERT_OK(TryReopen(reopen_options));
+
+  for (int i = 0; i < 24; ++i) {
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), keys[i], &value));
+    if (i % 2 == 0) {
+      ASSERT_EQ("new" + large_value, value);
+    } else {
+      ASSERT_EQ("cold" + large_value, value);
+    }
+  }
 }
 
 // With the hotness tracker disabled the DB must behave exactly as before:

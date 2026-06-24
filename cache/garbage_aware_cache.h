@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "cache/sharded_cache.h"
@@ -24,7 +25,8 @@ class GarbageAwareCacheShard : public CacheShard {
  public:
   GarbageAwareCacheShard(size_t capacity, bool strict_capacity_limit,
                          double admission_ratio, double demote_score_threshold,
-                         uint64_t log_interval);
+                         uint64_t log_interval, bool enable_aging,
+                         uint64_t aging_interval);
   ~GarbageAwareCacheShard() override;
 
   Status Insert(const Slice& key, uint32_t hash, void* value, size_t charge,
@@ -53,6 +55,12 @@ class GarbageAwareCacheShard : public CacheShard {
                               bool thread_safe) override;
   void EraseUnRefEntries() override;
   std::string GetPrintableOptions() const override;
+  void MarkBlockCacheFilesObsolete(
+      const std::vector<uint64_t>& file_numbers,
+      const std::vector<uint64_t>& output_file_numbers, const char* reason,
+      uint64_t job_id, Logger* info_log = nullptr);
+  void LogBlockCacheObsoleteSample(const char* reason, uint64_t job_id,
+                                   Logger* info_log = nullptr);
 
   void* Value(Cache::Handle* handle);
   size_t GetCharge(Cache::Handle* handle) const;
@@ -88,8 +96,12 @@ class GarbageAwareCacheShard : public CacheShard {
     bool in_admission = true;
     bool in_queue = false;
     bool garbage_aware = false;
+    uint64_t file_number = 0;
+    bool is_data_block = false;
+    bool is_blob_file = false;
     Cache::Priority priority = Cache::Priority::LOW;
     uint64_t access_freq = 1;
+    uint64_t last_epoch = 0;
     double garbage_ratio = 0.0;
     double score = 1.0;
     std::list<GAHandle*>::iterator lru_it;
@@ -103,19 +115,30 @@ class GarbageAwareCacheShard : public CacheShard {
                     void (*deleter)(const Slice& key, void* value),
                     const BlockCacheMetadata* metadata, uint32_t hash,
                     Cache::Handle** handle, Cache::Priority priority);
+  static bool IsNoHitHandle(Cache::Handle* handle);
+  static GAHandle* UnwrapHandle(Cache::Handle* handle);
+  static Cache::Handle* EncodeHandle(GAHandle* handle, bool no_hit);
   void FreeEntry(GAHandle* h);
   void DeleteHandleOnly(GAHandle* h);
   bool Unref(GAHandle* h);
   void RemoveFromQueue(GAHandle* h);
-  void AddToQueue(GAHandle* h);
+  void AddToQueue(GAHandle* h, bool promote = true);
   void RemoveFromCache(GAHandle* h);
+  void AddToFileIndex(GAHandle* h);
+  void RemoveFromFileIndex(GAHandle* h);
   void MoveToProbation(GAHandle* h);
+  void AdvanceAgingEpoch();
+  void ApplyAccessFreqAging(GAHandle* h);
   void UpdateScore(GAHandle* h);
+  void RefreshProbationScoresForAging();
+  GAHandle* FindAdmissionVictim(bool require_garbage_aware,
+                                bool require_low_priority);
   void EvictIfNeeded(std::vector<GAHandle*>* deleted);
   void MaybeLogLocked(const BlockCacheMetadata* metadata);
 
   mutable port::Mutex mutex_;
   std::unordered_map<std::string, GAHandle*> table_;
+  std::unordered_map<uint64_t, std::unordered_set<GAHandle*>> file_index_;
   std::list<GAHandle*> admission_lru_;
   std::set<ScoreKey, ScoreCmp> probation_scores_;
   size_t capacity_;
@@ -131,6 +154,12 @@ class GarbageAwareCacheShard : public CacheShard {
   uint64_t low_score_evictions_ = 0;
   uint64_t admission_hits_ = 0;
   uint64_t probation_hits_ = 0;
+  uint64_t obsolete_marked_blocks_ = 0;
+  uint64_t obsolete_marked_bytes_ = 0;
+  bool enable_aging_ = false;
+  uint64_t aging_interval_ = 0;
+  uint64_t operation_count_ = 0;
+  uint64_t current_epoch_ = 0;
   Statistics* statistics_ = nullptr;
 };
 
@@ -149,6 +178,7 @@ class GarbageAwareCache : public ShardedCache {
   void DisownData() override;
 
   using Cache::Insert;
+  using Cache::Lookup;
   Handle* Lookup(const Slice& key, Statistics* stats = nullptr) override;
   Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true,
                  Statistics* stats = nullptr) override;
@@ -157,6 +187,12 @@ class GarbageAwareCache : public ShardedCache {
       void (*deleter)(const Slice& key, void* value),
       const BlockCacheMetadata* metadata, Handle** handle = nullptr,
       Priority priority = Priority::LOW) override;
+  void MarkBlockCacheFilesObsolete(
+      const std::vector<uint64_t>& file_numbers,
+      const std::vector<uint64_t>& output_file_numbers, const char* reason,
+      uint64_t job_id, Logger* info_log = nullptr) override;
+  void LogBlockCacheObsoleteSample(const char* reason, uint64_t job_id,
+                                   Logger* info_log = nullptr) override;
 
   size_t TEST_GetAdmissionSize() const;
   size_t TEST_GetProbationSize() const;

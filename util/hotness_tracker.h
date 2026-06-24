@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -42,6 +44,8 @@ class HotnessTracker {
 
     mutable port::Mutex mu;
     bool admitted_hot = false;
+    uint32_t write_count = 0;
+    uint64_t last_update_epoch = 0;
     // Sequences of separated-value versions confirmed dead by compaction,
     // in append order ([0] is oldest). Linear search; deduplicated.
     std::array<SequenceNumber, kMaxDroppedSeqs> dropped_seqs;
@@ -87,15 +91,29 @@ class HotnessTracker {
     // Whether compaction obsolete-version feedback records exact dropped
     // sequence numbers for blob GC GetKey() short-circuiting.
     bool enable_drop_key_cache = true;
+    // Number of writes within the recent window needed before a key is admitted
+    // to the hot flush route. Default 2 preserves the legacy behavior: first
+    // write enters the window, second write becomes hot.
+    uint32_t admit_threshold = 2;
+    // Simple epoch decay. Every `decay_interval` RecordWrite calls advances one
+    // global epoch. 0 disables decay by default for compatibility.
+    uint64_t decay_interval = 0;
+    // If non-zero, an admitted hot key whose last write is older than this many
+    // epochs is considered cold again and its write counter is decayed.
+    uint64_t decay_window = 0;
   };
 
   explicit HotnessTracker(const Options& options, int num_shard_bits = 6)
       : enable_write_window_(options.enable_write_window &&
-                             options.window_capacity > 0),
+                             options.window_capacity > 0 &&
+                             options.hot_capacity > 0),
         enable_compaction_feedback_(options.enable_compaction_feedback &&
                                     options.hot_capacity > 0),
         enable_drop_key_cache_(options.enable_drop_key_cache &&
-                               options.hot_capacity > 0) {
+                               options.hot_capacity > 0),
+        admit_threshold_(std::max<uint32_t>(1, options.admit_threshold)),
+        decay_interval_(options.decay_interval),
+        decay_window_(options.decay_window) {
     if (enable_write_window_) {
       window_cache_ =
           NewFIFOCache(options.window_capacity, num_shard_bits, false, 0.0);
@@ -109,8 +127,10 @@ class HotnessTracker {
   }
 
   // Records a write of key. A repeated write inside the FIFO observation
-  // window promotes the key directly into the hot LRU.
+  // window increases the key's write counter. The key is admitted into the hot
+  // LRU only after the counter reaches admit_threshold_.
   void RecordWrite(const Slice& key) {
+    const uint64_t epoch = AdvanceAndGetEpoch();
     if (enable_write_window_ && window_cache_ != nullptr) {
       uint32_t hash = Hash(key);
       Cache::Handle* handle =
@@ -118,7 +138,7 @@ class HotnessTracker {
       if (handle != nullptr) {
         // Repeated write while still inside the recent window: an overwrite.
         window_cache_->Release(handle);
-        AdmitHotKey(key);
+        RecordWindowWrite(key, epoch, true /* repeated */);
       }
       // Insert (or refresh) the key in the recent window.
       window_cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter);
@@ -141,6 +161,9 @@ class HotnessTracker {
   // lookup when (key, seq) is found in this cache. Purely opportunistic: a
   // miss simply falls back to the legacy GetKey() path.
   void RecordCompactionFeedback(const Slice& key, SequenceNumber seq) {
+    if (seq == 0) {
+      return;
+    }
     if (!enable_compaction_feedback_ && !enable_drop_key_cache_) {
       return;
     }
@@ -161,7 +184,7 @@ class HotnessTracker {
   // matching only the user key is not enough (would be a false hit). A miss
   // (including after LRU eviction) is allowed and falls back to GetKey().
   bool IsDropped(const Slice& key, SequenceNumber seq) const {
-    if (!enable_drop_key_cache_ || hot_cache_ == nullptr) {
+    if (!enable_drop_key_cache_ || hot_cache_ == nullptr || seq == 0) {
       return false;
     }
     uint32_t hash = Hash(key);
@@ -183,7 +206,10 @@ class HotnessTracker {
   bool DropKeyCacheEnabled() const { return enable_drop_key_cache_; }
 
   FlushRoute ClassifyForFlush(const Slice& key) const {
-    if (HotCacheContainsAdmitted(key, true /* record_hit */)) {
+    // Flush classification should consume the hotness signal without refreshing
+    // LRU recency. Hotness is advanced by writes and compaction feedback, not by
+    // background flush scans.
+    if (HotCacheContainsAdmitted(key, false /* record_hit */)) {
       return FlushRoute::kEphemeral;  // hot route
     }
     return FlushRoute::kWarm;  // cold route
@@ -229,7 +255,8 @@ class HotnessTracker {
   // returns a referenced handle (or nullptr when the hot LRU is disabled).
   // Looking up an existing entry refreshes its LRU position and preserves any
   // dropped sequences it already holds. Caller must Release the handle.
-  Cache::Handle* GetOrCreateHotEntryHandle(const Slice& key, bool admit_hot) {
+  Cache::Handle* GetOrCreateHotEntryHandle(const Slice& key, bool admit_hot,
+                                           uint32_t initial_write_count = 0) {
     if (hot_cache_ == nullptr) {
       return nullptr;
     }
@@ -241,6 +268,8 @@ class HotnessTracker {
         if (entry != nullptr) {
           MutexLock l(&entry->mu);
           entry->admitted_hot = true;
+          entry->write_count = std::max(entry->write_count, admit_threshold_);
+          entry->last_update_epoch = CurrentEpoch();
         }
       }
       return handle;
@@ -251,6 +280,8 @@ class HotnessTracker {
     }
     HotEntry* entry = new HotEntry();
     entry->admitted_hot = admit_hot;
+    entry->write_count = admit_hot ? admit_threshold_ : initial_write_count;
+    entry->last_update_epoch = CurrentEpoch();
     Status s = hot_cache_->Insert(key, hash, entry, charge, &DeleteHotEntry,
                                   &handle);
     if (!s.ok() || handle == nullptr) {
@@ -267,6 +298,64 @@ class HotnessTracker {
     if (handle != nullptr) {
       hot_cache_->Release(handle);
     }
+  }
+
+  uint64_t AdvanceAndGetEpoch() {
+    if (decay_interval_ == 0) {
+      return 0;
+    }
+    const uint64_t tick = write_tick_.fetch_add(1, std::memory_order_relaxed) + 1;
+    return tick / decay_interval_;
+  }
+
+  uint64_t CurrentEpoch() const {
+    return decay_interval_ == 0
+               ? 0
+               : write_tick_.load(std::memory_order_relaxed) / decay_interval_;
+  }
+
+  void RecordWindowWrite(const Slice& key, uint64_t epoch, bool repeated) {
+    if (!repeated) {
+      return;
+    }
+    // The FIFO window is the observation structure for one-hit keys.  Only a
+    // repeated write is admitted into the hot LRU candidate set, so long-tail
+    // cold keys do not evict truly hot keys or drop-key feedback entries.
+    Cache::Handle* handle = GetOrCreateHotEntryHandle(
+        key, false /* admit_hot */, 1 /* initial_write_count */);
+    if (handle == nullptr) {
+      return;
+    }
+    auto* entry = static_cast<HotEntry*>(hot_cache_->Value(handle));
+    if (entry != nullptr) {
+      MutexLock l(&entry->mu);
+      if (IsExpiredLocked(*entry, epoch)) {
+        entry->admitted_hot = false;
+        entry->write_count = 0;
+      }
+      if (repeated && entry->write_count == 0) {
+        // The first write was represented by the FIFO hit; count it when an
+        // existing non-admitted entry came from drop-key feedback or was reset
+        // by decay.
+        entry->write_count = 1;
+      }
+      if (entry->write_count == 0 || repeated) {
+        if (entry->write_count < admit_threshold_) {
+          ++entry->write_count;
+        }
+      }
+      entry->last_update_epoch = epoch;
+      if (entry->write_count >= admit_threshold_) {
+        entry->admitted_hot = true;
+      }
+    }
+    hot_cache_->Release(handle);
+  }
+
+  bool IsExpiredLocked(const HotEntry& entry, uint64_t epoch) const {
+    return decay_interval_ > 0 && decay_window_ > 0 &&
+           epoch > entry.last_update_epoch &&
+           epoch - entry.last_update_epoch > decay_window_;
   }
 
   bool HotCacheContainsAny(const Slice& key, bool record_hit) const {
@@ -295,6 +384,10 @@ class HotnessTracker {
     bool hot = false;
     if (entry != nullptr) {
       MutexLock l(&entry->mu);
+      if (IsExpiredLocked(*entry, CurrentEpoch())) {
+        entry->admitted_hot = false;
+        entry->write_count = 0;
+      }
       hot = entry->admitted_hot;
     }
     hot_cache_->Release(handle);
@@ -304,6 +397,10 @@ class HotnessTracker {
   const bool enable_write_window_;
   const bool enable_compaction_feedback_;
   const bool enable_drop_key_cache_;
+  const uint32_t admit_threshold_;
+  const uint64_t decay_interval_;
+  const uint64_t decay_window_;
+  mutable std::atomic<uint64_t> write_tick_{0};
 
   std::shared_ptr<Cache> window_cache_;
   mutable std::shared_ptr<Cache> hot_cache_;

@@ -245,7 +245,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShardTemplate : public CacheMonitor,
 
  private:
   void LRU_Remove(LRUHandle* e);
-  void LRU_Insert(LRUHandle* e);
+  void LRU_Insert(LRUHandle* e, bool promote = true);
 
   // Overflow the last entry in high-pri pool to low-pri pool until size of
   // high-pri pool is no larger than the size specify by high_pri_pool_pct.

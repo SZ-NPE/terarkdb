@@ -17,6 +17,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <limits>
 #include <list>
 #include <map>
 #include <string>
@@ -1851,32 +1852,47 @@ void VersionStorageInfo::ComputeCompactionScore(
   // Calculate total_garbage_ratio_ as criterion for NeedsGarbageCollection().
   // precise_gc:
   //   false (entry-based): total_antiquation_entries / total_blob_entries
-  //   true  (byte-based) : total_antiquation_bytes   / total_blob_file_size
-  // Note on byte denominator: `blob_bytes` uses `fd.GetFileSize()`, which
-  // includes block/footer overhead on top of the raw value bytes. The ratio is
-  // therefore a conservative (slightly low) estimate of true garbage density,
-  // which is acceptable for triggering decisions.
+  //   true  (byte-based) : total_antiquation_bytes   /
+  //                        total_blob_accounting_bytes
+  // Keep the precise_gc denominator in the same byte domain as the GC picker:
+  // BlobGcAccountingBytes() prefers raw value bytes when available and falls
+  // back to physical file size for legacy metadata.
   uint64_t num_antiquation = 0;
   uint64_t num_antiquation_bytes = 0;
   uint64_t num_entries = 0;
-  uint64_t blob_bytes = 0;
+  uint64_t blob_accounting_bytes = 0;
   bool marked = false;
   for (auto& f : LevelFiles(-1)) {
     if (!f->is_gc_permitted()) {
       continue;
     }
     marked |= f->marked_for_compaction;
-    num_antiquation += f->num_antiquation;
-    num_antiquation_bytes += f->num_antiquation_bytes;
-    num_entries += f->prop.num_entries;
-    blob_bytes += f->fd.GetFileSize();
+    num_antiquation = num_antiquation > std::numeric_limits<uint64_t>::max() -
+                                           f->num_antiquation
+                          ? std::numeric_limits<uint64_t>::max()
+                          : num_antiquation + f->num_antiquation;
+    num_antiquation_bytes =
+        num_antiquation_bytes > std::numeric_limits<uint64_t>::max() -
+                                    f->num_antiquation_bytes
+            ? std::numeric_limits<uint64_t>::max()
+            : num_antiquation_bytes + f->num_antiquation_bytes;
+    num_entries = num_entries > std::numeric_limits<uint64_t>::max() -
+                                    f->prop.num_entries
+                      ? std::numeric_limits<uint64_t>::max()
+                      : num_entries + f->prop.num_entries;
+    const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
+    blob_accounting_bytes =
+        blob_accounting_bytes > std::numeric_limits<uint64_t>::max() -
+                                    accounting_bytes
+            ? std::numeric_limits<uint64_t>::max()
+            : blob_accounting_bytes + accounting_bytes;
   }
   blob_marked_for_compaction_ = marked;
-  total_garbage_ratio_ = mutable_cf_options.precise_gc
-                             ? num_antiquation_bytes /
-                                   std::max<double>(1, blob_bytes)
-                             : num_antiquation /
-                                   std::max<double>(1, num_entries);
+  total_garbage_ratio_ = std::min(
+      1.0, mutable_cf_options.precise_gc
+               ? num_antiquation_bytes /
+                     std::max<double>(1, blob_accounting_bytes)
+               : num_antiquation / std::max<double>(1, num_entries));
 
   is_pick_compaction_fail = false;
   ComputeFilesMarkedForCompaction();

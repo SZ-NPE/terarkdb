@@ -49,6 +49,7 @@ class CacheShard {
 class ShardedCache : public Cache {
  public:
   using Cache::Erase;
+  using Cache::Lookup;
 
   ShardedCache(size_t capacity, int num_shard_bits, bool strict_capacity_limit,
                std::shared_ptr<MemoryAllocator> memory_allocator = nullptr);
