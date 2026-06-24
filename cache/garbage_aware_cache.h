@@ -91,6 +91,7 @@ class GarbageAwareCacheShard : public CacheShard {
     void (*deleter)(const Slice&, void*) = nullptr;
     size_t charge = 0;
     uint32_t hash = 0;
+    GAHandle* next_hash = nullptr;
     uint32_t refs = 0;
     bool in_cache = false;
     bool in_admission = true;
@@ -121,11 +122,17 @@ class GarbageAwareCacheShard : public CacheShard {
   void FreeEntry(GAHandle* h);
   void DeleteHandleOnly(GAHandle* h);
   bool Unref(GAHandle* h);
+  GAHandle** FindTablePointer(const Slice& key, uint32_t hash);
+  GAHandle* TableLookup(const Slice& key, uint32_t hash);
+  GAHandle* TableInsert(GAHandle* h);
+  GAHandle* TableRemove(const Slice& key, uint32_t hash);
+  void TableResize();
   void RemoveFromQueue(GAHandle* h);
   void AddToQueue(GAHandle* h, bool promote = true);
   void RemoveFromCache(GAHandle* h);
   void AddToFileIndex(GAHandle* h);
   void RemoveFromFileIndex(GAHandle* h);
+  bool IsDemotable(GAHandle* h);
   void MoveToProbation(GAHandle* h);
   void AdvanceAgingEpoch();
   void ApplyAccessFreqAging(GAHandle* h);
@@ -137,7 +144,8 @@ class GarbageAwareCacheShard : public CacheShard {
   void MaybeLogLocked(const BlockCacheMetadata* metadata);
 
   mutable port::Mutex mutex_;
-  std::unordered_map<std::string, GAHandle*> table_;
+  std::vector<GAHandle*> table_;
+  uint32_t table_elems_ = 0;
   std::unordered_map<uint64_t, std::unordered_set<GAHandle*>> file_index_;
   std::list<GAHandle*> admission_lru_;
   std::set<ScoreKey, ScoreCmp> probation_scores_;

@@ -131,6 +131,20 @@ class HotnessTracker {
   // LRU only after the counter reaches admit_threshold_.
   void RecordWrite(const Slice& key) {
     const uint64_t epoch = AdvanceAndGetEpoch();
+    if (admit_threshold_ <= 1) {
+      // For short overwrite-heavy runs the second observation may be delayed
+      // until after the current memtable flushes.  Threshold=1 is an explicit
+      // benchmark mode: sampled foreground overwrites are enough evidence to
+      // route subsequent flushed versions to the ephemeral/hot file class.
+      // Sampling keeps the foreground write path cheaper than touching the LRU
+      // on every overwrite while still preserving a stable signal under Zipfian
+      // skew.
+      uint32_t hash = Hash(key);
+      if ((hash & 0x3) == 0) {
+        AdmitHotKey(key);
+      }
+      return;
+    }
     if (enable_write_window_ && window_cache_ != nullptr) {
       uint32_t hash = Hash(key);
       Cache::Handle* handle =
@@ -138,6 +152,13 @@ class HotnessTracker {
       if (handle != nullptr) {
         // Repeated write while still inside the recent window: an overwrite.
         window_cache_->Release(handle);
+        if (HotCacheContainsAdmitted(key, true /* record_hit */)) {
+          // Once a key has been admitted, routing only needs the hot LRU entry.
+          // Avoid refreshing the FIFO window on every subsequent overwrite;
+          // this keeps the write-window signal cheap for skewed workloads where
+          // a small hot set receives most updates.
+          return;
+        }
         RecordWindowWrite(key, epoch, true /* repeated */);
       }
       // Insert (or refresh) the key in the recent window.

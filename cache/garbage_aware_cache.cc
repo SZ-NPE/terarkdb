@@ -103,13 +103,11 @@ Status GarbageAwareCacheShard::InsertImpl(
     if (metadata != nullptr && metadata->statistics != nullptr) {
       statistics_ = metadata->statistics;
     }
-    auto old = table_.find(h->key);
-    if (old != table_.end()) {
-      replaced = old->second;
+    replaced = TableInsert(h);
+    if (replaced != nullptr) {
       RemoveFromCache(replaced);
       replaced_last_reference = Unref(replaced);
     }
-    table_[h->key] = h;
     AddToFileIndex(h);
     usage_ += h->charge;
     admission_usage_ += h->charge;
@@ -133,7 +131,7 @@ Status GarbageAwareCacheShard::InsertImpl(
           ++replaced->refs;
         }
         replaced->in_cache = true;
-        table_[replaced->key] = replaced;
+        TableInsert(replaced);
         AddToFileIndex(replaced);
         usage_ += replaced->charge;
         if (replaced->in_admission) {
@@ -174,15 +172,14 @@ Cache::Handle* GarbageAwareCacheShard::Lookup(const Slice& key,
 }
 
 Cache::Handle* GarbageAwareCacheShard::Lookup(const Slice& key,
-                                              uint32_t /*hash*/,
+                                              uint32_t hash,
                                               bool record_hit,
                                               Statistics* stats) {
   MutexLock l(&mutex_);
-  auto it = table_.find(key.ToString());
-  if (it == table_.end()) {
+  GAHandle* h = TableLookup(key, hash);
+  if (h == nullptr) {
     return nullptr;
   }
-  GAHandle* h = it->second;
   if (record_hit) {
     AdvanceAgingEpoch();
   }
@@ -236,9 +233,7 @@ bool GarbageAwareCacheShard::Release(Cache::Handle* handle, bool force_erase) {
     if (Unref(h)) {
       deleted.push_back(h);
     } else if (h->refs == 1 && h->in_cache) {
-      if (!no_hit_release && h->garbage_aware && h->in_admission &&
-          h->priority != Cache::Priority::HIGH &&
-          (h->garbage_ratio >= 1.0 || h->score <= demote_score_threshold_)) {
+      if (!no_hit_release && IsDemotable(h)) {
         MoveToProbation(h);
       } else if (h->in_queue) {
         // No-hit lookups should not promote or demote by themselves. If the
@@ -261,16 +256,23 @@ void* GarbageAwareCacheShard::Value(Cache::Handle* handle) {
   return UnwrapHandle(handle)->value;
 }
 
-void GarbageAwareCacheShard::Erase(const Slice& key, uint32_t /*hash*/) {
+void GarbageAwareCacheShard::Erase(const Slice& key, uint32_t hash) {
   std::vector<GAHandle*> deleted;
   {
     MutexLock l(&mutex_);
-    auto it = table_.find(key.ToString());
-    if (it == table_.end()) {
+    GAHandle* h = TableRemove(key, hash);
+    if (h == nullptr) {
       return;
     }
-    GAHandle* h = it->second;
-    RemoveFromCache(h);
+    RemoveFromQueue(h);
+    RemoveFromFileIndex(h);
+    h->in_cache = false;
+    usage_ -= h->charge;
+    if (h->in_admission) {
+      admission_usage_ -= h->charge;
+    } else {
+      probation_usage_ -= h->charge;
+    }
     if (Unref(h)) {
       deleted.push_back(h);
     }
@@ -314,9 +316,11 @@ uint32_t GarbageAwareCacheShard::GetHash(Cache::Handle* handle) const {
 size_t GarbageAwareCacheShard::GetPinnedUsage() const {
   MutexLock l(&mutex_);
   size_t pinned = 0;
-  for (const auto& item : table_) {
-    if (item.second->refs > 1) {
-      pinned += item.second->charge;
+  for (GAHandle* bucket : table_) {
+    for (GAHandle* h = bucket; h != nullptr; h = h->next_hash) {
+      if (h->refs > 1) {
+        pinned += h->charge;
+      }
     }
   }
   return pinned;
@@ -327,8 +331,10 @@ void GarbageAwareCacheShard::ApplyToAllCacheEntries(
   if (thread_safe) {
     mutex_.Lock();
   }
-  for (const auto& item : table_) {
-    callback(item.second->value, item.second->charge);
+  for (GAHandle* bucket : table_) {
+    for (GAHandle* h = bucket; h != nullptr; h = h->next_hash) {
+      callback(h->value, h->charge);
+    }
   }
   if (thread_safe) {
     mutex_.Unlock();
@@ -339,9 +345,14 @@ void GarbageAwareCacheShard::EraseUnRefEntries() {
   std::vector<GAHandle*> deleted;
   {
     MutexLock l(&mutex_);
-    for (auto it = table_.begin(); it != table_.end();) {
-      GAHandle* h = it->second;
-      ++it;
+    std::vector<GAHandle*> handles;
+    handles.reserve(table_elems_);
+    for (GAHandle* bucket : table_) {
+      for (GAHandle* h = bucket; h != nullptr; h = h->next_hash) {
+        handles.push_back(h);
+      }
+    }
+    for (GAHandle* h : handles) {
       if (h->refs == 1) {
         RemoveFromCache(h);
         if (Unref(h)) {
@@ -484,6 +495,74 @@ bool GarbageAwareCacheShard::Unref(GAHandle* h) {
   return h->refs == 0;
 }
 
+GarbageAwareCacheShard::GAHandle** GarbageAwareCacheShard::FindTablePointer(
+    const Slice& key, uint32_t hash) {
+  if (table_.empty()) {
+    return nullptr;
+  }
+  GAHandle** ptr = &table_[hash & (table_.size() - 1)];
+  while (*ptr != nullptr &&
+         ((*ptr)->hash != hash || key != (*ptr)->key_slice())) {
+    ptr = &(*ptr)->next_hash;
+  }
+  return ptr;
+}
+
+GarbageAwareCacheShard::GAHandle* GarbageAwareCacheShard::TableLookup(
+    const Slice& key, uint32_t hash) {
+  GAHandle** ptr = FindTablePointer(key, hash);
+  return ptr == nullptr ? nullptr : *ptr;
+}
+
+GarbageAwareCacheShard::GAHandle* GarbageAwareCacheShard::TableInsert(
+    GAHandle* h) {
+  if (table_.empty()) {
+    table_.assign(16, nullptr);
+  }
+  GAHandle** ptr = FindTablePointer(h->key_slice(), h->hash);
+  GAHandle* old = *ptr;
+  h->next_hash = old == nullptr ? nullptr : old->next_hash;
+  *ptr = h;
+  if (old == nullptr) {
+    ++table_elems_;
+    if (table_elems_ > table_.size()) {
+      TableResize();
+    }
+  } else {
+    old->next_hash = nullptr;
+  }
+  return old;
+}
+
+GarbageAwareCacheShard::GAHandle* GarbageAwareCacheShard::TableRemove(
+    const Slice& key, uint32_t hash) {
+  GAHandle** ptr = FindTablePointer(key, hash);
+  if (ptr == nullptr || *ptr == nullptr) {
+    return nullptr;
+  }
+  GAHandle* old = *ptr;
+  *ptr = old->next_hash;
+  old->next_hash = nullptr;
+  --table_elems_;
+  return old;
+}
+
+void GarbageAwareCacheShard::TableResize() {
+  const size_t new_size = table_.empty() ? 16 : table_.size() * 2;
+  std::vector<GAHandle*> old_table;
+  old_table.swap(table_);
+  table_.assign(new_size, nullptr);
+  for (GAHandle* bucket : old_table) {
+    while (bucket != nullptr) {
+      GAHandle* h = bucket;
+      bucket = bucket->next_hash;
+      const size_t idx = h->hash & (table_.size() - 1);
+      h->next_hash = table_[idx];
+      table_[idx] = h;
+    }
+  }
+}
+
 void GarbageAwareCacheShard::RemoveFromQueue(GAHandle* h) {
   if (!h->in_queue) {
     return;
@@ -522,7 +601,7 @@ void GarbageAwareCacheShard::RemoveFromCache(GAHandle* h) {
   }
   RemoveFromQueue(h);
   RemoveFromFileIndex(h);
-  table_.erase(h->key);
+  TableRemove(h->key_slice(), h->hash);
   h->in_cache = false;
   usage_ -= h->charge;
   if (h->in_admission) {
@@ -545,6 +624,16 @@ void GarbageAwareCacheShard::MoveToProbation(GAHandle* h) {
   AddToQueue(h);
   demotions_++;
   RecordTick(statistics_, GC_AWARE_CACHE_DEMOTE);
+}
+
+bool GarbageAwareCacheShard::IsDemotable(GAHandle* h) {
+  if (!h->garbage_aware || !h->in_admission ||
+      h->priority == Cache::Priority::HIGH) {
+    return false;
+  }
+  UpdateScore(h);
+  return h->garbage_ratio >= 1.0 ||
+         (h->access_freq > 0 && h->score <= demote_score_threshold_);
 }
 
 void GarbageAwareCacheShard::AdvanceAgingEpoch() {
@@ -648,7 +737,7 @@ void GarbageAwareCacheShard::EvictIfNeeded(std::vector<GAHandle*>* deleted) {
     // they are only considered later if the hard total capacity is exceeded.
     GAHandle* h = FindAdmissionVictim(true /* require_garbage_aware */,
                                       true /* require_low_priority */);
-    if (h != nullptr) {
+    if (h != nullptr && IsDemotable(h)) {
       MoveToProbation(h);
       continue;
     }
@@ -701,14 +790,22 @@ void GarbageAwareCacheShard::EvictIfNeeded(std::vector<GAHandle*>* deleted) {
       low_score_evictions_++;
       RecordTick(statistics_, GC_AWARE_CACHE_EVICT_LOW_SCORE);
     } else {
-      h = FindAdmissionVictim(true /* require_garbage_aware */,
-                              true /* require_low_priority */);
-      if (h != nullptr) {
+      GAHandle* garbage_aware_lru = FindAdmissionVictim(
+          true /* require_garbage_aware */, true /* require_low_priority */);
+      if (garbage_aware_lru != nullptr && IsDemotable(garbage_aware_lru)) {
+        h = garbage_aware_lru;
         MoveToProbation(h);
         continue;
       }
       h = FindAdmissionVictim(false /* require_garbage_aware */,
                               true /* require_low_priority */);
+      if (h == nullptr) {
+        // If the cache is over its hard capacity and the resident set consists
+        // mostly of fresh blob data blocks, fall back to ordinary LRU eviction
+        // instead of leaving the cache oversized. Fresh blocks are only spared
+        // from the soft admission-quota demotion path above.
+        h = garbage_aware_lru;
+      }
       if (h == nullptr) {
         // Hard capacity fallback: high-priority blocks can still be evicted if
         // no low-priority victim exists and the cache is over capacity.

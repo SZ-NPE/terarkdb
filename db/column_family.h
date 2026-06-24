@@ -418,6 +418,10 @@ class ColumnFamilyData {
     return hotness_tracker_;
   }
 
+  HotnessTracker* hotness_tracker_ptr() const {
+    return hotness_tracker_.get();
+  }
+
   Env::WriteLifeTimeHint CalculateSSTWriteHint(int level);
 
   Status AddDirectories();
