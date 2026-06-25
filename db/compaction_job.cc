@@ -35,6 +35,7 @@
 #endif
 
 #include <functional>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <set>
@@ -2420,7 +2421,9 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   size_t gc_block_size = 4096;  // default BlockBasedTable block size
   if (collect_gc_block_stats) {
     auto* table_factory = cfd->ioptions()->table_factory;
-    if (table_factory != nullptr) {
+    if (table_factory != nullptr &&
+        std::strcmp(table_factory->Name(), BlockBasedTableFactory::kName.c_str()) ==
+            0) {
       void* raw_opts = table_factory->GetOptions();
       if (raw_opts != nullptr) {
         gc_block_size =
@@ -2775,39 +2778,47 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     if (counter.has_run && counter.run_live) {
       counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
     }
-    auto& meta = sub_compact->blob_outputs.front().meta;
-    auto& inputs = *sub_compact->compaction->inputs();
-    assert(inputs.size() == 1 && inputs.front().level == -1);
-    auto& files = inputs.front().files;
-      TERARK_UNUSED_VAR(inheritance_tree_pruge_count);
-    if ((std::find_if(files.begin(), files.end(),
-                      [](FileMetaData* f) {
-                        return f->marked_for_compaction;
-                      }) == files.end() &&
-         files.size() == 1 && counter.input == meta.prop.num_entries) ||
-        meta.prop.num_entries == 0) {
+    if (sub_compact->blob_outputs.empty()) {
       ROCKS_LOG_INFO(db_options_.info_log,
-                     "[%s] [JOB %d] Table #%" PRIu64
-                     " GC purge %s records, dropped",
-                     cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(),
-                     meta.prop.num_entries == 0 ? "whole" : "0");
-      std::string fname = TableFileName(
-          sub_compact->compaction->immutable_cf_options()->cf_paths,
-          meta.fd.GetNumber(), meta.fd.GetPathId());
-      env_->DeleteFile(fname);
+                     "[%s] [JOB %d] GC purged all records, no output blob",
+                     cfd->GetName().c_str(), job_id_);
+    } else {
+      auto& meta = sub_compact->blob_outputs.front().meta;
+      auto& inputs = *sub_compact->compaction->inputs();
+      assert(inputs.size() == 1 && inputs.front().level == -1);
+      auto& files = inputs.front().files;
+      TERARK_UNUSED_VAR(inheritance_tree_pruge_count);
+      if ((std::find_if(files.begin(), files.end(),
+                        [](FileMetaData* f) {
+                          return f->marked_for_compaction;
+                        }) == files.end() &&
+           files.size() == 1 && counter.input == meta.prop.num_entries) ||
+          meta.prop.num_entries == 0) {
+        ROCKS_LOG_INFO(db_options_.info_log,
+                       "[%s] [JOB %d] Table #%" PRIu64
+                       " GC purge %s records, dropped",
+                       cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(),
+                       meta.prop.num_entries == 0 ? "whole" : "0");
+        std::string fname = TableFileName(
+            sub_compact->compaction->immutable_cf_options()->cf_paths,
+            meta.fd.GetNumber(), meta.fd.GetPathId());
+        env_->DeleteFile(fname);
 
-      if (meta.prop.num_entries == 0) {
-        for (auto f : files) {
-          RecordTick(db_options_.statistics.get(), GC_WHOLE_FILE_DELETE);
-          RecordTick(db_options_.statistics.get(), GC_WHOLE_FILE_DELETE_BYTES, f->fd.GetFileSize());
-          ROCKS_LOG_INFO(db_options_.info_log,
-                         "[%s] [JOB %d] ★染色删除★ Table #%" PRIu64
-                         " size %" PRIu64,
-                         cfd->GetName().c_str(), job_id_, f->fd.GetNumber(), f->fd.GetFileSize());
+        if (meta.prop.num_entries == 0) {
+          for (auto f : files) {
+            RecordTick(db_options_.statistics.get(), GC_WHOLE_FILE_DELETE);
+            RecordTick(db_options_.statistics.get(), GC_WHOLE_FILE_DELETE_BYTES,
+                       f->fd.GetFileSize());
+            ROCKS_LOG_INFO(db_options_.info_log,
+                           "[%s] [JOB %d] ★染色删除★ Table #%" PRIu64
+                           " size %" PRIu64,
+                           cfd->GetName().c_str(), job_id_, f->fd.GetNumber(),
+                           f->fd.GetFileSize());
+          }
         }
-      }
 
-      sub_compact->blob_outputs.clear();
+        sub_compact->blob_outputs.clear();
+      }
     }
   }
 
