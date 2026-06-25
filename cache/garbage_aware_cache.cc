@@ -188,9 +188,11 @@ Cache::Handle* GarbageAwareCacheShard::Lookup(const Slice& key,
   }
   h->refs++;
   if (record_hit) {
-    ApplyAccessFreqAging(h);
-    h->access_freq++;
-    UpdateScore(h);
+    if (!h->in_admission || h->garbage_ratio > 0.0) {
+      ApplyAccessFreqAging(h);
+      h->access_freq++;
+      UpdateScore(h);
+    }
     if (h->in_admission) {
       admission_hits_++;
       RecordTick(stats, GC_AWARE_CACHE_ADMISSION_HIT);
@@ -451,13 +453,53 @@ void GarbageAwareCacheShard::LogBlockCacheObsoleteSample(const char* reason,
   if (info_log == nullptr) {
     return;
   }
-  MutexLock l(&mutex_);
+  auto sample = GetObsoleteSample();
+  const double obsolete_block_ratio =
+      sample.tracked_blocks == 0
+          ? 0.0
+          : static_cast<double>(sample.obsolete_blocks) /
+                static_cast<double>(sample.tracked_blocks);
+  const double obsolete_byte_ratio =
+      sample.tracked_bytes == 0
+          ? 0.0
+          : static_cast<double>(sample.obsolete_bytes) /
+                static_cast<double>(sample.tracked_bytes);
   ROCKS_LOG_INFO(info_log,
                  "[GC_AWARE_BLOCK_CACHE_OBSOLETE_SAMPLE] reason=%s job=%" PRIu64
-                 " total_marked_blocks=%" PRIu64
-                 " total_marked_bytes=%" PRIu64,
+                 " tracked_blocks=%" PRIu64 " tracked_bytes=%" PRIu64
+                 " obsolete_blocks=%" PRIu64 " obsolete_bytes=%" PRIu64
+                 " obsolete_block_ratio=%.6f obsolete_byte_ratio=%.6f"
+                 " obsolete_file_count=%" PRIu64,
                  reason != nullptr ? reason : "unknown", job_id,
-                 obsolete_marked_blocks_, obsolete_marked_bytes_);
+                 sample.tracked_blocks, sample.tracked_bytes,
+                 sample.obsolete_blocks, sample.obsolete_bytes,
+                 obsolete_block_ratio, obsolete_byte_ratio,
+                 sample.obsolete_file_count);
+}
+
+GarbageAwareCacheShard::ObsoleteSample
+GarbageAwareCacheShard::GetObsoleteSample() const {
+  ObsoleteSample sample;
+  std::unordered_set<uint64_t> obsolete_files;
+  MutexLock l(&mutex_);
+  for (GAHandle* head : table_) {
+    for (GAHandle* h = head; h != nullptr; h = h->next_hash) {
+      if (!h->in_cache || !h->is_data_block) {
+        continue;
+      }
+      ++sample.tracked_blocks;
+      sample.tracked_bytes += h->charge;
+      if (h->garbage_aware && h->garbage_ratio >= 1.0) {
+        ++sample.obsolete_blocks;
+        sample.obsolete_bytes += h->charge;
+        if (h->file_number != 0) {
+          obsolete_files.insert(h->file_number);
+        }
+      }
+    }
+  }
+  sample.obsolete_file_count = obsolete_files.size();
+  return sample;
 }
 
 void GarbageAwareCacheShard::FreeEntry(GAHandle* h) {
@@ -631,9 +673,14 @@ bool GarbageAwareCacheShard::IsDemotable(GAHandle* h) {
       h->priority == Cache::Priority::HIGH) {
     return false;
   }
+  if (h->garbage_ratio <= 0.0 && demote_score_threshold_ <= 0.0) {
+    return false;
+  }
+  if (h->garbage_ratio >= 1.0) {
+    return true;
+  }
   UpdateScore(h);
-  return h->garbage_ratio >= 1.0 ||
-         (h->access_freq > 0 && h->score <= demote_score_threshold_);
+  return h->access_freq > 0 && h->score <= demote_score_threshold_;
 }
 
 void GarbageAwareCacheShard::AdvanceAgingEpoch() {
@@ -741,15 +788,11 @@ void GarbageAwareCacheShard::EvictIfNeeded(std::vector<GAHandle*>* deleted) {
       MoveToProbation(h);
       continue;
     }
-    h = FindAdmissionVictim(false /* require_garbage_aware */,
-                            true /* require_low_priority */);
-    if (h != nullptr) {
-      RemoveFromCache(h);
-      if (Unref(h)) {
-        deleted->push_back(h);
-      }
-      continue;
-    }
+    // Do not enforce the soft admission quota by evicting ordinary blocks.
+    // Before obsolete-file feedback arrives most data blocks have no garbage
+    // signal, so evicting them here shrinks the effective cache to only
+    // admission_ratio * capacity and makes the GC-aware cache slower than LRU.
+    // Ordinary blocks are still evicted by the hard-capacity path below.
     break;
   }
 
@@ -931,14 +974,48 @@ void GarbageAwareCache::MarkBlockCacheFilesObsolete(
     shards_[i].MarkBlockCacheFilesObsolete(file_numbers, output_file_numbers,
                                            reason, job_id, info_log);
   }
+  LogBlockCacheObsoleteSample(reason, job_id, info_log);
 }
 
 void GarbageAwareCache::LogBlockCacheObsoleteSample(const char* reason,
                                                     uint64_t job_id,
                                                     Logger* info_log) {
-  for (int i = 0; i < num_shards_; ++i) {
-    shards_[i].LogBlockCacheObsoleteSample(reason, job_id, info_log);
+  if (info_log == nullptr) {
+    return;
   }
+  GarbageAwareCacheShard::ObsoleteSample sample;
+  for (int i = 0; i < num_shards_; ++i) {
+    auto shard_sample = shards_[i].GetObsoleteSample();
+    sample.tracked_blocks += shard_sample.tracked_blocks;
+    sample.tracked_bytes += shard_sample.tracked_bytes;
+    sample.obsolete_blocks += shard_sample.obsolete_blocks;
+    sample.obsolete_bytes += shard_sample.obsolete_bytes;
+    sample.obsolete_file_count += shard_sample.obsolete_file_count;
+  }
+  const double obsolete_block_ratio =
+      sample.tracked_blocks == 0
+          ? 0.0
+          : static_cast<double>(sample.obsolete_blocks) /
+                static_cast<double>(sample.tracked_blocks);
+  const double obsolete_byte_ratio =
+      sample.tracked_bytes == 0
+          ? 0.0
+          : static_cast<double>(sample.obsolete_bytes) /
+                static_cast<double>(sample.tracked_bytes);
+  const uint64_t sample_id = obsolete_sample_id_.fetch_add(1) + 1;
+  ROCKS_LOG_INFO(info_log,
+                 "[BLOCK_CACHE_OBSOLETE_SAMPLE] ts_us=0 sample_id=%" PRIu64
+                 " job=%" PRIu64 " reason=%s tracked_blocks=%" PRIu64
+                 " tracked_bytes=%" PRIu64 " obsolete_blocks=%" PRIu64
+                 " obsolete_bytes=%" PRIu64 " obsolete_block_ratio=%.6f"
+                 " obsolete_byte_ratio=%.6f mean_obsolete_byte_ratio=%.6f"
+                 " peak_obsolete_byte_ratio=%.6f obsolete_file_count=%" PRIu64
+                 " top_obsolete_files=%s",
+                 sample_id, job_id, reason == nullptr ? "unknown" : reason,
+                 sample.tracked_blocks, sample.tracked_bytes,
+                 sample.obsolete_blocks, sample.obsolete_bytes,
+                 obsolete_block_ratio, obsolete_byte_ratio, obsolete_byte_ratio,
+                 obsolete_byte_ratio, sample.obsolete_file_count, "gc_aware");
 }
 
 size_t GarbageAwareCache::TEST_GetAdmissionSize() const {

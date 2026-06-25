@@ -23,6 +23,14 @@ namespace TERARKDB_NAMESPACE {
 
 class GarbageAwareCacheShard : public CacheShard {
  public:
+  struct ObsoleteSample {
+    uint64_t tracked_blocks = 0;
+    uint64_t tracked_bytes = 0;
+    uint64_t obsolete_blocks = 0;
+    uint64_t obsolete_bytes = 0;
+    uint64_t obsolete_file_count = 0;
+  };
+
   GarbageAwareCacheShard(size_t capacity, bool strict_capacity_limit,
                          double admission_ratio, double demote_score_threshold,
                          uint64_t log_interval, bool enable_aging,
@@ -61,6 +69,7 @@ class GarbageAwareCacheShard : public CacheShard {
       uint64_t job_id, Logger* info_log = nullptr);
   void LogBlockCacheObsoleteSample(const char* reason, uint64_t job_id,
                                    Logger* info_log = nullptr);
+  ObsoleteSample GetObsoleteSample() const;
 
   void* Value(Cache::Handle* handle);
   size_t GetCharge(Cache::Handle* handle) const;
@@ -210,6 +219,7 @@ class GarbageAwareCache : public ShardedCache {
 
   GarbageAwareCacheShard* shards_ = nullptr;
   int num_shards_ = 0;
+  std::atomic<uint64_t> obsolete_sample_id_{0};
 };
 
 }  // namespace TERARKDB_NAMESPACE
