@@ -273,6 +273,10 @@ class VersionStorageInfo {
     return blob_marked_for_compaction_;
   }
 
+  bool blob_needs_defragmentation() const {
+    return blob_needs_defragmentation_;
+  }
+
   bool has_space_amplification() const { return !space_amplification_.empty(); }
 
   bool has_space_amplification(int level) const {
@@ -643,6 +647,7 @@ class VersionStorageInfo {
   bool force_consistency_checks_;
 
   bool blob_marked_for_compaction_;
+  bool blob_needs_defragmentation_;
 
   std::unique_ptr<VersionBuilder::Context> version_builder_context_;
 

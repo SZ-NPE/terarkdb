@@ -281,6 +281,8 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    read_separated_value_by_handle);
   ROCKS_LOG_HEADER(log, "                          Options.blob_gc_ratio: %f",
                    blob_gc_ratio);
+  ROCKS_LOG_HEADER(log, "                  Options.byte_precise_gc: %d",
+                   static_cast<int>(byte_precise_gc));
   ROCKS_LOG_HEADER(log,
                    "                  Options.target_blob_file_size: %" PRIu64,
                    target_blob_file_size);

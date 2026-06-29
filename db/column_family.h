@@ -378,6 +378,12 @@ class ColumnFamilyData {
   void set_queued_for_garbage_collection(bool value) {
     queued_for_garbage_collection_ = value;
   }
+  void SetDynamicBlobGcRatio(double dynamic_blob_gc_ratio) {
+    dynamic_blob_gc_ratio_ = dynamic_blob_gc_ratio;
+  }
+  bool IsDynamicGCOpened() const {
+    return dynamic_blob_gc_ratio_ >= 0.0 && dynamic_blob_gc_ratio_ <= 1.0;
+  }
   bool queued_for_flush() { return queued_for_flush_ > 0; }
   bool queued_for_compaction() { return queued_for_compaction_; }
   bool queued_for_garbage_collection() {
@@ -513,6 +519,10 @@ class ColumnFamilyData {
   std::atomic<uint64_t> last_memtable_id_;
 
   std::shared_ptr<HotnessTracker> hotness_tracker_;
+
+  // In dynamic GC mode, select blob files whose garbage ratio exceeds this
+  // runtime threshold. Values outside [0, 1] disable dynamic thresholding.
+  double dynamic_blob_gc_ratio_ = 2.0;
 
   // Directories corresponding to cf_paths.
   std::vector<std::unique_ptr<Directory>> data_dirs_;

@@ -101,6 +101,16 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
                             table_properties.num_entries)
               << "num_data_blocks" << table_properties.num_data_blocks
               << "num_entries" << table_properties.num_entries
+              << "num_deletions" << table_properties.num_deletions
+              << "num_range_deletions" << table_properties.num_range_deletions
+              << "separated_total_size"
+              << table_properties.separated_total_size
+              << "separated_entry_count"
+              << table_properties.separated_entry_count
+              << "value_meta_total_size"
+              << table_properties.value_meta_total_size
+              << "delta_block_size" << table_properties.delta_block_size
+              << "remote_value_size" << table_properties.remote_value_size
               << "filter_policy_name" << table_properties.filter_policy_name;
       if (!table_properties.dependence.empty()) {
         jwriter << "dependence";
@@ -127,6 +137,10 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
         } else {
           jwriter << inheritance_tree.size();
         }
+      }
+      if (!table_properties.snapshots.empty()) {
+        jwriter << "snapshot_count" << table_properties.snapshots.size()
+                << "oldest_snapshot" << table_properties.snapshots.front();
       }
 
       // user collected properties

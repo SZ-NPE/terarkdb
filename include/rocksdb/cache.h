@@ -43,9 +43,6 @@ struct BlockCacheMetadata {
   bool is_blob_file = false;
   bool is_data_block = false;
   uint64_t file_number = 0;
-  uint64_t block_offset = 0;
-  uint64_t block_size = 0;
-  double garbage_ratio = 0.0;
   Statistics* statistics = nullptr;
   Logger* info_log = nullptr;
 };
@@ -204,11 +201,7 @@ struct GarbageAwareCacheOptions {
   size_t capacity = 0;
   int num_shard_bits = -1;
   bool strict_capacity_limit = false;
-  double admission_ratio = 0.7;
-  double demote_score_threshold = 0.0;
   uint64_t log_interval = 10000;
-  bool enable_aging = false;
-  uint64_t aging_interval = 10000;
   std::shared_ptr<MemoryAllocator> memory_allocator;
 };
 
@@ -217,15 +210,8 @@ extern std::shared_ptr<Cache> NewGarbageAwareCache(
 
 extern std::shared_ptr<Cache> NewGarbageAwareCache(
     size_t capacity, int num_shard_bits = -1,
-    bool strict_capacity_limit = false, double admission_ratio = 0.7,
-    double demote_score_threshold = 0.0, uint64_t log_interval = 10000,
+    bool strict_capacity_limit = false, uint64_t log_interval = 10000,
     std::shared_ptr<MemoryAllocator> memory_allocator = nullptr);
-
-extern std::shared_ptr<Cache> NewGarbageAwareCache(
-    size_t capacity, int num_shard_bits, bool strict_capacity_limit,
-    double admission_ratio, double demote_score_threshold, uint64_t log_interval,
-    std::shared_ptr<MemoryAllocator> memory_allocator, bool enable_aging,
-    uint64_t aging_interval);
 
 class Cache {
  public:

@@ -326,21 +326,15 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   if (result.blob_size > 0 && result.blob_size < 8) {
     result.blob_size = 8;
   }
-  if (result.precise_gc) {
-    if (result.table_factory != nullptr &&
-        result.table_factory->Name() == BlockBasedTableFactory::kName) {
-      auto* block_based_table_options = static_cast<BlockBasedTableOptions*>(
-          result.table_factory->GetOptions());
-      if (block_based_table_options != nullptr) {
-        block_based_table_options->use_delta_block = true;
-      }
-    }
+  if (result.precise_gc && !result.byte_precise_gc) {
+    result.byte_precise_gc = true;
   }
-  if (result.precise_gc &&
+  if (result.byte_precise_gc &&
       (!result.table_factory ||
-       !result.table_factory->IsExactGarbageCollectionSupported())) {
-    result.precise_gc = false;
+       !result.table_factory->SupportsBytePreciseGC())) {
+    result.byte_precise_gc = false;
   }
+  result.precise_gc = result.byte_precise_gc;
   if (result.middle_blob_size != size_t(-1) &&
       result.middle_blob_size < result.blob_size) {
     result.middle_blob_size = result.blob_size;
@@ -1012,10 +1006,16 @@ bool ColumnFamilyData::NeedsCompaction() const {
 
 bool ColumnFamilyData::NeedsGarbageCollection() const {
   auto vstorage = current_->storage_info();
-  bool res = !vstorage->IsPickGarbageCollectionFail() &&
+  auto total_gc_ratio = mutable_cf_options_.blob_gc_ratio;
+  if (IsDynamicGCOpened()) {
+    // Dynamic GC uses the runtime threshold passed to the picker, so do not
+    // gate scheduling on the static column-family ratio.
+    total_gc_ratio = 0;
+  }
+  return !vstorage->IsPickGarbageCollectionFail() &&
          (vstorage->blob_marked_for_compaction() ||
-          vstorage->total_garbage_ratio() >= mutable_cf_options_.blob_gc_ratio);
-  return res;
+          vstorage->blob_needs_defragmentation() ||
+          vstorage->total_garbage_ratio() >= total_gc_ratio);
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -1039,7 +1039,14 @@ Compaction* ColumnFamilyData::PickGarbageCollection(
   StopWatch sw(ioptions_.env, ioptions_.statistics,
                PICK_GARBAGE_COLLECTION_TIME);
   auto* result = compaction_picker_->PickGarbageCollection(
-      GetName(), mutable_options, current_->storage_info(), log_buffer);
+      GetName(), mutable_options, dynamic_blob_gc_ratio_,
+      current_->storage_info(), log_buffer);
+  if (result == nullptr &&
+      current_->storage_info()->blob_needs_defragmentation()) {
+    result = compaction_picker_->PickBlobDefragmentation(
+        GetName(), mutable_options, dynamic_blob_gc_ratio_,
+        current_->storage_info(), log_buffer);
+  }
   if (result != nullptr) {
     result->SetInputVersion(current_);
     result->set_compaction_load(0);

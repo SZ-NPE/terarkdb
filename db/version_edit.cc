@@ -230,15 +230,11 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
                           f.prop.raw_value_size);
       PutVarint64(&encode_property_cache, f.prop.earliest_time_begin_compact);
       PutVarint64(&encode_property_cache, f.prop.latest_time_end_compact);
-      // Keep new precise-GC metadata append-only. Older readers parse the
-      // fields above and then ignore this trailing byte_count vector, while
-      // newer readers can recover exact referenced bytes from it.
+      // Byte-precise GC metadata: separated-size bytes per dependence.
       for (auto& dependence : f.prop.dependence) {
-        PutVarint64(&encode_property_cache, dependence.byte_count);
+        PutVarint64(&encode_property_cache, dependence.separated_total_size);
       }
-      for (auto& dependence : f.prop.dependence) {
-        PutVarint64(&encode_property_cache, dependence.byte_count_entry_count);
-      }
+      encode_property_cache.push_back(static_cast<char>(f.prop.sst_type));
       PutLengthPrefixedSlice(dst, encode_property_cache);
     }
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
@@ -364,7 +360,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &file_number)) {
                 return error_msg;
               }
-              f.prop.dependence.emplace_back(Dependence{file_number, 0, 0, 0});
+              f.prop.dependence.emplace_back(Dependence{file_number, 0, 0});
             }
             if (!field.empty()) {
               if (!GetVarint64(&field, &f.prop.num_entries)) {
@@ -418,10 +414,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               }
             }
             if (!field.empty()) {
-              // precise_gc: byte_count is appended after all historical
-              // property-cache fields to preserve old manifest readers. Older
-              // manifests do not have this vector, leaving byte_count as zero
-              // so VersionBuilder falls back to averaged estimation.
+              // precise_gc: separated-size bytes per dependence.
               for (auto& dependence : f.prop.dependence) {
                 if (!GetVarint64(&field, &dependence.byte_count)) {
                   return error_msg;
@@ -429,12 +422,8 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               }
             }
             if (!field.empty()) {
-              for (auto& dependence : f.prop.dependence) {
-                if (!GetVarint64(&field,
-                                 &dependence.byte_count_entry_count)) {
-                  return error_msg;
-                }
-              }
+              f.prop.sst_type = static_cast<uint8_t>(field[0]);
+              field.remove_prefix(1);
             }
             if (f.prop.num_entries > 0 || f.prop.raw_key_size > 0 ||
                 f.prop.raw_value_size > 0) {
@@ -666,6 +655,13 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
   Status result;
   if (msg != nullptr) {
     result = Status::Corruption("VersionEdit", msg);
+  } else {
+    for (auto& new_file : new_files_) {
+      if (new_file.second.prop.sst_type == SstType::kMaxSstType) {
+        new_file.second.prop.sst_type = static_cast<uint8_t>(
+            new_file.first == -1 ? SstType::kLargeBlob : SstType::kNormal);
+      }
+    }
   }
   return result;
 }

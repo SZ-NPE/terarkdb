@@ -20,31 +20,12 @@
 
 namespace TERARKDB_NAMESPACE {
 
-namespace {
-
-double ClampRatio(double ratio) {
-  if (ratio < 0.0) {
-    return 0.0;
-  }
-  if (ratio > 1.0) {
-    return 1.0;
-  }
-  return ratio;
-}
-
-}  // namespace
-
-GarbageAwareCacheShard::GarbageAwareCacheShard(
-    size_t capacity, bool strict_capacity_limit, double admission_ratio,
-    double demote_score_threshold, uint64_t log_interval, bool enable_aging,
-    uint64_t aging_interval)
+GarbageAwareCacheShard::GarbageAwareCacheShard(size_t capacity,
+                                               bool strict_capacity_limit,
+                                               uint64_t log_interval)
     : capacity_(capacity),
       strict_capacity_limit_(strict_capacity_limit),
-      admission_ratio_(ClampRatio(admission_ratio)),
-      demote_score_threshold_(std::max(0.0, demote_score_threshold)),
-      log_interval_(log_interval),
-      enable_aging_(enable_aging && aging_interval > 0),
-      aging_interval_(aging_interval) {}
+      log_interval_(log_interval) {}
 
 GarbageAwareCacheShard::~GarbageAwareCacheShard() { EraseUnRefEntries(); }
 
@@ -90,29 +71,30 @@ Status GarbageAwareCacheShard::InsertImpl(
   if (metadata != nullptr) {
     h->file_number = metadata->file_number;
     h->is_data_block = metadata->is_data_block;
-    h->is_blob_file = metadata->is_blob_file;
     h->garbage_aware = metadata->is_blob_file && metadata->is_data_block;
-    h->garbage_ratio = ClampRatio(metadata->garbage_ratio);
-    h->score = h->access_freq * (1.0 - h->garbage_ratio);
+    h->garbage_ratio = 0.0;
   }
 
   {
     MutexLock l(&mutex_);
-    AdvanceAgingEpoch();
-    h->last_epoch = current_epoch_;
     if (metadata != nullptr && metadata->statistics != nullptr) {
       statistics_ = metadata->statistics;
     }
+    if (h->garbage_aware && IsObsoleteFile(h->file_number)) {
+      h->garbage_ratio = 1.0;
+    }
     replaced = TableInsert(h);
     if (replaced != nullptr) {
-      RemoveFromCache(replaced);
+      // TableInsert already unlinked `replaced` from the hash table and made
+      // `h` the live node for this key.  Use RemoveReplacedFromCache so we do
+      // not TableRemove(key, hash) and accidentally drop the new node `h`.
+      RemoveReplacedFromCache(replaced);
       replaced_last_reference = Unref(replaced);
     }
     AddToFileIndex(h);
     usage_ += h->charge;
-    admission_usage_ += h->charge;
     if (handle == nullptr) {
-      AddToQueue(h);
+      AddToQueue(h, h->garbage_ratio < 1.0);
     }
     if (h->garbage_aware) {
       RecordTick(metadata != nullptr ? metadata->statistics : nullptr,
@@ -125,6 +107,11 @@ Status GarbageAwareCacheShard::InsertImpl(
       inserted = false;
       s = Status::Incomplete("Insert failed due to strict capacity limit");
       if (replaced != nullptr) {
+        // The new entry was rejected, so restore the entry it displaced and
+        // keep it queryable.  `replaced` was unlinked by TableInsert and
+        // detached via RemoveReplacedFromCache, so re-link it here.  Restore it
+        // toward the LRU head: it is again the only live copy for this key and
+        // was just touched, so it should not be penalized to the tail.
         if (replaced->refs == 0) {
           replaced->refs = 1;
         } else {
@@ -134,13 +121,8 @@ Status GarbageAwareCacheShard::InsertImpl(
         TableInsert(replaced);
         AddToFileIndex(replaced);
         usage_ += replaced->charge;
-        if (replaced->in_admission) {
-          admission_usage_ += replaced->charge;
-        } else {
-          probation_usage_ += replaced->charge;
-        }
         if (replaced->refs == 1) {
-          AddToQueue(replaced, false /* promote */);
+          AddToQueue(replaced, true /* promote */);
         }
         replaced = nullptr;
         replaced_last_reference = false;
@@ -180,27 +162,11 @@ Cache::Handle* GarbageAwareCacheShard::Lookup(const Slice& key,
   if (h == nullptr) {
     return nullptr;
   }
-  if (record_hit) {
-    AdvanceAgingEpoch();
-  }
   if (h->refs == 1 && h->in_queue) {
     RemoveFromQueue(h);
   }
   h->refs++;
-  if (record_hit) {
-    if (!h->in_admission || h->garbage_ratio > 0.0) {
-      ApplyAccessFreqAging(h);
-      h->access_freq++;
-      UpdateScore(h);
-    }
-    if (h->in_admission) {
-      admission_hits_++;
-      RecordTick(stats, GC_AWARE_CACHE_ADMISSION_HIT);
-    } else {
-      probation_hits_++;
-      RecordTick(stats, GC_AWARE_CACHE_PROBATION_HIT);
-    }
-  } else {
+  if (!record_hit) {
     // The returned handle is tagged instead of using entry-level state so a
     // no-hit lookup keeps its release semantics even when hit/no-hit lookups
     // overlap and release in arbitrary order.
@@ -235,18 +201,19 @@ bool GarbageAwareCacheShard::Release(Cache::Handle* handle, bool force_erase) {
     if (Unref(h)) {
       deleted.push_back(h);
     } else if (h->refs == 1 && h->in_cache) {
-      if (!no_hit_release && IsDemotable(h)) {
-        MoveToProbation(h);
-      } else if (h->in_queue) {
+      if (h->in_queue) {
         // No-hit lookups should not promote or demote by themselves. If the
         // entry remained queued, leave its previous queue position intact.
         assert(no_hit_release);
       }
       if (!h->in_queue) {
-        AddToQueue(h, !no_hit_release /* promote */);
+        const bool promote = !no_hit_release && h->garbage_ratio < 1.0;
+        AddToQueue(h, promote);
       }
     }
-    EvictIfNeeded(&deleted);
+    if (usage_ > capacity_) {
+      EvictIfNeeded(&deleted);
+    }
   }
   for (auto* e : deleted) {
     FreeEntry(e);
@@ -270,11 +237,6 @@ void GarbageAwareCacheShard::Erase(const Slice& key, uint32_t hash) {
     RemoveFromFileIndex(h);
     h->in_cache = false;
     usage_ -= h->charge;
-    if (h->in_admission) {
-      admission_usage_ -= h->charge;
-    } else {
-      probation_usage_ -= h->charge;
-    }
     if (Unref(h)) {
       deleted.push_back(h);
     }
@@ -374,25 +336,14 @@ std::string GarbageAwareCacheShard::GetPrintableOptions() const {
   snprintf(buffer, sizeof(buffer),
            "    capacity : %" ROCKSDB_PRIszt "\n"
            "    strict_capacity_limit : %d\n"
-           "    admission_ratio : %.2f\n"
-           "    demote_score_threshold : %.2f\n"
-           "    log_interval : %" PRIu64 "\n"
-           "    enable_aging : %d\n"
-           "    aging_interval : %" PRIu64 "\n",
-           capacity_, strict_capacity_limit_, admission_ratio_,
-           demote_score_threshold_, log_interval_, enable_aging_,
-           aging_interval_);
+           "    log_interval : %" PRIu64 "\n",
+           capacity_, strict_capacity_limit_, log_interval_);
   return std::string(buffer);
 }
 
-size_t GarbageAwareCacheShard::TEST_GetAdmissionSize() const {
+size_t GarbageAwareCacheShard::TEST_GetLRUSize() const {
   MutexLock l(&mutex_);
-  return admission_lru_.size();
-}
-
-size_t GarbageAwareCacheShard::TEST_GetProbationSize() const {
-  MutexLock l(&mutex_);
-  return probation_scores_.size();
+  return lru_.size();
 }
 
 void GarbageAwareCacheShard::MarkBlockCacheFilesObsolete(
@@ -402,9 +353,13 @@ void GarbageAwareCacheShard::MarkBlockCacheFilesObsolete(
   std::vector<GAHandle*> deleted;
   uint64_t marked_blocks = 0;
   uint64_t marked_bytes = 0;
+  bool should_log = false;
   {
     MutexLock l(&mutex_);
     for (uint64_t file_number : file_numbers) {
+      if (file_number != 0) {
+        obsolete_files_.insert(file_number);
+      }
       auto it = file_index_.find(file_number);
       if (it == file_index_.end()) {
         continue;
@@ -412,33 +367,32 @@ void GarbageAwareCacheShard::MarkBlockCacheFilesObsolete(
       std::vector<GAHandle*> handles(it->second.begin(), it->second.end());
       for (GAHandle* h : handles) {
         if (!h->in_cache || h->file_number != file_number ||
-            !h->is_data_block) {
+            !h->garbage_aware) {
           continue;
         }
-        h->garbage_aware = true;
+        const bool newly_marked = h->garbage_ratio < 1.0;
         h->garbage_ratio = 1.0;
-        UpdateScore(h);
-        ++marked_blocks;
-        marked_bytes += h->charge;
+        if (newly_marked) {
+          ++marked_blocks;
+          marked_bytes += h->charge;
+        }
 
-        // Pinned handles (refs > 1) are left resident and will be queued or
-        // demoted safely when the caller releases them. Unpinned non-HIGH data
-        // blocks can be moved to probation immediately so future cache pressure
-        // evicts them ahead of useful blocks.
-        if (h->refs == 1 && h->in_admission &&
-            h->priority != Cache::Priority::HIGH) {
-          MoveToProbation(h);
+        if (newly_marked && h->refs == 1) {
+          MoveToLRUTail(h);
         }
       }
     }
+    const uint64_t old_marked_blocks = obsolete_marked_blocks_;
     obsolete_marked_blocks_ += marked_blocks;
-    obsolete_marked_bytes_ += marked_bytes;
+    should_log = info_log != nullptr && log_interval_ > 0 && marked_blocks > 0 &&
+                 old_marked_blocks / log_interval_ !=
+                     obsolete_marked_blocks_ / log_interval_;
     EvictIfNeeded(&deleted);
   }
   for (auto* e : deleted) {
     FreeEntry(e);
   }
-  if (info_log != nullptr && marked_blocks > 0) {
+  if (should_log) {
     ROCKS_LOG_INFO(info_log,
                    "[GC_AWARE_BLOCK_CACHE_OBSOLETE] reason=%s job=%" PRIu64
                    " marked_blocks=%" PRIu64 " marked_bytes=%" PRIu64,
@@ -447,40 +401,9 @@ void GarbageAwareCacheShard::MarkBlockCacheFilesObsolete(
   }
 }
 
-void GarbageAwareCacheShard::LogBlockCacheObsoleteSample(const char* reason,
-                                                         uint64_t job_id,
-                                                         Logger* info_log) {
-  if (info_log == nullptr) {
-    return;
-  }
-  auto sample = GetObsoleteSample();
-  const double obsolete_block_ratio =
-      sample.tracked_blocks == 0
-          ? 0.0
-          : static_cast<double>(sample.obsolete_blocks) /
-                static_cast<double>(sample.tracked_blocks);
-  const double obsolete_byte_ratio =
-      sample.tracked_bytes == 0
-          ? 0.0
-          : static_cast<double>(sample.obsolete_bytes) /
-                static_cast<double>(sample.tracked_bytes);
-  ROCKS_LOG_INFO(info_log,
-                 "[GC_AWARE_BLOCK_CACHE_OBSOLETE_SAMPLE] reason=%s job=%" PRIu64
-                 " tracked_blocks=%" PRIu64 " tracked_bytes=%" PRIu64
-                 " obsolete_blocks=%" PRIu64 " obsolete_bytes=%" PRIu64
-                 " obsolete_block_ratio=%.6f obsolete_byte_ratio=%.6f"
-                 " obsolete_file_count=%" PRIu64,
-                 reason != nullptr ? reason : "unknown", job_id,
-                 sample.tracked_blocks, sample.tracked_bytes,
-                 sample.obsolete_blocks, sample.obsolete_bytes,
-                 obsolete_block_ratio, obsolete_byte_ratio,
-                 sample.obsolete_file_count);
-}
-
 GarbageAwareCacheShard::ObsoleteSample
 GarbageAwareCacheShard::GetObsoleteSample() const {
   ObsoleteSample sample;
-  std::unordered_set<uint64_t> obsolete_files;
   MutexLock l(&mutex_);
   for (GAHandle* head : table_) {
     for (GAHandle* h = head; h != nullptr; h = h->next_hash) {
@@ -493,12 +416,12 @@ GarbageAwareCacheShard::GetObsoleteSample() const {
         ++sample.obsolete_blocks;
         sample.obsolete_bytes += h->charge;
         if (h->file_number != 0) {
-          obsolete_files.insert(h->file_number);
+          sample.obsolete_files.insert(h->file_number);
         }
       }
     }
   }
-  sample.obsolete_file_count = obsolete_files.size();
+  sample.obsolete_file_count = sample.obsolete_files.size();
   return sample;
 }
 
@@ -609,11 +532,7 @@ void GarbageAwareCacheShard::RemoveFromQueue(GAHandle* h) {
   if (!h->in_queue) {
     return;
   }
-  if (h->in_admission) {
-    admission_lru_.erase(h->lru_it);
-  } else {
-    probation_scores_.erase(h->score_it);
-  }
+  lru_.erase(h->lru_it);
   h->in_queue = false;
 }
 
@@ -622,17 +541,12 @@ void GarbageAwareCacheShard::AddToQueue(GAHandle* h, bool promote) {
   if (h->in_queue) {
     return;
   }
-  if (h->in_admission) {
-    if (promote) {
-      admission_lru_.push_front(h);
-      h->lru_it = admission_lru_.begin();
-    } else {
-      admission_lru_.push_back(h);
-      h->lru_it = --admission_lru_.end();
-    }
+  if (promote) {
+    lru_.push_front(h);
+    h->lru_it = lru_.begin();
   } else {
-    h->score_seq = next_score_seq_++;
-    h->score_it = probation_scores_.insert({h->score, h->score_seq, h}).first;
+    lru_.push_back(h);
+    h->lru_it = --lru_.end();
   }
   h->in_queue = true;
 }
@@ -646,104 +560,48 @@ void GarbageAwareCacheShard::RemoveFromCache(GAHandle* h) {
   TableRemove(h->key_slice(), h->hash);
   h->in_cache = false;
   usage_ -= h->charge;
-  if (h->in_admission) {
-    admission_usage_ -= h->charge;
-  } else {
-    probation_usage_ -= h->charge;
-  }
 }
 
-void GarbageAwareCacheShard::MoveToProbation(GAHandle* h) {
-  if (!h->in_admission || !h->garbage_aware ||
-      h->priority == Cache::Priority::HIGH) {
+// Detach an entry that TableInsert has already unlinked from the hash table
+// (the entry it replaced during a same-key overwrite).  Calling the regular
+// RemoveFromCache here would issue TableRemove(key, hash), which matches by
+// key+hash and would wrongly delete the freshly inserted replacement entry
+// that now occupies that key.  So skip TableRemove and only undo the rest of
+// the cache bookkeeping.
+void GarbageAwareCacheShard::RemoveReplacedFromCache(GAHandle* h) {
+  if (!h->in_cache) {
     return;
   }
-  UpdateScore(h);
   RemoveFromQueue(h);
-  h->in_admission = false;
-  admission_usage_ -= h->charge;
-  probation_usage_ += h->charge;
-  AddToQueue(h);
+  RemoveFromFileIndex(h);
+  h->in_cache = false;
+  usage_ -= h->charge;
+}
+
+void GarbageAwareCacheShard::MoveToLRUTail(GAHandle* h) {
+  if (!h->in_cache || h->refs > 1) {
+    return;
+  }
+  RemoveFromQueue(h);
+  AddToQueue(h, false /* promote */);
   demotions_++;
   RecordTick(statistics_, GC_AWARE_CACHE_DEMOTE);
 }
 
-bool GarbageAwareCacheShard::IsDemotable(GAHandle* h) {
-  if (!h->garbage_aware || !h->in_admission ||
-      h->priority == Cache::Priority::HIGH) {
-    return false;
-  }
-  if (h->garbage_ratio <= 0.0 && demote_score_threshold_ <= 0.0) {
-    return false;
-  }
-  if (h->garbage_ratio >= 1.0) {
-    return true;
-  }
-  UpdateScore(h);
-  return h->access_freq > 0 && h->score <= demote_score_threshold_;
-}
-
-void GarbageAwareCacheShard::AdvanceAgingEpoch() {
-  if (!enable_aging_) {
-    return;
-  }
-  ++operation_count_;
-  current_epoch_ = operation_count_ / aging_interval_;
-}
-
-void GarbageAwareCacheShard::ApplyAccessFreqAging(GAHandle* h) {
-  if (!enable_aging_ || h->last_epoch >= current_epoch_) {
-    return;
-  }
-  const uint64_t steps = current_epoch_ - h->last_epoch;
-  if (steps >= 63) {
-    h->access_freq = 1;
-  } else {
-    h->access_freq = std::max<uint64_t>(1, h->access_freq >> steps);
-  }
-  h->last_epoch = current_epoch_;
-}
-
-void GarbageAwareCacheShard::UpdateScore(GAHandle* h) {
-  const bool reinsert_score = h->in_queue && !h->in_admission;
-  if (reinsert_score) {
-    probation_scores_.erase(h->score_it);
-  }
-  ApplyAccessFreqAging(h);
-  h->score = h->access_freq * (1.0 - h->garbage_ratio);
-  if (reinsert_score) {
-    h->score_seq = next_score_seq_++;
-    h->score_it = probation_scores_.insert({h->score, h->score_seq, h}).first;
-  }
-}
-
-void GarbageAwareCacheShard::RefreshProbationScoresForAging() {
-  if (!enable_aging_ || probation_scores_.empty()) {
-    return;
-  }
-  std::vector<GAHandle*> handles;
-  handles.reserve(probation_scores_.size());
-  for (const auto& score : probation_scores_) {
-    handles.push_back(score.handle);
-  }
-  probation_scores_.clear();
-  for (auto* h : handles) {
-    ApplyAccessFreqAging(h);
-    h->score = h->access_freq * (1.0 - h->garbage_ratio);
-    h->score_seq = next_score_seq_++;
-    h->score_it = probation_scores_.insert({h->score, h->score_seq, h}).first;
-  }
+bool GarbageAwareCacheShard::IsObsoleteFile(uint64_t file_number) const {
+  return file_number != 0 &&
+         obsolete_files_.find(file_number) != obsolete_files_.end();
 }
 
 void GarbageAwareCacheShard::AddToFileIndex(GAHandle* h) {
-  if (h->file_number == 0 || !h->is_data_block) {
+  if (h->file_number == 0 || !h->is_data_block || !h->garbage_aware) {
     return;
   }
   file_index_[h->file_number].insert(h);
 }
 
 void GarbageAwareCacheShard::RemoveFromFileIndex(GAHandle* h) {
-  if (h->file_number == 0 || !h->is_data_block) {
+  if (h->file_number == 0 || !h->is_data_block || !h->garbage_aware) {
     return;
   }
   auto it = file_index_.find(h->file_number);
@@ -756,112 +614,37 @@ void GarbageAwareCacheShard::RemoveFromFileIndex(GAHandle* h) {
   }
 }
 
-GarbageAwareCacheShard::GAHandle* GarbageAwareCacheShard::FindAdmissionVictim(
-    bool require_garbage_aware, bool require_low_priority) {
-  for (auto it = admission_lru_.rbegin(); it != admission_lru_.rend(); ++it) {
-    GAHandle* h = *it;
-    if (h->refs > 1) {
-      continue;
-    }
-    if (require_low_priority && h->priority == Cache::Priority::HIGH) {
-      continue;
-    }
-    if (require_garbage_aware != h->garbage_aware) {
-      continue;
-    }
-    return h;
+GarbageAwareCacheShard::GAHandle* GarbageAwareCacheShard::FindLRUVictim() {
+  if (lru_.empty()) {
+    return nullptr;
   }
-  return nullptr;
+  GAHandle* h = nullptr;
+  for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
+    if ((*it)->priority != Cache::Priority::HIGH) {
+      h = *it;
+      break;
+    }
+  }
+  if (h == nullptr) {
+    h = lru_.back();
+  }
+  assert(h->refs == 1);
+  return h;
 }
 
 void GarbageAwareCacheShard::EvictIfNeeded(std::vector<GAHandle*>* deleted) {
-  const size_t admission_capacity =
-      static_cast<size_t>(capacity_ * admission_ratio_);
-  while (admission_usage_ > admission_capacity && !admission_lru_.empty()) {
-    // Admission quota pressure is a soft partitioning signal. Prefer demoting
-    // low-priority garbage-aware blocks, then evict low-priority ordinary
-    // blocks. High-priority index/filter blocks are not admission-quota victims;
-    // they are only considered later if the hard total capacity is exceeded.
-    GAHandle* h = FindAdmissionVictim(true /* require_garbage_aware */,
-                                      true /* require_low_priority */);
-    if (h != nullptr && IsDemotable(h)) {
-      MoveToProbation(h);
-      continue;
-    }
-    // Do not enforce the soft admission quota by evicting ordinary blocks.
-    // Before obsolete-file feedback arrives most data blocks have no garbage
-    // signal, so evicting them here shrinks the effective cache to only
-    // admission_ratio * capacity and makes the GC-aware cache slower than LRU.
-    // Ordinary blocks are still evicted by the hard-capacity path below.
-    break;
-  }
-
-  const size_t probation_capacity = capacity_ - admission_capacity;
-  if ((probation_usage_ > probation_capacity && usage_ > capacity_) ||
-      usage_ > capacity_) {
-    RefreshProbationScoresForAging();
-  }
-  while (probation_usage_ > probation_capacity && usage_ > capacity_ &&
-         !probation_scores_.empty()) {
-    auto victim_it = probation_scores_.begin();
-    while (victim_it != probation_scores_.end() && victim_it->handle->refs > 1) {
-      ++victim_it;
-    }
-    if (victim_it == probation_scores_.end()) {
-      break;
-    }
-    GAHandle* h = victim_it->handle;
-    RemoveFromCache(h);
-    if (Unref(h)) {
-      deleted->push_back(h);
-    }
-    low_score_evictions_++;
-    RecordTick(statistics_, GC_AWARE_CACHE_EVICT_LOW_SCORE);
+  if (usage_ <= capacity_) {
+    return;
   }
 
   while (usage_ > capacity_) {
-    GAHandle* h = nullptr;
-    if (!probation_scores_.empty()) {
-      auto victim_it = probation_scores_.begin();
-      while (victim_it != probation_scores_.end() &&
-             victim_it->handle->refs > 1) {
-        ++victim_it;
-      }
-      h = victim_it == probation_scores_.end() ? nullptr : victim_it->handle;
+    GAHandle* h = FindLRUVictim();
+    if (h == nullptr) {
+      break;
     }
-    if (h != nullptr) {
+    if (h->garbage_aware && h->garbage_ratio >= 1.0) {
       low_score_evictions_++;
       RecordTick(statistics_, GC_AWARE_CACHE_EVICT_LOW_SCORE);
-    } else {
-      GAHandle* garbage_aware_lru = FindAdmissionVictim(
-          true /* require_garbage_aware */, true /* require_low_priority */);
-      if (garbage_aware_lru != nullptr && IsDemotable(garbage_aware_lru)) {
-        h = garbage_aware_lru;
-        MoveToProbation(h);
-        continue;
-      }
-      h = FindAdmissionVictim(false /* require_garbage_aware */,
-                              true /* require_low_priority */);
-      if (h == nullptr) {
-        // If the cache is over its hard capacity and the resident set consists
-        // mostly of fresh blob data blocks, fall back to ordinary LRU eviction
-        // instead of leaving the cache oversized. Fresh blocks are only spared
-        // from the soft admission-quota demotion path above.
-        h = garbage_aware_lru;
-      }
-      if (h == nullptr) {
-        // Hard capacity fallback: high-priority blocks can still be evicted if
-        // no low-priority victim exists and the cache is over capacity.
-        h = FindAdmissionVictim(true /* require_garbage_aware */,
-                                false /* require_low_priority */);
-      }
-      if (h == nullptr) {
-        h = FindAdmissionVictim(false /* require_garbage_aware */,
-                                false /* require_low_priority */);
-      }
-      if (h == nullptr) {
-        break;
-      }
     }
     RemoveFromCache(h);
     if (Unref(h)) {
@@ -883,12 +666,9 @@ void GarbageAwareCacheShard::MaybeLogLocked(
   ROCKS_LOG_INFO(
       metadata->info_log,
       "[GC_AWARE_BLOCK_CACHE] usage=%" ROCKSDB_PRIszt
-      " admission_usage=%" ROCKSDB_PRIszt
-      " probation_usage=%" ROCKSDB_PRIszt
-      " admission_hits=%" PRIu64 " probation_hits=%" PRIu64
-      " demote=%" PRIu64 " evict_low_score=%" PRIu64,
-      usage_, admission_usage_, probation_usage_, admission_hits_,
-      probation_hits_, demotions_, low_score_evictions_);
+      " lru_size=%" ROCKSDB_PRIszt
+      " move_obsolete_tail=%" PRIu64 " evict_obsolete=%" PRIu64,
+      usage_, lru_.size(), demotions_, low_score_evictions_);
 }
 
 GarbageAwareCache::GarbageAwareCache(const GarbageAwareCacheOptions& options,
@@ -903,9 +683,7 @@ GarbageAwareCache::GarbageAwareCache(const GarbageAwareCacheOptions& options,
       (options.capacity + (num_shards_ - 1)) / num_shards_;
   for (int i = 0; i < num_shards_; ++i) {
     new (&shards_[i]) GarbageAwareCacheShard(
-        per_shard, options.strict_capacity_limit, options.admission_ratio,
-        options.demote_score_threshold, options.log_interval,
-        options.enable_aging, options.aging_interval);
+        per_shard, options.strict_capacity_limit, options.log_interval);
   }
 }
 
@@ -970,11 +748,14 @@ void GarbageAwareCache::MarkBlockCacheFilesObsolete(
     const std::vector<uint64_t>& file_numbers,
     const std::vector<uint64_t>& output_file_numbers, const char* reason,
     uint64_t job_id, Logger* info_log) {
+  // Optimization only: relocate obsolete blocks toward the LRU tail.  The
+  // diagnostic residency sample is emitted separately through
+  // LogBlockCacheObsoleteSample so that it stays off the GC hot path unless
+  // explicitly enabled.
   for (int i = 0; i < num_shards_; ++i) {
     shards_[i].MarkBlockCacheFilesObsolete(file_numbers, output_file_numbers,
                                            reason, job_id, info_log);
   }
-  LogBlockCacheObsoleteSample(reason, job_id, info_log);
 }
 
 void GarbageAwareCache::LogBlockCacheObsoleteSample(const char* reason,
@@ -984,14 +765,17 @@ void GarbageAwareCache::LogBlockCacheObsoleteSample(const char* reason,
     return;
   }
   GarbageAwareCacheShard::ObsoleteSample sample;
+  std::unordered_set<uint64_t> obsolete_files;
   for (int i = 0; i < num_shards_; ++i) {
     auto shard_sample = shards_[i].GetObsoleteSample();
     sample.tracked_blocks += shard_sample.tracked_blocks;
     sample.tracked_bytes += shard_sample.tracked_bytes;
     sample.obsolete_blocks += shard_sample.obsolete_blocks;
     sample.obsolete_bytes += shard_sample.obsolete_bytes;
-    sample.obsolete_file_count += shard_sample.obsolete_file_count;
+    obsolete_files.insert(shard_sample.obsolete_files.begin(),
+                          shard_sample.obsolete_files.end());
   }
+  sample.obsolete_file_count = obsolete_files.size();
   const double obsolete_block_ratio =
       sample.tracked_blocks == 0
           ? 0.0
@@ -1003,33 +787,26 @@ void GarbageAwareCache::LogBlockCacheObsoleteSample(const char* reason,
           : static_cast<double>(sample.obsolete_bytes) /
                 static_cast<double>(sample.tracked_bytes);
   const uint64_t sample_id = obsolete_sample_id_.fetch_add(1) + 1;
+  // Only emit fields that downstream tooling actually consumes.  The log
+  // timestamp is recovered from the line prefix by the parser, so we do not
+  // fabricate ts_us/mean/peak/top-file values here.
   ROCKS_LOG_INFO(info_log,
-                 "[BLOCK_CACHE_OBSOLETE_SAMPLE] ts_us=0 sample_id=%" PRIu64
+                 "[BLOCK_CACHE_OBSOLETE_SAMPLE] sample_id=%" PRIu64
                  " job=%" PRIu64 " reason=%s tracked_blocks=%" PRIu64
                  " tracked_bytes=%" PRIu64 " obsolete_blocks=%" PRIu64
                  " obsolete_bytes=%" PRIu64 " obsolete_block_ratio=%.6f"
-                 " obsolete_byte_ratio=%.6f mean_obsolete_byte_ratio=%.6f"
-                 " peak_obsolete_byte_ratio=%.6f obsolete_file_count=%" PRIu64
-                 " top_obsolete_files=%s",
+                 " obsolete_byte_ratio=%.6f obsolete_file_count=%" PRIu64,
                  sample_id, job_id, reason == nullptr ? "unknown" : reason,
                  sample.tracked_blocks, sample.tracked_bytes,
                  sample.obsolete_blocks, sample.obsolete_bytes,
-                 obsolete_block_ratio, obsolete_byte_ratio, obsolete_byte_ratio,
-                 obsolete_byte_ratio, sample.obsolete_file_count, "gc_aware");
+                 obsolete_block_ratio, obsolete_byte_ratio,
+                 sample.obsolete_file_count);
 }
 
-size_t GarbageAwareCache::TEST_GetAdmissionSize() const {
+size_t GarbageAwareCache::TEST_GetLRUSize() const {
   size_t total = 0;
   for (int i = 0; i < num_shards_; ++i) {
-    total += shards_[i].TEST_GetAdmissionSize();
-  }
-  return total;
-}
-
-size_t GarbageAwareCache::TEST_GetProbationSize() const {
-  size_t total = 0;
-  for (int i = 0; i < num_shards_; ++i) {
-    total += shards_[i].TEST_GetProbationSize();
+    total += shards_[i].TEST_GetLRUSize();
   }
   return total;
 }
@@ -1041,30 +818,16 @@ uint32_t GarbageAwareCache::ShardForHash(uint32_t hash) const {
 
 std::shared_ptr<Cache> NewGarbageAwareCache(
     const GarbageAwareCacheOptions& cache_opts) {
-  return NewGarbageAwareCache(
-      cache_opts.capacity, cache_opts.num_shard_bits,
-      cache_opts.strict_capacity_limit, cache_opts.admission_ratio,
-      cache_opts.demote_score_threshold, cache_opts.log_interval,
-      cache_opts.memory_allocator, cache_opts.enable_aging,
-      cache_opts.aging_interval);
+  return NewGarbageAwareCache(cache_opts.capacity, cache_opts.num_shard_bits,
+                              cache_opts.strict_capacity_limit,
+                              cache_opts.log_interval,
+                              cache_opts.memory_allocator);
 }
 
 std::shared_ptr<Cache> NewGarbageAwareCache(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
-    double admission_ratio, double demote_score_threshold, uint64_t log_interval,
+    uint64_t log_interval,
     std::shared_ptr<MemoryAllocator> memory_allocator) {
-  return NewGarbageAwareCache(capacity, num_shard_bits, strict_capacity_limit,
-                              admission_ratio, demote_score_threshold,
-                              log_interval, std::move(memory_allocator),
-                              false /* enable_aging */,
-                              10000 /* aging_interval */);
-}
-
-std::shared_ptr<Cache> NewGarbageAwareCache(
-    size_t capacity, int num_shard_bits, bool strict_capacity_limit,
-    double admission_ratio, double demote_score_threshold, uint64_t log_interval,
-    std::shared_ptr<MemoryAllocator> memory_allocator, bool enable_aging,
-    uint64_t aging_interval) {
   if (num_shard_bits >= 20) {
     return nullptr;  // the cache cannot be sharded into too many fine pieces
   }
@@ -1075,11 +838,7 @@ std::shared_ptr<Cache> NewGarbageAwareCache(
   options.capacity = capacity;
   options.num_shard_bits = num_shard_bits;
   options.strict_capacity_limit = strict_capacity_limit;
-  options.admission_ratio = admission_ratio;
-  options.demote_score_threshold = demote_score_threshold;
   options.log_interval = log_interval;
-  options.enable_aging = enable_aging;
-  options.aging_interval = aging_interval;
   options.memory_allocator = std::move(memory_allocator);
   return std::make_shared<GarbageAwareCache>(options, num_shard_bits);
 }

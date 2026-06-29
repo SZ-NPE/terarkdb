@@ -183,14 +183,10 @@ Status SanitizeOptionsByTable(
   Status s;
   for (auto cf : column_families) {
     auto& op = cf.options;
-    if (op.precise_gc && op.table_factory != nullptr &&
-        op.table_factory->Name() == BlockBasedTableFactory::kName) {
-      auto* block_based_table_options = static_cast<BlockBasedTableOptions*>(
-          op.table_factory->GetOptions());
-      if (block_based_table_options != nullptr) {
-        block_based_table_options->use_delta_block = true;
-      }
+    if (op.precise_gc && !op.byte_precise_gc) {
+      op.byte_precise_gc = true;
     }
+    op.precise_gc = op.byte_precise_gc;
     s = op.table_factory->SanitizeOptions(db_opts, op);
     if (!s.ok()) {
       return s;

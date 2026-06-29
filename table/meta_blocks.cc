@@ -80,9 +80,13 @@ void PropertyBlockBuilder::Add(
 void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kRawKeySize, props.raw_key_size);
   Add(TablePropertiesNames::kRawValueSize, props.raw_value_size);
+  Add(TablePropertiesNames::kSeparatedTotalSize, props.separated_total_size);
+  Add(TablePropertiesNames::kSeparatedEntryCount, props.separated_entry_count);
+  Add(TablePropertiesNames::kValueMetaTotalSize, props.value_meta_total_size);
   if (props.delta_block_size != 0) {
     Add(TablePropertiesNames::kDeltaBlockSize, props.delta_block_size);
   }
+  Add(TablePropertiesNames::kRemoteValueSize, props.remote_value_size);
   Add(TablePropertiesNames::kDataSize, props.data_size);
   Add(TablePropertiesNames::kIndexSize, props.index_size);
   if (props.index_partitions != 0) {
@@ -114,6 +118,7 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
     PutVarint32Varint64(&val, props.max_read_amp, DoubleToU64(props.read_amp));
     Add(TablePropertiesNames::kReadAmp, val);
   }
+  Add(TablePropertiesNames::kFileSstType, props.sst_type);
   if (!props.dependence.empty()) {
     std::vector<uint64_t> val;
     val.reserve(props.dependence.size());
@@ -128,14 +133,9 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
     Add(TablePropertiesNames::kDependenceEntryCount, val);
     val.clear();
     for (auto& dependence : props.dependence) {
-      val.emplace_back(dependence.byte_count);
+      val.emplace_back(dependence.separated_total_size);
     }
-    Add(TablePropertiesNames::kDependenceByteCount, val);
-    val.clear();
-    for (auto& dependence : props.dependence) {
-      val.emplace_back(dependence.byte_count_entry_count);
-    }
-    Add(TablePropertiesNames::kDependenceByteCountEntryCount, val);
+    Add(TablePropertiesNames::kDependenceSeparatedSize, val);
   }
   if (!props.inheritance_tree.empty()) {
     Add(TablePropertiesNames::kInheritanceTree, props.inheritance_tree);
@@ -282,8 +282,16 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       {TablePropertiesNames::kRawKeySize, &new_table_properties->raw_key_size},
       {TablePropertiesNames::kRawValueSize,
        &new_table_properties->raw_value_size},
+      {TablePropertiesNames::kSeparatedTotalSize,
+       &new_table_properties->separated_total_size},
+      {TablePropertiesNames::kSeparatedEntryCount,
+       &new_table_properties->separated_entry_count},
+      {TablePropertiesNames::kValueMetaTotalSize,
+       &new_table_properties->value_meta_total_size},
       {TablePropertiesNames::kDeltaBlockSize,
        &new_table_properties->delta_block_size},
+      {TablePropertiesNames::kRemoteValueSize,
+       &new_table_properties->remote_value_size},
       {TablePropertiesNames::kNumDataBlocks,
        &new_table_properties->num_data_blocks},
       {TablePropertiesNames::kNumEntries, &new_table_properties->num_entries},
@@ -368,6 +376,13 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
         continue;
       }
       *pos->second = val;
+    } else if (key == TablePropertiesNames::kFileSstType) {
+      uint64_t val;
+      if (!GetVarint64(&raw_val, &val)) {
+        log_error();
+        continue;
+      }
+      new_table_properties->sst_type = static_cast<int>(val);
     } else if (key == TablePropertiesNames::kFilterPolicy) {
       new_table_properties->filter_policy_name = raw_val.ToString();
     } else if (key == TablePropertiesNames::kColumnFamilyName) {
@@ -429,7 +444,7 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       for (size_t i = 0; i < val.size(); ++i) {
         new_table_properties->dependence[i].entry_count = val[i];
       }
-    } else if (key == TablePropertiesNames::kDependenceByteCount) {
+    } else if (key == TablePropertiesNames::kDependenceSeparatedSize) {
       std::vector<uint64_t> val;
       GetUint64Vector(key, &raw_val, val);
       if (new_table_properties->dependence.empty()) {
@@ -440,18 +455,6 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       }
       for (size_t i = 0; i < val.size(); ++i) {
         new_table_properties->dependence[i].byte_count = val[i];
-      }
-    } else if (key == TablePropertiesNames::kDependenceByteCountEntryCount) {
-      std::vector<uint64_t> val;
-      GetUint64Vector(key, &raw_val, val);
-      if (new_table_properties->dependence.empty()) {
-        new_table_properties->dependence.resize(val.size());
-      } else if (new_table_properties->dependence.size() != val.size()) {
-        log_error();
-        continue;
-      }
-      for (size_t i = 0; i < val.size(); ++i) {
-        new_table_properties->dependence[i].byte_count_entry_count = val[i];
       }
     } else if (key == TablePropertiesNames::kInheritanceChain) {
       std::vector<uint64_t> val;

@@ -154,6 +154,38 @@ TEST_F(CompactionPickerTest, Single) {
   ASSERT_TRUE(compaction.get() == nullptr);
 }
 
+TEST_F(CompactionPickerTest, GarbageCollectionGroupsByPersistedSstType) {
+  NewVersionStorage(6, kCompactionStyleLevel);
+  mutable_cf_options_.enable_hotness_tracker = false;
+  mutable_cf_options_.enable_delta_separate = false;
+  mutable_cf_options_.blob_gc_ratio = 0.5;
+  mutable_cf_options_.target_blob_file_size = 1 << 20;
+
+  Add(-1, 11U, "100", "199", 10000U);
+  Add(-1, 12U, "200", "299", 10000U);
+  FileMetaData* warm = file_map_[11U].first;
+  FileMetaData* cold = file_map_[12U].first;
+  warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+  cold->prop.sst_type = static_cast<uint8_t>(SstType::kColdLargeBlob);
+  for (FileMetaData* f : {warm, cold}) {
+    f->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    f->prop.num_entries = 100;
+    f->num_antiquation = 90;
+    f->num_antiquation_bytes = 9000;
+  }
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickGarbageCollection(
+          cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+
+  ASSERT_NE(nullptr, compaction.get());
+  ASSERT_EQ(kGarbageCollection, compaction->compaction_type());
+  ASSERT_EQ(1U, compaction->num_input_files(0));
+  ASSERT_EQ(SstType::kWarmLargeBlob,
+            static_cast<SstType>(compaction->input(0, 0)->prop.sst_type));
+}
+
 TEST_F(CompactionPickerTest, Level0Trigger) {
   NewVersionStorage(6, kCompactionStyleLevel);
   mutable_cf_options_.level0_file_num_compaction_trigger = 2;
@@ -791,7 +823,8 @@ TEST_F(CompactionPickerTest, ParentIndexResetBug) {
   Add(2, 7U, "400", "500");  // <- being compacted
 
   vstorage_->LevelFiles(2)[3]->being_compacted = true;
-  vstorage_->LevelFiles(0)[0]->marked_for_compaction = true;
+  vstorage_->LevelFiles(0)[0]->marked_for_compaction =
+      FileMetaData::kMarkedFromUser;
 
   UpdateVersionStorageInfo();
 
@@ -927,8 +960,10 @@ TEST_F(CompactionPickerTest, OverlappingUserKeys6) {
   Add(2, 6U, "460", "600", 1U, 0, 0);
   Add(2, 7U, "600", "700", 1U, 0, 0);
 
-  vstorage_->LevelFiles(1)[0]->marked_for_compaction = true;
-  vstorage_->LevelFiles(1)[1]->marked_for_compaction = true;
+  vstorage_->LevelFiles(1)[0]->marked_for_compaction =
+      FileMetaData::kMarkedFromUser;
+  vstorage_->LevelFiles(1)[1]->marked_for_compaction =
+      FileMetaData::kMarkedFromUser;
 
   UpdateVersionStorageInfo();
 
@@ -1306,8 +1341,9 @@ TEST_F(CompactionPickerTest, EstimateCompactionBytesNeededDynamicLevel) {
   UpdateVersionStorageInfo();
 
   // Merging to the second last level: (5200 / 2100 + 1) * 1100
-  // Merging to the last level: (50000 / 6300 + 1) * 1300
-  ASSERT_EQ(2100u + 3823u + 11617u,
+  // The last level is not an input level, so the estimate stops at the
+  // compaction into the last level instead of recursively compacting it.
+  ASSERT_EQ(2100u + 3823u,
             vstorage_->estimated_compaction_needed_bytes());
 }
 

@@ -95,7 +95,8 @@ struct TableBuilderOptions {
       const std::string* _compression_dict, bool _skip_filters,
       const std::string& _column_family_name, int _level,
       double _compaction_load, uint64_t _creation_time = 0,
-      int64_t _oldest_key_time = 0, SstPurpose _sst_purpose = kEssenceSst)
+      int64_t _oldest_key_time = 0, SstPurpose _sst_purpose = kEssenceSst,
+      SstType _sst_type = SstType::kNormal)
       : ioptions(_ioptions),
         moptions(_moptions),
         internal_comparator(_internal_comparator),
@@ -109,7 +110,8 @@ struct TableBuilderOptions {
         compaction_load(_compaction_load),
         creation_time(_creation_time),
         oldest_key_time(_oldest_key_time),
-        sst_purpose(_sst_purpose) {}
+        sst_purpose(_sst_purpose),
+        sst_type(_sst_type) {}
   const ImmutableCFOptions& ioptions;
   const MutableCFOptions& moptions;
   const InternalKeyComparator& internal_comparator;
@@ -127,6 +129,7 @@ struct TableBuilderOptions {
   const uint64_t creation_time;
   const int64_t oldest_key_time;
   const SstPurpose sst_purpose;
+  const SstType sst_type;
   Slice smallest_user_key;
   Slice largest_user_key;
 

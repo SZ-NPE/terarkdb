@@ -95,6 +95,7 @@ struct TablePropertyCache {
   uint8_t purpose = 0;                 // zero for essence sst
   uint16_t max_read_amp = 1;           // max read amp from sst
   float read_amp = 1;                  // expt read amp from sst
+  uint8_t sst_type = static_cast<uint8_t>(SstType::kMaxSstType);
   std::vector<Dependence> dependence;  // make these sst hidden
   std::vector<uint64_t> inheritance;   // inheritance set
   uint64_t earliest_time_begin_compact = port::kMaxUint64;

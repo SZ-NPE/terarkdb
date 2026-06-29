@@ -1245,7 +1245,8 @@ VersionStorageInfo::VersionStorageInfo(
       is_pick_compaction_fail(false),
       is_pick_garbage_collection_fail(false),
       force_consistency_checks_(_force_consistency_checks),
-      blob_marked_for_compaction_(false) {
+      blob_marked_for_compaction_(false),
+      blob_needs_defragmentation_(false) {
   ++files_;  // level -1 used for dependence files
 }
 
@@ -1861,12 +1862,23 @@ void VersionStorageInfo::ComputeCompactionScore(
   uint64_t num_antiquation_bytes = 0;
   uint64_t num_entries = 0;
   uint64_t blob_accounting_bytes = 0;
+  uint64_t fragment_count = 0;
   bool marked = false;
+  size_t target_blob_file_size = MaxBlobSize(
+      mutable_cf_options, immutable_cf_options.num_levels,
+      immutable_cf_options.compaction_style);
+  size_t fragment_size = mutable_cf_options.blob_file_defragment_size;
+  if (fragment_size == 0) {
+    fragment_size = target_blob_file_size / 8;
+  }
   for (auto& f : LevelFiles(-1)) {
     if (!f->is_gc_permitted()) {
       continue;
     }
     marked |= f->marked_for_compaction;
+    if (!f->being_compacted && f->fd.GetFileSize() < fragment_size) {
+      ++fragment_count;
+    }
     num_antiquation = num_antiquation > std::numeric_limits<uint64_t>::max() -
                                            f->num_antiquation
                           ? std::numeric_limits<uint64_t>::max()
@@ -1888,8 +1900,9 @@ void VersionStorageInfo::ComputeCompactionScore(
             : blob_accounting_bytes + accounting_bytes;
   }
   blob_marked_for_compaction_ = marked;
+  blob_needs_defragmentation_ = fragment_count > 8;
   total_garbage_ratio_ = std::min(
-      1.0, mutable_cf_options.precise_gc
+      1.0, mutable_cf_options.byte_precise_gc
                ? num_antiquation_bytes /
                      std::max<double>(1, blob_accounting_bytes)
                : num_antiquation / std::max<double>(1, num_entries));

@@ -197,6 +197,7 @@ void ProcessFileMetaData(const char* job_info, FileMetaData* meta,
   meta->prop.num_deletions = tp->num_deletions;
   meta->prop.raw_key_size = tp->raw_key_size;
   meta->prop.raw_value_size = tp->raw_value_size;
+  meta->prop.sst_type = static_cast<uint8_t>(tp->sst_type);
   meta->prop.flags |=
       tp->num_range_deletions > 0 ? 0 : TablePropertyCache::kNoRangeDeletions;
   meta->prop.flags |=

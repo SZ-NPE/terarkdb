@@ -247,8 +247,8 @@ void CompactionIterator::MaybeRecordDroppedKey(const ParsedInternalKey& ikey) {
   // the legacy GC reverse lookup. Keep the pre-install staging bounded so a
   // large overwrite-heavy compaction cannot grow memory without limit before
   // InstallCompactionResults() succeeds and publishes the entries.
-  constexpr size_t kMaxPendingDroppedKeys = 4096;
-  constexpr size_t kMaxPendingDroppedKeyBytes = 4 * 1024 * 1024;
+  constexpr size_t kMaxPendingDroppedKeys = 256 * 1024;
+  constexpr size_t kMaxPendingDroppedKeyBytes = 32 * 1024 * 1024;
   const size_t key_size = ikey.user_key.size();
   const size_t entry_charge = key_size + sizeof(std::string) +
                               sizeof(SequenceNumber);
@@ -960,18 +960,6 @@ void CompactionIterator::PrepareOutput() {
     } else {
       if (!blob_config_.read_separated_value_by_handle) {
         output_value_meta_.block_handle = BlockHandle();
-      }
-      if (output_value_meta_.value_size == 0 &&
-          input_.separate_helper()->ShouldUpdateValueSize()) {
-        auto s = value_.fetch();
-        if (!s.ok()) {
-          valid_ = false;
-          status_ = std::move(s);
-          return;
-        }
-        if (!set_output_value_size()) {
-          return;
-        }
       }
       auto s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_, &output_value_meta_,

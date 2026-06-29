@@ -321,6 +321,7 @@ class BlockBasedTable : public TableReader {
       BlockBasedTable::CachableEntry<Block>* block,
       const Slice& compression_dict, size_t read_amp_bytes_per_bit,
       bool is_index = false, GetContext* get_context = nullptr,
+      const BlockHandle* block_handle = nullptr,
       const BlockCacheMetadata* block_cache_metadata = nullptr);
 
   // Put a raw block (maybe compressed) to the corresponding block caches.

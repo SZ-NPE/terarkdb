@@ -65,6 +65,17 @@ BlockBasedTable::~BlockBasedTable() {
 std::atomic<uint64_t> BlockBasedTable::next_cache_key_id_(0);
 
 namespace {
+
+void FillBlockCacheMetadata(BlockBasedTable::Rep* rep,
+                            const BlockHandle& handle, bool is_index,
+                            BlockCacheMetadata* metadata) {
+  metadata->is_blob_file = rep->is_blob_file.load(std::memory_order_relaxed);
+  metadata->is_data_block = !is_index;
+  metadata->file_number = rep->file_number;
+  metadata->statistics = rep->ioptions.statistics;
+  metadata->info_log = rep->ioptions.info_log;
+}
+
 // Read the block identified by "handle" from "file".
 // The only relevant option is options.verify_checksums for now.
 // On failure return non-OK.
@@ -1304,6 +1315,7 @@ Status BlockBasedTable::GetDataBlockFromCache(
     const ReadOptions& read_options,
     BlockBasedTable::CachableEntry<Block>* block, const Slice& compression_dict,
     size_t read_amp_bytes_per_bit, bool is_index, GetContext* get_context,
+    const BlockHandle* block_handle,
     const BlockCacheMetadata* block_cache_metadata) {
   Status s;
   BlockContents* compressed_block = nullptr;
@@ -1373,10 +1385,16 @@ Status BlockBasedTable::GetDataBlockFromCache(
     if (block_cache != nullptr && block->value->own_bytes() &&
         read_options.fill_cache) {
       size_t charge = block->value->ApproximateMemoryUsage();
-      if (block_cache_metadata != nullptr) {
+      BlockCacheMetadata local_metadata;
+      const BlockCacheMetadata* metadata = block_cache_metadata;
+      if (metadata == nullptr && block_handle != nullptr) {
+        FillBlockCacheMetadata(rep, *block_handle, is_index, &local_metadata);
+        metadata = &local_metadata;
+      }
+      if (metadata != nullptr) {
         s = block_cache->InsertWithMetadata(
             block_cache_key, block->value, charge, &DeleteCachedEntry<Block>,
-            block_cache_metadata, &(block->cache_handle));
+            metadata, &(block->cache_handle));
       } else {
         s = block_cache->Insert(block_cache_key, block->value, charge,
                                 &DeleteCachedEntry<Block>,
@@ -1951,17 +1969,6 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
   Slice ckey /* key to the compressed block cache */;
   if (block_cache != nullptr || block_cache_compressed != nullptr) {
     Statistics* statistics = rep->ioptions.statistics;
-    BlockCacheMetadata block_cache_metadata;
-    block_cache_metadata.is_blob_file =
-        rep->is_blob_file.load(std::memory_order_relaxed);
-    block_cache_metadata.is_data_block = !is_index;
-    block_cache_metadata.file_number = rep->file_number;
-    block_cache_metadata.block_offset = handle.offset();
-    block_cache_metadata.block_size = handle.size();
-    block_cache_metadata.garbage_ratio =
-        rep->file_garbage_ratio.load(std::memory_order_relaxed);
-    block_cache_metadata.statistics = statistics;
-    block_cache_metadata.info_log = rep->ioptions.info_log;
 
     // create key for block cache
     if (block_cache != nullptr) {
@@ -1978,7 +1985,7 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
     s = GetDataBlockFromCache(key, ckey, block_cache, block_cache_compressed,
                               rep, ro, block_entry, compression_dict,
                               rep->table_options.read_amp_bytes_per_bit,
-                              is_index, get_context, &block_cache_metadata);
+                              is_index, get_context, &handle);
 
     // Can't find the block from the cache. If I/O is allowed, read from the
     // file.
@@ -2002,6 +2009,8 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
 
       if (s.ok()) {
         SequenceNumber seq_no = rep->get_global_seqno(is_index);
+        BlockCacheMetadata block_cache_metadata;
+        FillBlockCacheMetadata(rep, handle, is_index, &block_cache_metadata);
         // If filling cache is allowed and a cache is configured, try to put the
         // block to the cache.
         s = PutDataBlockToCache(

@@ -283,6 +283,7 @@ struct BlockBasedTableBuilder::Rep {
   const std::string& column_family_name;
   uint64_t creation_time = 0;
   uint64_t oldest_key_time = 0;
+  SstType sst_type = SstType::kNormal;
 
   std::vector<std::unique_ptr<IntTblPropCollector>> table_properties_collectors;
 
@@ -324,7 +325,8 @@ struct BlockBasedTableBuilder::Rep {
         column_family_id(_column_family_id),
         column_family_name(builder_opt.column_family_name),
         creation_time(builder_opt.creation_time),
-        oldest_key_time(builder_opt.oldest_key_time) {
+        oldest_key_time(builder_opt.oldest_key_time),
+        sst_type(builder_opt.sst_type) {
     if (table_options.index_type ==
         BlockBasedTableOptions::kTwoLevelIndexSearch) {
       p_index_builder_ = PartitionedIndexBuilder::CreateIndexBuilder(
@@ -434,7 +436,7 @@ Status BlockBasedTableBuilder::Add(
     // < all entries in subsequent blocks.
     if (ok()) {
       r->index_builder->AddIndexEntry(&r->last_key, &key, r->pending_handle);
-      if (r->table_options.use_delta_block) {
+      if (r->table_options.use_separated_value_meta_block) {
         if (!delta_index_fits()) {
           r->status = Status::InvalidArgument(
               "SST is too large for delta-block index metadata");
@@ -459,7 +461,7 @@ Status BlockBasedTableBuilder::Add(
     r->index_builder->AddIndexEntry(&r->last_key, &key, r->pending_handle);
   }
   r->data_block.Add(key, value);
-  if (r->table_options.use_delta_block) {
+  if (r->table_options.use_separated_value_meta_block) {
     Status delta_status = r->delta_block.Add(
         is_separated, is_separated ? value_meta.value_size : 0,
         value_meta.meta_data.empty() ? nullptr : &value_meta.meta_data);
@@ -471,7 +473,7 @@ Status BlockBasedTableBuilder::Add(
   if (r->store_block_handle_in_sst) {
     Flush();
     value_meta.block_handle = r->pending_handle;
-    if (r->table_options.use_delta_block) {
+    if (r->table_options.use_separated_value_meta_block) {
       if (!delta_index_fits(1)) {
         r->status = Status::InvalidArgument(
             "SST is too large for delta-block index metadata");
@@ -485,6 +487,11 @@ Status BlockBasedTableBuilder::Add(
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
+  if (is_separated) {
+    r->props.separated_total_size += value_meta.value_size;
+    r->props.separated_entry_count++;
+    r->props.value_meta_total_size += value_meta.meta_data.size();
+  }
   if (value_type == kTypeDeletion || value_type == kTypeSingleDeletion) {
     r->props.num_deletions++;
   } else if (value_type == kTypeMerge) {
@@ -832,6 +839,7 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
     PropertyBlockBuilder property_block_builder;
     rep_->props.column_family_id = rep_->column_family_id;
     rep_->props.column_family_name = rep_->column_family_name;
+    rep_->props.sst_type = static_cast<int>(rep_->sst_type);
     rep_->props.filter_policy_name =
         rep_->table_options.filter_policy != nullptr
             ? rep_->table_options.filter_policy->Name()
@@ -928,7 +936,7 @@ void BlockBasedTableBuilder::WriteRangeDelBlock(
 
 void BlockBasedTableBuilder::WriteDeltaBlock(
     MetaIndexBuilder* meta_index_builder) {
-  if (ok() && rep_->table_options.use_delta_block &&
+  if (ok() && rep_->table_options.use_separated_value_meta_block &&
       !rep_->delta_block.empty()) {
     BlockHandle delta_block_handle;
     LazyBuffer delta_block_content;
@@ -987,7 +995,7 @@ Status BlockBasedTableBuilder::Finish(
     r->index_builder->AddIndexEntry(
         &r->last_key, nullptr /* no next data block */, r->pending_handle);
   }
-  if (ok() && r->table_options.use_delta_block) {
+  if (ok() && r->table_options.use_separated_value_meta_block) {
     if (r->props.num_data_blocks > std::numeric_limits<uint32_t>::max() ||
         r->props.num_entries > std::numeric_limits<uint32_t>::max()) {
       r->status = Status::InvalidArgument(

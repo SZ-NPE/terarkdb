@@ -262,15 +262,16 @@ Status BlockBasedTableFactory::SanitizeOptions(
   }
   if (table_options_.index_type != BlockBasedTableOptions::kBinarySearch &&
       table_options_.index_type != BlockBasedTableOptions::kHashSearch &&
-      table_options_.use_delta_block) {
+      table_options_.use_separated_value_meta_block) {
     return Status::InvalidArgument(
-        "Do not support delta block and precise_gc in this index type. Please "
-        "disable both use_delta_block in table_options and precise_gc in "
-        "cf_options.");
+        "Separated-value metadata blocks are only supported by binary/hash "
+        "block indexes. Please disable use_separated_value_meta_block in "
+        "table_options and byte_precise_gc in cf_options.");
   }
-  if (cf_opts.precise_gc && !table_options_.use_delta_block) {
+  const bool byte_precise_gc = cf_opts.byte_precise_gc || cf_opts.precise_gc;
+  if (byte_precise_gc && !table_options_.use_separated_value_meta_block) {
     return Status::InvalidArgument(
-        "precise_gc requires BlockBasedTableOptions::use_delta_block");
+        "byte_precise_gc requires BlockBasedTableOptions::use_separated_value_meta_block");
   }
   return Status::OK();
 }
@@ -366,8 +367,8 @@ std::string BlockBasedTableFactory::GetPrintableTableOptions() const {
   snprintf(buffer, kBufferSize, "  use_delta_encoding: %d\n",
            table_options_.use_delta_encoding);
   ret.append(buffer);
-  snprintf(buffer, kBufferSize, "  use_delta_block: %d\n",
-           table_options_.use_delta_block);
+  snprintf(buffer, kBufferSize, "  use_separated_value_meta_block: %d\n",
+           table_options_.use_separated_value_meta_block);
   ret.append(buffer);
   snprintf(buffer, kBufferSize, "  filter_policy: %s\n",
            table_options_.filter_policy == nullptr

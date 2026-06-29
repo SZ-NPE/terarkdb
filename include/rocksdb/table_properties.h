@@ -44,7 +44,11 @@ struct TablePropertiesNames {
   static const std::string kFilterSize;
   static const std::string kRawKeySize;
   static const std::string kRawValueSize;
+  static const std::string kSeparatedTotalSize;
+  static const std::string kSeparatedEntryCount;
+  static const std::string kValueMetaTotalSize;
   static const std::string kDeltaBlockSize;
+  static const std::string kRemoteValueSize;
   static const std::string kNumDataBlocks;
   static const std::string kNumEntries;
   static const std::string kDeletedKeys;
@@ -66,10 +70,10 @@ struct TablePropertiesNames {
   static const std::string kSnapshots;
   static const std::string kPurpose;
   static const std::string kReadAmp;
+  static const std::string kFileSstType;
   static const std::string kDependence;
   static const std::string kDependenceEntryCount;
-  static const std::string kDependenceByteCount;
-  static const std::string kDependenceByteCountEntryCount;
+  static const std::string kDependenceSeparatedSize;
   static const std::string kInheritanceChain;
   static const std::string kInheritanceTree;
   static const std::string kEarliestTimeBeginCompact;
@@ -182,8 +186,16 @@ struct TablePropertiesBase {
   uint64_t raw_key_size = 0;
   // total raw value size
   uint64_t raw_value_size = 0;
+  // total size of separated values referenced by value-index entries
+  uint64_t separated_total_size = 0;
+  // total count of separated value-index entries
+  uint64_t separated_entry_count = 0;
+  // total size of separated value metadata persisted in delta blocks
+  uint64_t value_meta_total_size = 0;
   // total size of delta metadata blocks
   uint64_t delta_block_size = 0;
+  // total size of remote values extracted from inline values when available
+  uint64_t remote_value_size = 0;
   // the number of blocks in this table
   uint64_t num_data_blocks = 0;
   // the number of entries in this table
@@ -256,6 +268,9 @@ struct TablePropertiesBase {
 
   // Expt read amp from sst
   float read_amp = 1;
+
+  // SST role for middle-value delta-separate.
+  int sst_type = static_cast<int>(SstType::kMaxSstType);
 
   // Make these sst hidden
   std::vector<Dependence> dependence;

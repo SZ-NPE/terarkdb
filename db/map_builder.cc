@@ -16,6 +16,7 @@
 #include <inttypes.h>
 
 #include <algorithm>
+#include <limits>
 #include <list>
 #include <string>
 #include <unordered_map>
@@ -92,7 +93,7 @@ struct IteratorCacheContext {
         nullptr /* range_del_agg */,
         ctx->mutable_cf_options->prefix_extractor.get(), reader_ptr,
         nullptr /* no per level latency histogram */,
-        false /* for_compaction */, arena, false /* skip_filters */,
+        true /* for_compaction */, arena, false /* skip_filters */,
         -1 /* level */);
   }
   static InternalIterator* CreateVersionIter(void* arg, Arena* arena) {
@@ -168,6 +169,28 @@ struct RangeWithDepend {
     stable = false;
   }
 };
+
+void SaturatingAdd(uint64_t value, uint64_t* target) {
+  if (*target > std::numeric_limits<uint64_t>::max() - value) {
+    *target = std::numeric_limits<uint64_t>::max();
+  } else {
+    *target += value;
+  }
+}
+
+void AddDependenceStats(const FileMetaData* meta, uint64_t entry_count,
+                        uint64_t byte_count,
+                        MapSstDependenceMap* dependence) {
+  auto& stats = (*dependence)[meta->fd.GetNumber()];
+  SaturatingAdd(entry_count, &stats.entry_count);
+  SaturatingAdd(byte_count, &stats.byte_count);
+}
+
+void AddWholeFileDependence(const FileMetaData* meta,
+                            MapSstDependenceMap* dependence) {
+  AddDependenceStats(meta, meta->prop.num_entries,
+                     meta->BlobGcAccountingBytes(), dependence);
+}
 
 int CompInclude(int c, size_t ab, size_t ai, size_t bb, size_t bi) {
 #define CASE(a, b, c, d) \
@@ -267,7 +290,7 @@ class MapSstElementIterator : public MapSstRangeIterator {
   LazyBuffer value() const override { return LazyBuffer(buffer_); }
   Status status() const override { return status_; }
 
-  const std::unordered_map<uint64_t, uint64_t>& GetDependence() const override {
+  const MapSstDependenceMap& GetDependence() const override {
     return dependence_build_;
   }
 
@@ -293,14 +316,6 @@ class MapSstElementIterator : public MapSstRangeIterator {
         }
         assert(sst_read_amp_ratio_ >= 1);
         assert(sst_read_amp_ratio_ <= sst_read_amp_);
-        for (auto& pair : dependence_build_) {
-          auto f = iterator_cache_.GetFileMetaData(pair.first);
-          assert(f != nullptr);
-          assert(f->fd.file_size > 0);
-          pair.second = f->prop.num_entries * pair.second / f->fd.file_size;
-          pair.second = std::min<uint64_t>(pair.second, f->prop.num_entries);
-          pair.second = std::max<uint64_t>(pair.second, 1);
-        }
         return;
       }
       auto& start = map_elements_.smallest_key = where_->point[0];
@@ -317,15 +332,78 @@ class MapSstElementIterator : public MapSstRangeIterator {
 
       ++where_;
       size_t range_size = 0;
-      auto put_dependence = [&](uint64_t file_number, uint64_t size) {
-        auto ib = dependence_build_.emplace(file_number, size);
-        if (!ib.second) {
-          ib.first->second += size;
+      auto collect_range_dependence = [&](const FileMetaData* meta) -> bool {
+        assert(meta != nullptr);
+        if (icomp_.Compare(meta->smallest.Encode(), start) > 0 &&
+            icomp_.Compare(meta->largest.Encode(), end) <= 0) {
+          AddWholeFileDependence(meta, &dependence_build_);
+          return true;
         }
+
+        TableReader* reader = nullptr;
+        auto iter = iterator_cache_.GetIterator(meta, &reader);
+        if (!iter->status().ok()) {
+          status_ = iter->status();
+          return false;
+        }
+
+        uint64_t entry_count = 0;
+        uint64_t byte_count = 0;
+        iter->Seek(start);
+        while (iter->Valid()) {
+          const Slice iter_key = iter->key();
+          if (!map_elements_.include_smallest &&
+              icomp_.Compare(iter_key, start) <= 0) {
+            iter->Next();
+            continue;
+          }
+          const int end_cmp = icomp_.Compare(iter_key, end);
+          if (end_cmp > 0 || (end_cmp == 0 && !map_elements_.include_largest)) {
+            break;
+          }
+
+          ++entry_count;
+          ParsedInternalKey ikey;
+          bool exact = ParseInternalKey(iter_key, &ikey);
+          if (exact &&
+              (ikey.type == kTypeValueIndex || ikey.type == kTypeMergeIndex)) {
+            std::string delta_value_size;
+            Status s =
+                iter->GetProperty("rocksdb.delta.value-size", &delta_value_size);
+            Slice value_size_slice(delta_value_size);
+            uint32_t decoded_value_size = 0;
+            exact = s.ok() &&
+                    GetVarint32(&value_size_slice, &decoded_value_size) &&
+                    value_size_slice.empty();
+            if (exact) {
+              SaturatingAdd(decoded_value_size, &byte_count);
+            }
+          } else if (exact) {
+            SaturatingAdd(iter_key.size() + iter->value().size(), &byte_count);
+          }
+          iter->Next();
+        }
+        if (!iter->status().ok()) {
+          status_ = iter->status();
+          return false;
+        }
+        AddDependenceStats(meta, entry_count, byte_count, &dependence_build_);
+        return true;
       };
       if (stable) {
         for (auto& link : links) {
-          put_dependence(link.file_number, link.size);
+          const FileMetaData* meta =
+              iterator_cache_.GetFileMetaData(link.file_number);
+          if (meta == nullptr) {
+            status_ =
+                Status::Corruption("MapSstElementIterator missing FileMetaData");
+            buffer_.clear();
+            return;
+          }
+          if (!collect_range_dependence(meta)) {
+            buffer_.clear();
+            return;
+          }
           range_size += link.size;
         }
       } else {
@@ -350,6 +428,7 @@ class MapSstElementIterator : public MapSstRangeIterator {
             // cover whole file
             link.size = meta->fd.GetFileSize();
             range_size += link.size;
+            AddWholeFileDependence(meta, &dependence_build_);
           } else {
             auto iter = iterator_cache_.GetIterator(meta, &reader);
             if (!iter->status().ok()) {
@@ -384,7 +463,11 @@ class MapSstElementIterator : public MapSstRangeIterator {
               return;
             }
           }
-          put_dependence(link.file_number, link.size);
+          if (link.size != meta->fd.GetFileSize() &&
+              !collect_range_dependence(meta)) {
+            buffer_.clear();
+            return;
+          }
         }
         links.erase(std::remove_if(links.begin(), links.end(),
                                    [](const MapSstElement::LinkTarget& link) {
@@ -410,7 +493,7 @@ class MapSstElementIterator : public MapSstRangeIterator {
   std::string buffer_;
   std::vector<RangeWithDepend>::const_iterator where_;
   const std::vector<RangeWithDepend>& ranges_;
-  std::unordered_map<uint64_t, uint64_t> dependence_build_;
+  MapSstDependenceMap dependence_build_;
   size_t sst_read_amp_ = 0;
   double sst_read_amp_ratio_ = 0;
   size_t sst_read_amp_size_ = 0;
@@ -1684,10 +1767,8 @@ Status MapBuilder::WriteOutputFile(
   auto& dependence = file_meta->prop.dependence;
   dependence.reserve(dependence_build.size());
   for (auto& pair : dependence_build) {
-    // precise_gc: MapSST only records dependence relations and never creates
-    // new blob files, so byte_count stays 0 (VersionBuilder falls back to an
-    // averaged estimate from the source blob).
-    dependence.emplace_back(Dependence{pair.first, pair.second, 0, 0});
+    dependence.emplace_back(
+        Dependence{pair.first, pair.second.entry_count, pair.second.byte_count});
   }
   std::sort(dependence.begin(), dependence.end(), TERARK_CMP(file_number, <));
 

@@ -185,6 +185,7 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.enable_delta_separate = mutable_cf_options.enable_delta_separate;
   cf_opts.middle_blob_size = mutable_cf_options.middle_blob_size;
   cf_opts.middle_combine_level = mutable_cf_options.middle_combine_level;
+  cf_opts.enable_hotness_tracker = mutable_cf_options.enable_hotness_tracker;
   cf_opts.hotness_window_capacity = mutable_cf_options.hotness_window_capacity;
   cf_opts.hotness_hot_capacity = mutable_cf_options.hotness_hot_capacity;
   cf_opts.hotness_enable_write_window =
@@ -200,7 +201,9 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.read_separated_value_by_handle =
       mutable_cf_options.read_separated_value_by_handle;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
-  cf_opts.precise_gc = mutable_cf_options.precise_gc;
+  cf_opts.byte_precise_gc = mutable_cf_options.byte_precise_gc;
+  cf_opts.precise_gc = mutable_cf_options.precise_gc ||
+                       mutable_cf_options.byte_precise_gc;
   cf_opts.target_blob_file_size = mutable_cf_options.target_blob_file_size;
   cf_opts.blob_file_defragment_size =
       mutable_cf_options.blob_file_defragment_size;
@@ -852,6 +855,10 @@ Status GetMutableOptionsFromStrings(
                                      std::string(e.what()));
     }
   }
+  if (new_options->precise_gc && !new_options->byte_precise_gc) {
+    new_options->byte_precise_gc = true;
+  }
+  new_options->precise_gc = new_options->byte_precise_gc;
   return Status::OK();
 }
 
@@ -1993,7 +2000,8 @@ std::unordered_map<std::string, OptionTypeInfo>
           offsetof(struct MutableCFOptions, middle_combine_level)}},
         {"enable_hotness_tracker",
          {offset_of(&ColumnFamilyOptions::enable_hotness_tracker),
-          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, enable_hotness_tracker)}},
         {"hotness_window_capacity",
          {offset_of(&ColumnFamilyOptions::hotness_window_capacity),
           OptionType::kSizeT, OptionVerificationType::kNormal, false, 0}},
@@ -2030,10 +2038,22 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::blob_gc_ratio), OptionType::kDouble,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, blob_gc_ratio)}},
+        {"byte_precise_gc",
+         {offset_of(&ColumnFamilyOptions::byte_precise_gc),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          true, offsetof(struct MutableCFOptions, byte_precise_gc)}},
         {"precise_gc",
          {offset_of(&ColumnFamilyOptions::precise_gc), OptionType::kBoolean,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, precise_gc)}},
+        {"exact_gc",
+         {offset_of(&ColumnFamilyOptions::byte_precise_gc),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          true, offsetof(struct MutableCFOptions, byte_precise_gc)}},
+        {"exact_garbage_ratio",
+         {offset_of(&ColumnFamilyOptions::byte_precise_gc),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          true, offsetof(struct MutableCFOptions, byte_precise_gc)}},
         {"target_blob_file_size",
          {offset_of(&ColumnFamilyOptions::target_blob_file_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal, true,

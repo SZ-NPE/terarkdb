@@ -61,7 +61,7 @@ TableBuilder* NewTableBuilder(
     const CompressionOptions& compression_opts, int level,
     double compaction_load, const std::string* compression_dict,
     bool skip_filters, uint64_t creation_time, uint64_t oldest_key_time,
-    SstPurpose sst_purpose) {
+    SstPurpose sst_purpose, SstType sst_type) {
   assert((column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          column_family_name.empty());
@@ -70,7 +70,8 @@ TableBuilder* NewTableBuilder(
                           int_tbl_prop_collector_factories, compression_type,
                           compression_opts, compression_dict, skip_filters,
                           column_family_name, level, compaction_load,
-                          creation_time, oldest_key_time, sst_purpose),
+                          creation_time, oldest_key_time, sst_purpose,
+                          sst_type),
       column_family_id, file);
 }
 
@@ -110,6 +111,7 @@ Status BuildTable(
     table_properties_vec->emplace_back();
   }
   auto sst_meta = [meta_vec] { return &meta_vec->front(); };
+  sst_meta()->prop.sst_type = SstType::kNormal;
   Arena arena;
   ScopedArenaIterator iter(get_input_iter_callback(get_input_iter_arg, arena));
   iter->SeekToFirst();
@@ -179,7 +181,7 @@ Status BuildTable(
     struct BuilderSeparateHelper : public SeparateHelper {
       std::vector<FileMetaData>* output = nullptr;
       std::vector<TableProperties>* prop = nullptr;
-      BlobOutput blobs[3];  // warm, ephemeral, stable
+      BlobOutput blobs[3][2];  // flush route x {middle, large}
       std::unique_ptr<ValueExtractor> value_meta_extractor;
       Status (*trans_to_separate_callback)(void* args, const Slice& key,
                                            LazyBuffer& value,
@@ -254,7 +256,7 @@ Status BuildTable(
           return Env::WLTH_MEDIUM;
         case HotnessTracker::FlushRoute::kEphemeral:
           return Env::WLTH_SHORT;
-        case HotnessTracker::FlushRoute::kStable:
+        case HotnessTracker::FlushRoute::kCold:
           return Env::WLTH_EXTREME;
       }
       return Env::WLTH_MEDIUM;
@@ -265,23 +267,40 @@ Status BuildTable(
             return "warm";
           case HotnessTracker::FlushRoute::kEphemeral:
             return "hot";
-          case HotnessTracker::FlushRoute::kStable:
-            return "stable";
+          case HotnessTracker::FlushRoute::kCold:
+            return "cold";
         }
         return "unknown";
       };
       uint64_t flush_route_keys[3] = {0, 0, 0};
       uint64_t flush_route_bytes[3] = {0, 0, 0};
 
-    auto finish_output_blob_sst = [&](int hot_idx) {
+    // Map a flush route to the large-blob sst_type. When hotness tracking is
+    // off, large blobs keep the legacy kLargeBlob type. When it is on, the cold
+    // route emits kColdLargeBlob and the warm/hot routes emit kWarmLargeBlob
+    // (hot is folded into warm). Blob GC later keeps warm/cold large blobs in
+    // separate jobs so the single replacement file owns one variant only.
+    auto large_blob_type_for_route = [&](int hot_idx) {
+      if (!mutable_cf_options.enable_hotness_tracker) {
+        return SstType::kLargeBlob;
+      }
+      return hot_idx == static_cast<int>(HotnessTracker::FlushRoute::kCold)
+                 ? SstType::kColdLargeBlob
+                 : SstType::kWarmLargeBlob;
+    };
+
+    auto finish_output_blob_sst = [&](int hot_idx, int type_idx) {
       Status status;
-      auto& bstate = separate_helper.blobs[hot_idx];
+      auto& bstate = separate_helper.blobs[hot_idx][type_idx];
       TableBuilder* blob_builder = bstate.builder.get();
       assert(blob_builder != nullptr);
       FileMetaData& blob_meta = current_blob_meta(bstate);
       blob_meta.prop.num_entries = blob_builder->NumEntries();
       blob_meta.prop.num_deletions = 0;
       blob_meta.prop.purpose = kEssenceSst;
+      blob_meta.prop.sst_type = static_cast<uint8_t>(
+          type_idx == 0 ? SstType::kHotMidBlob
+                        : large_blob_type_for_route(hot_idx));
       blob_meta.prop.flags |= TablePropertyCache::kNoRangeDeletions;
       status = blob_builder->Finish(&blob_meta.prop, nullptr);
       TableProperties& tp = current_blob_properties(bstate);
@@ -315,6 +334,18 @@ Status BuildTable(
 
     size_t target_blob_file_size = MaxBlobSize(
         mutable_cf_options, ioptions.num_levels, ioptions.compaction_style);
+    auto route_target_blob_file_size = [&](HotnessTracker::FlushRoute route) {
+      if (route == HotnessTracker::FlushRoute::kEphemeral) {
+        return std::min(target_blob_file_size,
+                        std::max<size_t>(256 * 1024 * 1024,
+                                         target_blob_file_size / 2));
+      }
+      return target_blob_file_size;
+    };
+    const bool middle_delta_enabled =
+        mutable_cf_options.enable_delta_separate &&
+        mutable_cf_options.middle_blob_size != size_t(-1) &&
+        mutable_cf_options.middle_blob_size > mutable_cf_options.blob_size;
     std::shared_ptr<HotnessTracker> hotness_tracker;
     ColumnFamilyData* cfd =
         versions_->GetColumnFamilySet()->GetColumnFamily(column_family_id);
@@ -332,17 +363,24 @@ Status BuildTable(
         Slice user_key = ExtractUserKey(key);
         route = hotness_tracker->ClassifyForFlush(user_key);
       }
-      int hot_idx = static_cast<int>(route);
-      auto& bstate = separate_helper.blobs[hot_idx];
-
-      TableBuilder* blob_builder = bstate.builder.get();
       auto s = value.fetch();
       if (!s.ok()) {
         return s;
       }
+      const bool is_middle =
+          middle_delta_enabled &&
+          SeparateHelper::do_middle_separate(value.size(),
+                                             mutable_cf_options.middle_blob_size);
+      const int type_idx = is_middle ? 0 : 1;
+      int hot_idx = static_cast<int>(route);
+      const SstType sst_type =
+          is_middle ? SstType::kHotMidBlob : large_blob_type_for_route(hot_idx);
+      auto& bstate = separate_helper.blobs[hot_idx][type_idx];
+
+      TableBuilder* blob_builder = bstate.builder.get();
       if (blob_builder != nullptr &&
-          blob_builder->FileSize() > target_blob_file_size) {
-        status = finish_output_blob_sst(hot_idx);
+          blob_builder->FileSize() > route_target_blob_file_size(route)) {
+        status = finish_output_blob_sst(hot_idx, type_idx);
         blob_builder = nullptr;
       }
       if (status.ok() && blob_builder == nullptr) {
@@ -365,6 +403,7 @@ Status BuildTable(
         FileMetaData& blob_meta = current_blob_meta(bstate);
         blob_meta.fd = FileDescriptor(versions_->NewFileNumber(),
                                       sst_meta()->fd.GetPathId(), 0);
+        blob_meta.prop.sst_type = static_cast<uint8_t>(sst_type);
         bstate.fname =
             TableFileName(ioptions.cf_paths, blob_meta.fd.GetNumber(),
                           blob_meta.fd.GetPathId());
@@ -387,7 +426,8 @@ Status BuildTable(
             int_tbl_prop_collector_factories_for_blob, column_family_id,
             column_family_name, bstate.file_writer.get(), compression,
             compression_opts, -1 /* level */, 0 /* compaction_load */, nullptr,
-            true));
+            true, 0 /* creation_time */, 0 /* oldest_key_time */, kEssenceSst,
+            sst_type));
         blob_builder = bstate.builder.get();
       }
       if (status.ok()) {
@@ -408,6 +448,10 @@ Status BuildTable(
           } else if (route == HotnessTracker::FlushRoute::kWarm) {
             RecordTick(ioptions.statistics, HOTNESS_FLUSH_WARM_KEYS);
             RecordTick(ioptions.statistics, HOTNESS_FLUSH_WARM_BYTES,
+                       route_record_bytes);
+          } else if (route == HotnessTracker::FlushRoute::kCold) {
+            RecordTick(ioptions.statistics, HOTNESS_FLUSH_COLD_KEYS);
+            RecordTick(ioptions.statistics, HOTNESS_FLUSH_COLD_BYTES,
                        route_record_bytes);
           }
         FileMetaData& blob_meta = current_blob_meta(bstate);
@@ -436,9 +480,9 @@ Status BuildTable(
     // Allocation hint only: each flush route can roll over independently and
     // append more than one blob file, so route state must not depend on vector
     // element pointer stability.
-    separate_helper.output->reserve(separate_helper.output->size() + 3);
+    separate_helper.output->reserve(separate_helper.output->size() + 6);
     if (separate_helper.prop != nullptr) {
-      separate_helper.prop->reserve(separate_helper.prop->size() + 3);
+      separate_helper.prop->reserve(separate_helper.prop->size() + 6);
     }
     BlobConfig blob_config = mutable_cf_options.get_blob_config();
     if (ioptions.table_factory->IsBuilderNeedSecondPass()) {
@@ -533,15 +577,17 @@ Status BuildTable(
       s = c_iter.status();
     }
     for (int i = 0; i < 3; ++i) {
-      if (separate_helper.blobs[i].builder) {
+      for (int j = 0; j < 2; ++j) {
+      if (separate_helper.blobs[i][j].builder) {
         if (!s.ok() || empty) {
-          separate_helper.blobs[i].builder->Abandon();
+          separate_helper.blobs[i][j].builder->Abandon();
         } else {
-          Status blob_s = finish_output_blob_sst(i);
+          Status blob_s = finish_output_blob_sst(i, j);
           if (s.ok()) {
             s = blob_s;
           }
         }
+      }
       }
     }
     if (!s.ok() || empty) {
@@ -560,7 +606,7 @@ Status BuildTable(
                 : blob.prop.raw_key_size + blob.prop.raw_value_size;
         sst_meta()->prop.dependence.emplace_back(
             Dependence{blob.fd.GetNumber(), blob.prop.num_entries,
-                       accounting_bytes, blob.prop.num_entries});
+                       accounting_bytes});
       }
       auto shrinked_snapshots = sst_meta()->ShrinkSnapshot(snapshots);
       s = builder->Finish(&sst_meta()->prop, &shrinked_snapshots);

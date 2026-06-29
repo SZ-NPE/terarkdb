@@ -18,8 +18,8 @@
     .full { fill: #d13f2f; }
   </style>
 
-  <text x="640" y="36" text-anchor="middle" class="title">Paper Evaluation: Overall Comparison 预期结果图</text>
-  <text x="640" y="62" text-anchor="middle" class="subtitle">示意最终论文评估版式：RocksDB / BlobDB / TerarkDB baseline / TerarkDB full；数值为预期趋势占位，等待真实实验替换</text>
+  <text x="640" y="36" text-anchor="middle" class="title">Paper Evaluation: Overall Comparison Sketch</text>
+  <text x="640" y="62" text-anchor="middle" class="subtitle">Layout sketch for RocksDB / BlobDB / TerarkDB baseline / TerarkDB full; values are placeholders until replaced by real results.</text>
 
   <g transform="translate(45,95)">
     <rect class="panel" x="0" y="0" width="570" height="285"/>

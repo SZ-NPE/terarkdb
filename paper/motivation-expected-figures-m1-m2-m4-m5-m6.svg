@@ -12,14 +12,14 @@
     .axis { stroke: #222; stroke-width: 1.8; }
   </style>
 
-  <text x="700" y="36" text-anchor="middle" class="title">TerarkDB Motivation Figures：M1/M2/M4/M5/M6 预期样式</text>
-  <text x="700" y="62" text-anchor="middle" class="subtitle">这些是论文动机图的版式示意，不是实验真实数据；颜色、坐标和相对趋势按 FAST 风格设计</text>
+  <text x="700" y="36" text-anchor="middle" class="title">TerarkDB Motivation Figures: M1/M2/M4/M5/M6 Sketch</text>
+  <text x="700" y="62" text-anchor="middle" class="subtitle">Layout sketches only, not real measurements; colors, axes, and relative trends follow a FAST-style presentation.</text>
 
   <!-- ================= M1 ================= -->
   <g transform="translate(55,95)">
     <rect x="0" y="0" width="620" height="380" fill="#fbfbfb" stroke="#ddd"/>
-    <text x="18" y="32" class="panel-title">M1. vSST 垃圾率分布 CDF</text>
-    <text x="18" y="54" class="note">hot/cold 混写导致大量 vSST 只有中低垃圾率；冷热路由使垃圾更集中</text>
+    <text x="18" y="32" class="panel-title">M1. vSST Garbage-Ratio CDF</text>
+    <text x="18" y="54" class="note">Hot/cold mixing leaves many vSSTs partially dirty; routing should concentrate garbage.</text>
     <g transform="translate(70,80)">
       <rect x="0" y="0" width="490" height="240" fill="#fff" stroke="#eee"/>
       <g class="grid">
@@ -50,8 +50,8 @@
   <!-- ================= M2 ================= -->
   <g transform="translate(725,95)">
     <rect x="0" y="0" width="620" height="380" fill="#fbfbfb" stroke="#ddd"/>
-    <text x="18" y="32" class="panel-title">M2. GC I/O 分解堆叠柱</text>
-    <text x="18" y="54" class="note">GC 代价不仅是搬迁 live value，还包括 vSST 扫描、无效读和 kSST 反查</text>
+    <text x="18" y="32" class="panel-title">M2. GC I/O Breakdown</text>
+    <text x="18" y="54" class="note">GC cost includes live relocation plus vSST scanning, invalid reads, and kSST reverse lookups.</text>
     <g transform="translate(75,80)">
       <rect x="0" y="0" width="490" height="240" fill="#fff" stroke="#eee"/>
       <g class="grid"><line x1="0" y1="192" x2="490" y2="192"/><line x1="0" y1="144" x2="490" y2="144"/><line x1="0" y1="96" x2="490" y2="96"/><line x1="0" y1="48" x2="490" y2="48"/></g>
@@ -80,8 +80,8 @@
   <!-- ================= M4 ================= -->
   <g transform="translate(55,540)">
     <rect x="0" y="0" width="1290" height="350" fill="#fbfbfb" stroke="#ddd"/>
-    <text x="18" y="32" class="panel-title">M4. Block Cache 中 obsolete blocks 占比时间线</text>
-    <text x="18" y="54" class="note">compaction/GC 后，已失效文件的 blocks 仍长期驻留；GC-aware eviction 应快速压低这条曲线</text>
+    <text x="18" y="32" class="panel-title">M4. Obsolete Block-Cache Residency Timeline</text>
+    <text x="18" y="54" class="note">After compaction/GC, obsolete-file blocks can remain resident; GC-aware eviction should reduce this curve.</text>
     <g transform="translate(75,80)">
       <rect x="0" y="0" width="1125" height="210" fill="#fff" stroke="#eee"/>
       <g class="grid">
@@ -100,7 +100,7 @@
         <text x="0" y="230" text-anchor="middle">0</text><text x="187" y="230" text-anchor="middle">5</text><text x="375" y="230" text-anchor="middle">10</text><text x="562" y="230" text-anchor="middle">15</text><text x="750" y="230" text-anchor="middle">20</text><text x="937" y="230" text-anchor="middle">25</text><text x="1125" y="230" text-anchor="middle">30</text>
         <text x="-10" y="214" text-anchor="end">0</text><text x="-10" y="130" text-anchor="end">0.4</text><text x="-10" y="46" text-anchor="end">0.8</text>
       </g>
-      <text x="562" y="262" text-anchor="middle" class="axis-label">时间（min）</text>
+      <text x="562" y="262" text-anchor="middle" class="axis-label">Time (min)</text>
       <text x="-48" y="105" transform="rotate(-90 -48 105)" text-anchor="middle" class="axis-label">obsolete byte ratio</text>
       <line x1="820" y1="20" x2="850" y2="20" stroke="#2f80ed" stroke-width="4"/><text x="858" y="24" class="legend">LRU cache</text>
       <line x1="930" y1="20" x2="960" y2="20" stroke="#d13f2f" stroke-width="4"/><text x="968" y="24" class="legend">GC-aware cache</text>
@@ -110,8 +110,8 @@
   <!-- ================= M5 ================= -->
   <g transform="translate(55,955)">
     <rect x="0" y="0" width="620" height="420" fill="#fbfbfb" stroke="#ddd"/>
-    <text x="18" y="32" class="panel-title">M5. Entry-based vs Byte-based 垃圾率散点</text>
-    <text x="18" y="54" class="note">不定长 value 下，entry 比例无法代表真实可回收字节比例</text>
+    <text x="18" y="32" class="panel-title">M5. Entry-Based vs Byte-Based Garbage-Ratio Scatter</text>
+    <text x="18" y="54" class="note">Under variable-size values, entry ratio does not represent reclaimable bytes.</text>
     <g transform="translate(80,82)">
       <rect x="0" y="0" width="450" height="260" fill="#fff" stroke="#eee"/>
       <g class="grid"><line x1="0" y1="208" x2="450" y2="208"/><line x1="0" y1="156" x2="450" y2="156"/><line x1="0" y1="104" x2="450" y2="104"/><line x1="0" y1="52" x2="450" y2="52"/><line x1="90" y1="0" x2="90" y2="260"/><line x1="180" y1="0" x2="180" y2="260"/><line x1="270" y1="0" x2="270" y2="260"/><line x1="360" y1="0" x2="360" y2="260"/></g>
@@ -130,8 +130,8 @@
       <text x="225" y="314" text-anchor="middle" class="axis-label">entry-based garbage ratio</text>
       <text x="-50" y="130" transform="rotate(-90 -50 130)" text-anchor="middle" class="axis-label">byte-based garbage ratio</text>
       <circle cx="270" cy="302" r="5" fill="#2f80ed"/><text x="282" y="306" class="legend">fixed</text>
-      <circle cx="330" cy="302" r="5" fill="#d13f2f"/><text x="342" y="306" class="legend">Pareto-small dead</text>
-      <circle cx="455" cy="302" r="5" fill="#f2994a"/><text x="467" y="306" class="legend">Pareto-large dead</text>
+      <circle cx="330" cy="302" r="5" fill="#d13f2f"/><text x="342" y="306" class="legend">uniform-fixed small dead</text>
+      <circle cx="455" cy="302" r="5" fill="#f2994a"/><text x="467" y="306" class="legend">uniform-fixed large dead</text>
     </g>
   </g>
 
@@ -139,7 +139,7 @@
   <g transform="translate(725,955)">
     <rect x="0" y="0" width="620" height="420" fill="#fbfbfb" stroke="#ddd"/>
     <text x="18" y="32" class="panel-title">M6. GC scan bytes / reclaimed bytes</text>
-    <text x="18" y="54" class="note">entry-based GC 在不定长 value 下会选错文件，单位回收成本升高</text>
+    <text x="18" y="54" class="note">Entry-based GC can choose low-benefit files under variable-size values, increasing cost per reclaimed byte.</text>
     <g transform="translate(75,82)">
       <rect x="0" y="0" width="490" height="260" fill="#fff" stroke="#eee"/>
       <g class="grid"><line x1="0" y1="208" x2="490" y2="208"/><line x1="0" y1="156" x2="490" y2="156"/><line x1="0" y1="104" x2="490" y2="104"/><line x1="0" y1="52" x2="490" y2="52"/></g>
@@ -150,7 +150,7 @@
         <rect x="335" y="21" width="42" height="239" fill="#2f80ed"/><rect x="382" y="104" width="42" height="156" fill="#d13f2f"/>
       </g>
       <g class="tick">
-        <text x="90" y="280" text-anchor="middle">fixed</text><text x="235" y="280" text-anchor="middle">Pareto</text><text x="380" y="280" text-anchor="middle">Pareto+zipf</text>
+        <text x="90" y="280" text-anchor="middle">fixed</text><text x="235" y="280" text-anchor="middle">uniform_fixed</text><text x="380" y="280" text-anchor="middle">uniform_fixed+zipf</text>
         <text x="-10" y="264" text-anchor="end">0</text><text x="-10" y="212" text-anchor="end">1</text><text x="-10" y="160" text-anchor="end">2</text><text x="-10" y="108" text-anchor="end">3</text><text x="-10" y="56" text-anchor="end">4</text><text x="-10" y="4" text-anchor="end">5</text>
       </g>
       <text x="245" y="314" text-anchor="middle" class="axis-label">value size distribution / workload</text>
@@ -158,7 +158,7 @@
       <rect x="292" y="24" width="13" height="13" fill="#2f80ed"/><text x="313" y="35" class="legend">entry-based picker</text>
       <rect x="292" y="48" width="13" height="13" fill="#d13f2f"/><text x="313" y="59" class="legend">byte-precise picker</text>
       <path d="M307 88 C370 78 405 70 420 38" fill="none" stroke="#666" stroke-dasharray="4 4"/>
-      <text x="310" y="96" class="note">越低表示单位空间回收成本越小</text>
+      <text x="310" y="96" class="note">Lower means less cost per reclaimed byte.</text>
     </g>
   </g>
 </svg>

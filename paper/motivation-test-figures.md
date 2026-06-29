@@ -1,76 +1,75 @@
-# TerarkDB 动机测试图表记录
+# TerarkDB Motivation Figure Notes
 
-本文档记录用于论文动机部分的 6 幅核心图表。目标是用现有 `test-sh/new-ycsb/terarkdb.sh` 支持的 `load + overwrite`、`workloada/workloadb`、以及 Pareto 不定长 value 负载，分别证明冷热路由与反查加速、GC 感知块缓存淘汰、不定长 value 精确 GC 的问题动机。
+This file records the current M1-M5 motivation design supported by `test-sh/new-ycsb/motivation.sh`. It does not preserve old matrices as active defaults.
 
-## 图 M1：vSST 垃圾率分布 CDF
+If it conflicts with current scripts or logs, trust the scripts/logs and update this file.
 
-- **图表形式**：CDF 图。
-- **建议负载**：`load + overwrite-zipf`、`load + overwrite-zipf1.2` 或 `load + overwrite-hotspot-0.9`。
-- **横轴**：每个 vSST 的 garbage ratio。
-- **纵轴**：vSST 文件累计占比。
-- **证明的问题**：hot/cold value 混写会使垃圾分散在多个 vSST 中，GC 难以只选择高垃圾文件，导致回收时必须扫描较多有效数据。
-- **对应动机**：需要冷热路由，将高更新频率 value 聚集到短生命周期 vSST 中，提高垃圾集中度。
+---
 
-## 图 M2：GC I/O 分解图
+## 1. Current alignment
 
-- **图表形式**：堆叠柱状图。
-- **建议负载**：`load + overwrite-uniform`、`load + overwrite-zipf`、`load + overwrite-zipf1.2`、`load + overwrite-hotspot-0.9`。
-- **横轴**：不同 overwrite 分布或不同 skew 程度。
-- **纵轴**：GC I/O bytes。
-- **堆叠项**：
-  - vSST read bytes
-  - invalid/dead value read bytes
-  - kSST lookup read bytes
-  - live value relocation write bytes
-- **证明的问题**：Blob GC 的代价不仅是搬迁有效 value，还包括扫描 vSST、读取最终会被丢弃的 dead value、以及执行 kSST 反查。
-- **对应动机**：需要减少 GC 无效读带宽浪费，并通过 drop-key cache 等方式降低 kSST 反查开销。
+- Entry: `test-sh/new-ycsb/motivation.sh`.
+- Matrix: 5 cases, one case per motivation figure.
+- Mixed-value path: `uniform_fixed`, not Pareto.
+- M5 uses key-correlated mixed value size plus `byte_precise_gc=true` and `use_separated_value_meta_block=true`.
+- Final/interface ablations live in `test-sh/new-ycsb/interface.sh`; motivation figures explain why the optimizations are needed.
 
-## 图 M3：GC 期间前台性能时间线
+Relevant code: `test-sh/new-ycsb/motivation.sh:111`, `test-sh/new-ycsb/motivation.sh:97`, `test-sh/new-ycsb/motivation.sh:314`.
 
-- **图表形式**：时间序列图。
-- **建议负载**：`load + overwrite-zipf` 后触发 GC，同时运行前台读或短 scan。
-- **横轴**：时间。
-- **纵轴**：
-  - 前台吞吐或 P99 延迟。
-  - GC read bandwidth，可拆分为 vSST read bandwidth 和 kSST lookup read bandwidth。
-- **证明的问题**：GC 扫描 vSST 和反查 kSST 会与前台读争用 I/O 带宽，造成前台吞吐下降或尾延迟升高。
-- **对应动机**：需要降低 GC 后台读 I/O 和反查放大，避免 GC 对前台读造成明显干扰。
+---
 
-## 图 M4：block cache 失效块占比时间线
+## 2. Figure map
 
-- **图表形式**：时间序列折线图或面积图。
-- **建议负载**：`load + workloada/workloadb`，开启 `block_cache_obsolete_tracking`。
-- **横轴**：时间。
-- **纵轴**：block cache 中 obsolete block bytes 占比，例如 `obsolete block bytes / tracked block bytes` 或 `obsolete block bytes / total block cache bytes`。
-- **证明的问题**：compaction/GC 之后，属于 obsolete vSST/SST 的 blocks 会继续驻留在 LRU block cache 中，并长期保持较高水位。
-- **对应动机**：LRU 不感知 block 的 GC 状态和文件失效状态，需要 GC-aware block cache eviction 主动降低失效块优先级。
+| Figure | Case | Workload/settings | Primary data | Message |
+| --- | --- | --- | --- | --- |
+| M1 | `m1_garbage_cdf` | fixed values, `overwrite-zipf1.2`, unoptimized baseline (no hot/cold routing) | `BLOB_GC_RECLAIM_STATS`, fallback `BLOB_GC_FILE_GARBAGE_STATS` | Stock TerarkDB under write-hotspot skewed overwrites produces many mixed-garbage vSSTs, so reclaiming them still requires full scan and lookup work. |
+| M2 | `m2_gc_io` | fixed values, `overwrite-zipf1.2` | `BLOB_GC_RECLAIM_STATS`, `BLOB_GC_BYTES` | Blob GC cost includes vSST reads, invalid/dead reads, kSST reverse lookups, and live relocation writes. |
+| M3 | `m3_gc_timeline` | fixed values, `workloada`, default 600s, timechart on | timechart CSV + `BLOB_GC_RECLAIM_STATS` + `BLOB_GC_LATENCY` | GC scan/reverse lookup traffic can disturb foreground throughput/latency. |
+| M4 | `m4_cache_residency` | fixed values, `workloada`, default 900s, obsolete tracking on, standard LRU cache (unoptimized residency) | `BLOCK_CACHE_OBSOLETE_SAMPLE` + timechart CSV | Obsolete blocks can remain resident long enough to motivate GC-aware eviction. |
+| M5 | `m5_byte_accounting` | mixed `uniform_fixed`, key-correlated value size | `BLOB_GC_FILE_GARBAGE_STATS.entry_ratio/byte_ratio` | Dead-entry ratio is not a reliable proxy for reclaimable bytes under mixed values. |
 
-## 图 M5：entry-based garbage ratio vs byte-based garbage ratio 散点图
+Case overrides are defined in `test-sh/new-ycsb/motivation.sh:297`.
 
-- **图表形式**：散点图，带 `y = x` 参考线。
-- **建议负载**：`load + overwrite-pareto`，可分别使用 `overwrite-uniform` 和 `overwrite-zipf` 的 key 更新分布。
-- **每个点**：一个 vSST。
-- **横轴**：entry-based garbage ratio，即 `dead entries / total entries`。
-- **纵轴**：byte-based garbage ratio，即 `dead bytes / total bytes`。
-- **证明的问题**：在不定长 value 下，失效 key 比例不能准确代表真实可回收字节比例；大量点会偏离 `y = x`。
-- **对应动机**：entry-based GC 收益模型在 variable-size value 场景下会误判，需要 byte-precise GC。
+---
 
-## 图 M6：GC scan bytes / reclaimed bytes
+## 3. Diagnostic families
 
-- **图表形式**：柱状图或折线图。
-- **建议负载**：fixed value 与 Pareto value 对比；也可进一步区分 `overwrite-uniform + pareto` 和 `overwrite-zipf + pareto`。
-- **横轴**：value size 分布或 workload 组合。
-- **纵轴**：`GC scan bytes / reclaimed bytes`，也可使用 `GC total I/O bytes / reclaimed bytes`。
-- **证明的问题**：entry-based GC 在不定长 value 下可能选择回收收益较低的 vSST，导致单位回收成本升高。
-- **对应动机**：byte-precise GC 不仅修正统计口径，还能降低错误 GC 选择带来的实际回收效率损失。
+The current suite expects these diagnostics when enabled:
 
-## 图表与优化点对应关系
+```text
+BLOB_GC_FILE_GARBAGE_STATS
+BLOB_GC_RECLAIM_STATS
+BLOB_GC_BYTES
+BLOB_GC_LATENCY
+BLOCK_CACHE_OBSOLETE_SAMPLE
+*_kvbench_timechart_*.csv
+```
 
-| 优化点 | 图表 | 证明的问题 |
+`motivation_log_inventory.tsv` counts these families; see `test-sh/new-ycsb/motivation.sh:394`.
+
+---
+
+## 4. Mapping to paper optimizations
+
+| Optimization theme | Motivation figures | Interface validation |
 | --- | --- | --- |
-| 冷热路由与反查加速 | M1：vSST 垃圾率分布 CDF | hot/cold 混写导致垃圾分散，冷热路由有必要。 |
-| 冷热路由与反查加速 | M2：GC I/O 分解图 | GC 存在 vSST 无效扫描和 kSST 反查 I/O。 |
-| 冷热路由与反查加速 | M3：GC 期间前台性能时间线 | GC 后台读与前台读争用带宽并造成性能抖动。 |
-| GC 感知块缓存淘汰 | M4：block cache 失效块占比时间线 | LRU 下 obsolete blocks 长期驻留并污染 block cache。 |
-| 不定长 value 精确 GC | M5：entry vs byte garbage ratio 散点图 | entry-based 垃圾率不能代表真实可回收 bytes。 |
-| 不定长 value 精确 GC | M6：GC scan bytes / reclaimed bytes | 错误收益模型会转化为实际 GC 效率损失。 |
+| Hot/cold routing + drop-key reverse-lookup acceleration | M1, M2, M3 | `hotness_base` vs `hotness_opt` |
+| GC-aware block cache | M4 | `gc_cache_base` vs `gc_cache_opt` |
+| Byte-precise GC over separated-value metadata | M5 | `precise_base` vs `precise_opt` |
+
+---
+
+## 5. SVG sketches
+
+Use these only as structural guides:
+
+- `third-party/terarkdb/paper/motivation-expected-figures-m1-m2-m4-m5-m6.svg`
+- `third-party/terarkdb/paper/m3-expected-gc-foreground-timeline.svg`
+
+If an SVG disagrees with current code/log semantics, update the SVG or this note; do not let the sketch override reality.
+
+---
+
+## 6. Maintenance rule
+
+Update this file only when the case matrix, mixed-value default, figure meaning, diagnostic source, or plotting path changes in a stable way.

@@ -274,8 +274,10 @@ enum Tickers : uint32_t {
     // Hotness routing final counters for experiments.
     HOTNESS_FLUSH_HOT_KEYS,
     HOTNESS_FLUSH_WARM_KEYS,
+    HOTNESS_FLUSH_COLD_KEYS,
     HOTNESS_FLUSH_HOT_BYTES,
     HOTNESS_FLUSH_WARM_BYTES,
+    HOTNESS_FLUSH_COLD_BYTES,
 
     // Blob GC final counters for file selection and bandwidth breakdown.
     GC_PICK_CANDIDATE_FILES,
@@ -287,12 +289,16 @@ enum Tickers : uint32_t {
     GC_KSST_READ_BYTES,
     GC_INVALID_READ_BYTES,
     GC_RELOCATION_WRITE_BYTES,
+    // Compatibility counters aligned with exact_gc/delta_block deployments.
+    CF_GC_WRITE_BYTES,
+    CF_GC_READ_BYTES,
+    CF_GC_CLEAR_BYTES,
+    CF_GC_ANTIQUATED_ENTRY_PERMIL,
+    CF_GC_ANTIQUATED_BYTES_PERMIL,
     GC_RUN_MICROS,
     GC_BLOCK_TOTAL,
     GC_BLOCK_INVALID_100,
 
-    GC_AWARE_CACHE_ADMISSION_HIT,
-    GC_AWARE_CACHE_PROBATION_HIT,
     GC_AWARE_CACHE_DEMOTE,
     GC_AWARE_CACHE_EVICT_LOW_SCORE,
     GC_AWARE_CACHE_VSST_DATA_INSERT,

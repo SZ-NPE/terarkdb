@@ -367,7 +367,12 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // valid [0 , 0.5]
   double blob_gc_ratio = 0.05;
 
-  // Use byte-precise garbage ratio when metadata is available.
+  // Use byte-level garbage ratio for blob/vSST GC. This relies on separated
+  // value size metadata, normally written by use_separated_value_meta_block.
+  bool byte_precise_gc = false;
+
+  // Compatibility alias for older scripts and option files. Sanitization folds
+  // true into byte_precise_gc=true.
   bool precise_gc = false;
 
   // Blob file size

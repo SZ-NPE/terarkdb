@@ -55,7 +55,8 @@ TableBuilder* NewTableBuilder(
     const CompressionOptions& compression_opts, int level,
     double compaction_load, const std::string* compression_dict = nullptr,
     bool skip_filters = false, uint64_t creation_time = 0,
-    uint64_t oldest_key_time = 0, SstPurpose sst_purpose = kEssenceSst);
+    uint64_t oldest_key_time = 0, SstPurpose sst_purpose = kEssenceSst,
+    SstType sst_type = SstType::kNormal);
 
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to number specified in meta. On success, the rest of

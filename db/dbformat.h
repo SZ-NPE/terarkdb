@@ -915,8 +915,6 @@ class SeparateHelper {
     return TransToSeparate(internal_key, value);
   }
 
-  virtual bool ShouldUpdateValueSize() const { return false; }
-
   virtual LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
                                      const LazyBuffer& value) const = 0;
 };

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "db/compaction.h"
@@ -28,10 +29,17 @@ class TableCache;
 class VersionEdit;
 class VersionSet;
 
+struct MapSstDependenceStats {
+  uint64_t entry_count = 0;
+  uint64_t byte_count = 0;
+};
+
+using MapSstDependenceMap =
+    std::unordered_map<uint64_t, MapSstDependenceStats>;
+
 class MapSstRangeIterator : public InternalIterator {
  public:
-  virtual const std::unordered_map<uint64_t, uint64_t>& GetDependence()
-      const = 0;
+  virtual const MapSstDependenceMap& GetDependence() const = 0;
   virtual std::pair<size_t, double> GetSstReadAmp() const = 0;
 };
 

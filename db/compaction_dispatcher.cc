@@ -18,6 +18,7 @@
 #include <inttypes.h>
 
 #include <chrono>
+#include <limits>
 
 #ifdef WITH_TERARK_ZIP
 #include <terark/num_to_str.hpp>
@@ -205,7 +206,7 @@ AJSON(EncodedString, data);
 
 #endif
 
-AJSON(Dependence, file_number, entry_count);
+AJSON(Dependence, file_number, entry_count, byte_count);
 
 using FileInfo = CompactionWorkerResult::FileInfo;
 AJSON(FileInfo, smallest, largest, file_name, smallest_seqno, largest_seqno,
@@ -218,7 +219,7 @@ AJSON(FileDescriptor, packed_number_and_path_id, file_size, smallest_seqno,
       largest_seqno);
 
 AJSON(TablePropertyCache, num_entries, num_deletions, raw_key_size,
-      raw_value_size, flags, purpose, max_read_amp, read_amp, dependence,
+      raw_value_size, flags, purpose, max_read_amp, read_amp, sst_type, dependence,
       inheritance);
 
 AJSON(FileMetaData, fd, smallest, largest, prop);
@@ -854,7 +855,11 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
   std::unique_ptr<WritableFileWriter> writer;
   std::unique_ptr<TableBuilder> builder;
   FileMetaData meta;
-  std::unordered_map<uint64_t, uint64_t> dependence;
+  struct DependenceAccumulator {
+    uint64_t entry_count = 0;
+    uint64_t byte_count = 0;
+  };
+  std::unordered_map<uint64_t, DependenceAccumulator> dependence;
   auto finish_output_file = [&](Status s, const Slice* next_key) -> Status {
     if (s.ok() && !range_del_agg.IsEmpty()) {
       Slice lower_bound_guard, upper_bound_guard;
@@ -944,12 +949,9 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
           builder->NeedCompact() ? FileMetaData::kMarkedFromTableBuilder : 0;
       meta.prop.num_entries = builder->NumEntries();
       for (auto& pair : dependence) {
-        // precise_gc: remote workers never create new blob files, so all
-        // referenced blobs are carried over from existing SSTs. Leave
-        // byte_count as 0 and let VersionBuilder fall back to an averaged
-        // estimate from the source blob's file size.
         meta.prop.dependence.emplace_back(
-            Dependence{pair.first, pair.second, 0, 0});
+            Dependence{pair.first, pair.second.entry_count,
+                         pair.second.byte_count});
       }
       terark::sort_a(meta.prop.dependence, TERARK_CMP(file_number, <));
       auto shrinked_snapshots = meta.ShrinkSnapshot(context.existing_snapshots);
@@ -1010,9 +1012,16 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
     if (c_iter->ikey().type == kTypeValueIndex ||
         c_iter->ikey().type == kTypeMergeIndex) {
       assert(value.file_number() != uint64_t(-1));
-      auto ib = dependence.emplace(value.file_number(), 1);
-      if (!ib.second) {
-        ++ib.first->second;
+      auto& acc = dependence[value.file_number()];
+      ++acc.entry_count;
+      const uint64_t value_size = c_iter->value_size();
+      if (value_size > 0) {
+        if (acc.byte_count >
+            std::numeric_limits<uint64_t>::max() - value_size) {
+          acc.byte_count = std::numeric_limits<uint64_t>::max();
+        } else {
+          acc.byte_count += value_size;
+        }
       }
     }
 

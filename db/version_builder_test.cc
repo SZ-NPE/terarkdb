@@ -151,7 +151,7 @@ TablePropertyCache GetPropCache(
     uint8_t purpose, std::initializer_list<uint64_t> dependence = {},
     std::initializer_list<uint64_t> inheritance = {}) {
   std::vector<Dependence> dep;
-  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, 0, 0});
+  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, 0});
   TablePropertyCache ret;
   ret.purpose = purpose;
   ret.dependence = dep;
@@ -168,8 +168,7 @@ TablePropertyCache GetPropCacheWithBytes(
   std::vector<Dependence> dep;
   for (auto& t : dep_list) {
     dep.emplace_back(
-        Dependence{std::get<0>(t), std::get<1>(t), std::get<2>(t),
-                   std::get<1>(t)});
+        Dependence{std::get<0>(t), std::get<1>(t), std::get<2>(t)});
   }
   TablePropertyCache ret;
   ret.purpose = purpose;
@@ -495,7 +494,8 @@ TEST_F(VersionBuilderTest, HugeLSM) {
     TablePropertyCache prop;
     for (uint32_t j = 0; j < kFilesBlobDependence; ++j) {
       prop.dependence.emplace_back(Dependence{
-          (_rand.Uniform(kFilesBlobCount) * kFilesBlobInheritance) + 1, 1});
+            (_rand.Uniform(kFilesBlobCount) * kFilesBlobInheritance) + 1, 1,
+            0});
     }
     std::sort(prop.dependence.begin(), prop.dependence.end(),
               [](const Dependence& l, const Dependence& r) {
@@ -546,9 +546,8 @@ TEST_F(VersionBuilderTest, HugeLSM) {
 }
 
 // precise_gc: when a referencing SST carries an explicit per-dependence
-// byte_count, VersionBuilder should propagate it to the blob file's
-// num_antiquation_bytes field instead of falling back to the averaged
-// estimate. This test also verifies that the entry-based
+// byte_count, VersionBuilder should propagate it directly to the blob file's
+// num_antiquation_bytes field. This test also verifies that the entry-based
 // num_antiquation still works in parallel with the byte-based accounting.
 TEST_F(VersionBuilderTest, PreciseGcByteCountFromDependence) {
   // Blob B (file_number=100) at level -1:
@@ -586,15 +585,9 @@ TEST_F(VersionBuilderTest, PreciseGcByteCountFromDependence) {
   UnrefFilesInVersion(&new_vstorage);
 }
 
-// precise_gc: when byte_count is 0 in every referencing Dependence (legacy
-// manifests / MapSst / remote-compaction paths), VersionBuilder must fall
-// back to the averaged estimate (entry_count * file_size / num_entries)
-// so that num_antiquation_bytes is still a meaningful approximation.
-TEST_F(VersionBuilderTest, PreciseGcByteCountFallbackWhenZero) {
-  // Blob B: 100 entries, 10000 bytes. Average entry size = 100 bytes.
-  // S references 70 entries with byte_count=0 -> fallback estimate:
-  //   bytes_depended ~= 70 * 10000 / 100 = 7000
-  //   num_antiquation_bytes ~= 10000 - 7000 = 3000
+TEST_F(VersionBuilderTest, PreciseGcByteCountDirectWhenZero) {
+  // Match exact_gc semantics: byte_count is the live-byte term directly.
+  // A zero byte_count means zero depended bytes.
   Add(-1, 101U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100);
   UpdateVersionStorageInfo();
 
@@ -615,23 +608,19 @@ TEST_F(VersionBuilderTest, PreciseGcByteCountFallbackWhenZero) {
   ASSERT_TRUE(it != dep_map.end());
   FileMetaData* b = it->second;
   ASSERT_EQ(30U, b->num_antiquation);
-  ASSERT_EQ(3000U, b->num_antiquation_bytes);
+  ASSERT_EQ(10000U, b->num_antiquation_bytes);
 
   UnrefFilesInVersion(&new_vstorage);
 }
 
-TEST_F(VersionBuilderTest, PreciseGcMixedByteCountFallbacksMissingEntries) {
+TEST_F(VersionBuilderTest, PreciseGcUsesPersistedByteCountDirectly) {
   // Blob B: 100 entries, 10000 accounting bytes. The referencing SST has 70
-  // live entries, but only 40 carry exact byte metadata. VersionBuilder should
-  // use the exact 4000 bytes plus an averaged estimate for the 30 missing
-  // entries instead of treating the partial byte_count as complete:
-  //   live bytes = 4000 + 30 * 10000 / 100 = 7000
-  //   obsolete bytes = 3000
+  // live entries. VersionBuilder consumes the persisted byte_count directly.
   Add(-1, 107U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100);
   UpdateVersionStorageInfo();
 
   TablePropertyCache prop;
-  prop.dependence.emplace_back(Dependence{107U, 70U, 4000U, 40U});
+  prop.dependence.emplace_back(Dependence{107U, 70U, 4000U});
   VersionEdit version_edit;
   version_edit.AddFile(2, 207U, 0, 500U, GetInternalKey("100"),
                        GetInternalKey("199"), 200, 200, false, prop);
@@ -648,7 +637,7 @@ TEST_F(VersionBuilderTest, PreciseGcMixedByteCountFallbacksMissingEntries) {
   ASSERT_TRUE(it != dep_map.end());
   FileMetaData* b = it->second;
   ASSERT_EQ(30U, b->num_antiquation);
-  ASSERT_EQ(3000U, b->num_antiquation_bytes);
+  ASSERT_EQ(6000U, b->num_antiquation_bytes);
 
   UnrefFilesInVersion(&new_vstorage);
 }
@@ -699,6 +688,7 @@ TEST_F(VersionBuilderTest, PreciseGcTriggerUsesPickerAccountingBytes) {
   blob->num_antiquation_bytes = 2000U;
   UpdateVersionStorageInfo();
 
+  mutable_cf_options_.byte_precise_gc = true;
   mutable_cf_options_.precise_gc = true;
   vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_);
   const double picker_score = blob->num_antiquation_bytes /
@@ -706,6 +696,7 @@ TEST_F(VersionBuilderTest, PreciseGcTriggerUsesPickerAccountingBytes) {
   ASSERT_DOUBLE_EQ(picker_score, vstorage_.total_garbage_ratio());
   ASSERT_DOUBLE_EQ(0.25, vstorage_.total_garbage_ratio());
 
+  mutable_cf_options_.byte_precise_gc = false;
   mutable_cf_options_.precise_gc = false;
   vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_);
   ASSERT_DOUBLE_EQ(0.30, vstorage_.total_garbage_ratio());
@@ -752,8 +743,8 @@ TEST_F(VersionBuilderTest, PreciseGcConsumesByteCountPersistedBeforeEnabled) {
 }
 
 TEST_F(VersionBuilderTest, PreciseGcMetadataCompletenessLogged) {
-  // Mixed metadata should be observable: one dependence carries exact bytes,
-  // the other simulates legacy metadata and falls back to entry average.
+  // Metadata logging reports the same direct byte-accounting path consumed by
+  // VersionBuilder.
   AddBlobFile(-1, 105U, "100", "199", 10000U /* file_size */,
               8000U /* raw_value_size */, 8U /* num_entries */);
   AddBlobFile(-1, 106U, "200", "299", 9000U /* file_size */,
@@ -780,12 +771,8 @@ TEST_F(VersionBuilderTest, PreciseGcMetadataCompletenessLogged) {
 
   ASSERT_NE(std::string::npos,
             logger.logs().find("[PRECISE_GC_METADATA]"));
-  ASSERT_NE(std::string::npos, logger.logs().find("exact_deps=1"));
-  ASSERT_NE(std::string::npos, logger.logs().find("estimated_deps=1"));
-  ASSERT_NE(std::string::npos, logger.logs().find("exact_bytes=4000"));
-  ASSERT_NE(std::string::npos, logger.logs().find("estimated_bytes=3000"));
-  ASSERT_NE(std::string::npos,
-            logger.logs().find("exact_byte_ratio=0.571429"));
+  ASSERT_NE(std::string::npos, logger.logs().find("deps=2"));
+  ASSERT_NE(std::string::npos, logger.logs().find("bytes=4000"));
 
   UnrefFilesInVersion(&new_vstorage);
 }

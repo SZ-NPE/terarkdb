@@ -167,6 +167,7 @@ struct MutableCFOptions {
         enable_delta_separate(true),
         middle_blob_size(size_t(-1)),
         middle_combine_level(size_t(-1)),
+        enable_hotness_tracker(false),
         hotness_window_capacity(0),
         hotness_hot_capacity(0),
         hotness_enable_write_window(false),
@@ -178,6 +179,7 @@ struct MutableCFOptions {
         blob_large_key_ratio(0),
         read_separated_value_by_handle(true),
         blob_gc_ratio(0),
+        byte_precise_gc(false),
         precise_gc(false),
         target_blob_file_size(0),
         blob_file_defragment_size(0),
@@ -246,6 +248,7 @@ struct MutableCFOptions {
   bool enable_delta_separate;
   size_t middle_blob_size;
   size_t middle_combine_level;
+  bool enable_hotness_tracker;
   size_t hotness_window_capacity;
   size_t hotness_hot_capacity;
   bool hotness_enable_write_window;
@@ -257,6 +260,9 @@ struct MutableCFOptions {
   double blob_large_key_ratio;
   bool read_separated_value_by_handle;
   double blob_gc_ratio;
+  bool byte_precise_gc;
+  // Compatibility alias copied from legacy ColumnFamilyOptions::precise_gc.
+  // Engine code should use byte_precise_gc.
   bool precise_gc;
   uint64_t target_blob_file_size;
   uint64_t blob_file_defragment_size;

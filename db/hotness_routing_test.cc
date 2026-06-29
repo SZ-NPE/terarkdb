@@ -144,31 +144,32 @@ TEST_F(HotnessTrackerTest, DecayAdvancesWhenWriteWindowDisabled) {
             HotnessTracker::FlushRoute::kWarm);
 }
 
-// (c) Compaction feedback is confirmed overwrite evidence and promotes directly.
+// (c) Compaction feedback is stronger evidence than the write-window signal:
+// one confirmed obsolete version is enough to route the next flushed value to
+// the hot file class.
 TEST_F(HotnessTrackerTest, CompactionFeedbackBecomesHot) {
   HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
   Slice key("compaction_feedback_key");
 
   tracker.RecordCompactionFeedback(key);
-
   ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kEphemeral);
 }
 
-// (c2) Compaction feedback with a sequence also promotes the key into the hot
-// LRU (same hot-routing semantics as the no-seq overload).
+// (c2) Compaction feedback with a dropped sequence also promotes the key into
+// the hot route while retaining the exact sequence for drop-key GC lookup.
 TEST_F(HotnessTrackerTest, CompactionFeedbackWithSeqBecomesHot) {
   HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
   Slice key("compaction_feedback_seq_key");
 
   tracker.RecordCompactionFeedback(key, 42 /* seq */);
-
   ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kEphemeral);
+  ASSERT_TRUE(tracker.IsDropped(key, 42 /* seq */));
 }
 
 // (c3) IsDropped only hits the exact recorded sequence. Other sequences under
@@ -199,7 +200,7 @@ TEST_F(HotnessTrackerTest, IsDroppedLostAfterEviction) {
   Slice second("drop_key_2");
   Slice third("drop_key_3");
   options.hot_capacity =
-      (first.size() + sizeof(HotnessTracker::HotEntry)) * 2;
+      (first.size() + sizeof(HotnessTracker::HotEntry)) * 5;
   HotnessTracker tracker(options, 0 /* num_shard_bits */);
 
   tracker.RecordCompactionFeedback(first, 1 /* seq */);
@@ -251,25 +252,50 @@ TEST_F(HotnessTrackerTest, DropKeyCacheCanBeDisabledIndependently) {
 
   Slice key("promote_without_drop_key");
   tracker.RecordCompactionFeedback(key, 12 /* seq */);
-
   ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
   ASSERT_EQ(tracker.ClassifyForFlush(key),
             HotnessTracker::FlushRoute::kEphemeral);
   ASSERT_FALSE(tracker.IsDropped(key, 12));
 }
 
-// (d) Hot LRU capacity bounds the promoted hot set.
+TEST_F(HotnessTrackerTest, StrongColdRequiresRepeatedStableObservations) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
+
+  Slice key("stable_cold_key");
+  ASSERT_EQ(tracker.ClassifyForFlush(key), HotnessTracker::FlushRoute::kWarm);
+  ASSERT_EQ(tracker.ClassifyForFlush(key), HotnessTracker::FlushRoute::kWarm);
+  ASSERT_EQ(tracker.ClassifyForFlush(key), HotnessTracker::FlushRoute::kCold);
+}
+
+TEST_F(HotnessTrackerTest, HotSignalResetsColdCandidate) {
+  HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
+
+  Slice key("cold_then_hot_key");
+  ASSERT_EQ(tracker.ClassifyForFlush(key), HotnessTracker::FlushRoute::kWarm);
+  ASSERT_EQ(tracker.ClassifyForFlush(key), HotnessTracker::FlushRoute::kWarm);
+
+  tracker.RecordWrite(key);
+  tracker.RecordWrite(key);
+
+  ASSERT_EQ(tracker.ClassifyForFlush(key),
+            HotnessTracker::FlushRoute::kEphemeral);
+}
+
+// (d) Drop-hot LRU capacity bounds the promoted compaction-feedback set.
 TEST_F(HotnessTrackerTest, HotLruCapacityEvictsOldEntries) {
   HotnessTracker::Options options = MakeTestOptions();
   Slice first("hot_key_1");
   Slice second("hot_key_2");
   Slice third("hot_key_3");
   options.hot_capacity =
-      (first.size() + sizeof(HotnessTracker::HotEntry)) * 2;
+      (first.size() + sizeof(HotnessTracker::HotEntry)) * 5;
   HotnessTracker tracker(options, 0 /* num_shard_bits */);
 
   tracker.RecordCompactionFeedback(first);
+  tracker.RecordCompactionFeedback(first);
   tracker.RecordCompactionFeedback(second);
+  tracker.RecordCompactionFeedback(second);
+  tracker.RecordCompactionFeedback(third);
   tracker.RecordCompactionFeedback(third);
 
   ASSERT_FALSE(tracker.TEST_HotCacheContains(first));
@@ -277,10 +303,33 @@ TEST_F(HotnessTrackerTest, HotLruCapacityEvictsOldEntries) {
   ASSERT_TRUE(tracker.TEST_HotCacheContains(third));
 }
 
+TEST_F(HotnessTrackerTest, WriteHotTrafficDoesNotEvictDropKeySequences) {
+  HotnessTracker::Options options = MakeTestOptions();
+  Slice drop_key("drop_region_key");
+  options.hot_capacity =
+      (drop_key.size() + sizeof(HotnessTracker::HotEntry)) * 8;
+  HotnessTracker tracker(options, 0 /* num_shard_bits */);
+
+  tracker.RecordCompactionFeedback(drop_key, 101 /* seq */);
+  tracker.RecordCompactionFeedback(drop_key, 102 /* seq */);
+  ASSERT_TRUE(tracker.IsDropped(drop_key, 101));
+
+  for (int i = 0; i < 100; ++i) {
+    std::string write_key = "write_region_key_" + std::to_string(i);
+    tracker.RecordWrite(write_key);
+    tracker.RecordWrite(write_key);
+  }
+
+  ASSERT_TRUE(tracker.IsDropped(drop_key, 101));
+  ASSERT_EQ(tracker.ClassifyForFlush(drop_key),
+            HotnessTracker::FlushRoute::kEphemeral);
+}
+
 TEST_F(HotnessTrackerTest, HotLruDoesNotExpireWithoutEviction) {
   HotnessTracker tracker(MakeTestOptions(), 0 /* num_shard_bits */);
 
   Slice key("persistent_hot_key");
+  tracker.RecordCompactionFeedback(key);
   tracker.RecordCompactionFeedback(key);
   ASSERT_TRUE(tracker.TEST_HotCacheContains(key));
 
@@ -414,10 +463,14 @@ TEST_F(HotnessTrackerTest, HotnessAndGcTickerNamesAreRegistered) {
             "rocksdb.num.hotness.flush.hot_keys");
   ASSERT_EQ(names[HOTNESS_FLUSH_WARM_KEYS],
             "rocksdb.num.hotness.flush.warm_keys");
+  ASSERT_EQ(names[HOTNESS_FLUSH_COLD_KEYS],
+            "rocksdb.num.hotness.flush.cold_keys");
   ASSERT_EQ(names[HOTNESS_FLUSH_HOT_BYTES],
             "rocksdb.bytes.hotness.flush.hot");
   ASSERT_EQ(names[HOTNESS_FLUSH_WARM_BYTES],
             "rocksdb.bytes.hotness.flush.warm");
+  ASSERT_EQ(names[HOTNESS_FLUSH_COLD_BYTES],
+            "rocksdb.bytes.hotness.flush.cold");
   ASSERT_EQ(names[GC_PICK_SELECTED_GARBAGE_BYTES],
             "rocksdb.bytes.gc.pick.selected_garbage");
   ASSERT_EQ(names[GC_VSST_READ_BYTES], "rocksdb.bytes.gc.vsst_read");
@@ -431,6 +484,8 @@ TEST_F(HotnessTrackerTest, DropKeyCacheStatsAreObservable) {
   RecordTick(stats.get(), GC_GET_KEY_AVOIDED, 3);
   RecordTick(stats.get(), HOTNESS_FLUSH_HOT_KEYS, 7);
   RecordTick(stats.get(), HOTNESS_FLUSH_HOT_BYTES, 1024);
+  RecordTick(stats.get(), HOTNESS_FLUSH_COLD_KEYS, 2);
+  RecordTick(stats.get(), HOTNESS_FLUSH_COLD_BYTES, 512);
   RecordTick(stats.get(), GC_PICK_SELECTED_FILES, 2);
   RecordTick(stats.get(), GC_VSST_READ_BYTES, 4096);
 
@@ -439,6 +494,8 @@ TEST_F(HotnessTrackerTest, DropKeyCacheStatsAreObservable) {
   ASSERT_EQ(3U, stats->getTickerCount(GC_GET_KEY_AVOIDED));
   ASSERT_EQ(7U, stats->getTickerCount(HOTNESS_FLUSH_HOT_KEYS));
   ASSERT_EQ(1024U, stats->getTickerCount(HOTNESS_FLUSH_HOT_BYTES));
+  ASSERT_EQ(2U, stats->getTickerCount(HOTNESS_FLUSH_COLD_KEYS));
+  ASSERT_EQ(512U, stats->getTickerCount(HOTNESS_FLUSH_COLD_BYTES));
   ASSERT_EQ(2U, stats->getTickerCount(GC_PICK_SELECTED_FILES));
   ASSERT_EQ(4096U, stats->getTickerCount(GC_VSST_READ_BYTES));
 }

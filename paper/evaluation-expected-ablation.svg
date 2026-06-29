@@ -19,8 +19,8 @@
     .line { fill: none; stroke-width: 3.5; stroke-linejoin: round; stroke-linecap: round; }
   </style>
 
-  <text x="640" y="36" text-anchor="middle" class="title">Paper Evaluation: Per-Optimization Paired Ablation 预期结果图</text>
-  <text x="640" y="62" text-anchor="middle" class="subtitle">每个优化点采用 interface.sh 中最有利于暴露收益的负载；数值为预期趋势占位，等待真实实验替换</text>
+  <text x="640" y="36" text-anchor="middle" class="title">Paper Evaluation: Per-Optimization Paired Ablation Sketch</text>
+  <text x="640" y="62" text-anchor="middle" class="subtitle">Each optimization uses the interface.sh workload that best exposes its benefit; values are placeholders until replaced by real results.</text>
 
   <g transform="translate(45,95)">
     <rect class="panel" x="0" y="0" width="570" height="325"/>
@@ -109,10 +109,10 @@
         <line x1="0" y1="134" x2="486" y2="134" stroke="#eee"/>
         <text x="16" y="164">delta</text><text x="150" y="164">overwrite-zipf</text><text x="315" y="164">fewer large rewrites</text>
         <line x1="0" y1="184" x2="486" y2="184" stroke="#eee"/>
-        <text x="16" y="214">precise GC</text><text x="150" y="214">overwrite-zipf1.2 + Pareto</text><text x="315" y="214">byte-accurate reclaim</text>
+        <text x="16" y="214">precise GC</text><text x="150" y="214">overwrite-zipf1.2 + uniform_fixed</text><text x="315" y="214">byte-accurate reclaim</text>
       </g>
     </g>
   </g>
 
-  <text x="640" y="828" text-anchor="middle" class="note">建议论文最终使用 A/B 作为主消融图；C/D 可作为扩展图或 appendix，用真实日志指标替换占位数值。</text>
+  <text x="640" y="828" text-anchor="middle" class="note">Use A/B as the main ablation figure; C/D can move to appendix after replacing placeholders with real log metrics.</text>
 </svg>

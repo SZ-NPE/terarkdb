@@ -190,14 +190,10 @@ struct BlockBasedTableOptions {
   // Default: true
   bool use_delta_encoding = true;
 
-  // Use an SST-side delta metadata block to store per-entry metadata for
-  // separated values. This is a table-format extension used by precise Blob GC
-  // to recover value sizes without fetching Blob values during compaction.
-  //
-  // Disabled by default during migration; existing precise_gc paths continue
-  // to fall back to Dependence::byte_count or average-size estimation when the
-  // delta block is absent.
-  bool use_delta_block = false;
+  // Store per-entry separated-value size/meta in an SST metadata block. This is
+  // required by byte_precise_gc to compute garbage by bytes instead of entries.
+  // This is the delta_block metadata used by the exact/byte-precise GC path.
+  bool use_separated_value_meta_block = false;
 
   // If non-nullptr, use the specified filter policy to reduce disk reads.
   // Many applications will benefit from passing the result of
@@ -544,7 +540,7 @@ class TableFactory
 
   // Return whether this table format persists per-entry separated value sizes
   // needed by precise Blob GC.
-  virtual bool IsExactGarbageCollectionSupported() const { return false; }
+  virtual bool SupportsBytePreciseGC() const { return false; }
 };
 
 #ifndef ROCKSDB_LITE

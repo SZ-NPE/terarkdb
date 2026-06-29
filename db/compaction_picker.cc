@@ -78,7 +78,7 @@ struct GarbageFileInfo {
   double score;
   uint64_t estimate_size;
 
-  // precise_gc: compute per-file garbage score.
+  // byte_precise_gc: compute per-file garbage score.
   //   precise==true  -> byte-based: antiquation_bytes / file_size
   //   precise==false -> entry-based: num_antiquation / num_entries
   static double ComputeScore(const FileMetaData* f, bool precise) {
@@ -92,8 +92,8 @@ struct GarbageFileInfo {
                              std::max<double>(1, f->prop.num_entries));
   }
 
-  GarbageFileInfo(FileMetaData* _f, bool precise_gc = false)
-      : f(_f), score(ComputeScore(_f, precise_gc)), estimate_size(0) {
+  GarbageFileInfo(FileMetaData* _f, bool byte_precise_gc = false)
+      : f(_f), score(ComputeScore(_f, byte_precise_gc)), estimate_size(0) {
     if (f == nullptr) return;
     estimate_size = static_cast<uint64_t>(f->fd.file_size * (1 - score));
   }
@@ -861,11 +861,16 @@ void CompactionPicker::GetGrandparents(
 // 3. it marked for compaction
 Compaction* CompactionPicker::PickGarbageCollection(
     const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
-    VersionStorageInfo* vstorage, LogBuffer* /*log_buffer*/) {
+    double dynamic_blob_gc_ratio, VersionStorageInfo* vstorage,
+    LogBuffer* /*log_buffer*/) {
   // Setting fragment_size as one eighth target_blob_file_size prevents
   // selecting massive files to single compaction which would pin down the
   // maximum deletable file number for a long time resulting possible storage
   // leakage.
+  double blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
+  if (dynamic_blob_gc_ratio >= 0.0 && dynamic_blob_gc_ratio <= 1.0) {
+    blob_gc_ratio = dynamic_blob_gc_ratio;
+  }
   size_t target_blob_file_size = MaxBlobSize(
       mutable_cf_options, ioptions_.num_levels, ioptions_.compaction_style);
 
@@ -883,6 +888,11 @@ Compaction* CompactionPicker::PickGarbageCollection(
   };
 
   auto& hidden_files = vstorage->LevelFiles(-1);
+  // Keep a GC job's inputs homogeneous in sst_type so the single replacement
+  // blob inherits exactly one persisted variant and the inheritance owner stays
+  // unique. This is based on file metadata, not the current mutable options: a
+  // DB may contain historical warm/cold/middle blob files after those features
+  // are disabled for new writes.
   uint64_t idx = 0;
   uint64_t scanned_blobs = 0;
   uint64_t permitted_blobs = 0;
@@ -892,16 +902,19 @@ Compaction* CompactionPicker::PickGarbageCollection(
          : score < 0.7 ? 3 : score < 0.9 ? 4 : 5;
   };
   // Find largest score blob
-  GarbageFileInfo dirtiest_blob{nullptr, mutable_cf_options.precise_gc};
+  GarbageFileInfo dirtiest_blob{nullptr,
+                                mutable_cf_options.byte_precise_gc};
   for (; idx < hidden_files.size() && !hidden_files[idx]->is_gc_forbidden();
        ++idx) {
     ++scanned_blobs;
     FileMetaData* f = hidden_files[idx];
-    if (!f->is_gc_permitted() || f->being_compacted) {
+    if (!f->is_gc_permitted() || f->being_compacted ||
+        f->prop.sst_type == SstType::kHotMidBlob ||
+        f->prop.sst_type == SstType::kColdMidBlob) {
       continue;
     }
     ++permitted_blobs;
-    GarbageFileInfo info{f, mutable_cf_options.precise_gc};
+    GarbageFileInfo info{f, mutable_cf_options.byte_precise_gc};
     if (ioptions_.blob_gc_diagnostics && ioptions_.info_log != nullptr) {
       const uint64_t entries = f->prop.num_entries;
       const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
@@ -922,7 +935,8 @@ Compaction* CompactionPicker::PickGarbageCollection(
           cf_name.c_str(), ioptions_.env->NowMicros(), f->fd.GetNumber(),
           f->fd.GetFileSize(), accounting_bytes, entries, f->num_antiquation,
           f->num_antiquation_bytes, entry_ratio, byte_ratio, info.score,
-          mutable_cf_options.precise_gc ? 1 : 0, static_cast<int>(f->gc_status),
+          mutable_cf_options.byte_precise_gc ? 1 : 0,
+          static_cast<int>(f->gc_status),
           f->marked_for_compaction, f->being_compacted ? 1 : 0);
     }
     ++garbage_ratio_buckets[bucket_idx(info.score)];
@@ -934,7 +948,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
 
   if (dirtiest_blob.f == nullptr ||
       (!dirtiest_blob.f->marked_for_compaction &&
-       dirtiest_blob.score < mutable_cf_options.blob_gc_ratio)) {
+       dirtiest_blob.score < blob_gc_ratio)) {
     return nullptr;
   }
   // Set up inputs for garbage collection.
@@ -946,6 +960,8 @@ Compaction* CompactionPicker::PickGarbageCollection(
   uint64_t total_estimate_size = dirtiest_blob.estimate_size;
   uint64_t num_antiquation = dirtiest_blob.f->num_antiquation;
   uint64_t size_antiquated = dirtiest_blob.f->num_antiquation_bytes;
+  const SstType target_sst_type =
+      static_cast<SstType>(dirtiest_blob.f->prop.sst_type);
 
   // expand with neighbor blob
   std::vector<GarbageFileInfo> candidate_blob_vec;
@@ -988,10 +1004,11 @@ Compaction* CompactionPicker::PickGarbageCollection(
     }
   }
   auto push_candidate = [&](FileMetaData* f) {
-    if (f->is_gc_permitted() && !f->being_compacted) {
-      GarbageFileInfo gc_blob(f, mutable_cf_options.precise_gc);
+    if (f->is_gc_permitted() && !f->being_compacted &&
+        f->prop.sst_type == target_sst_type) {
+      GarbageFileInfo gc_blob(f, mutable_cf_options.byte_precise_gc);
       if (gc_blob.estimate_size <= fragment_size ||
-          gc_blob.score >= mutable_cf_options.blob_gc_ratio ||
+          gc_blob.score >= blob_gc_ratio ||
           gc_blob.f->marked_for_compaction) {
         candidate_blob_vec.emplace_back(gc_blob);
       }
@@ -1021,6 +1038,19 @@ Compaction* CompactionPicker::PickGarbageCollection(
     candidate_blob_vec.pop_back();
   }
 
+  uint64_t selected_bytes = 0;
+  for (const auto* f : input.files) {
+    const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
+    selected_bytes = selected_bytes >
+                             std::numeric_limits<uint64_t>::max() -
+                                 accounting_bytes
+                         ? std::numeric_limits<uint64_t>::max()
+                         : selected_bytes + accounting_bytes;
+  }
+  const uint64_t selected_live_bytes =
+      selected_bytes - std::min(selected_bytes, size_antiquated);
+  const size_t selected_file_count = input.files.size();
+
   int bottommost_level = vstorage->num_levels() - 1;
   // Set compaction params.
   CompactionParams params(vstorage, ioptions_, mutable_cf_options);
@@ -1043,31 +1073,120 @@ Compaction* CompactionPicker::PickGarbageCollection(
   Compaction* c = RegisterCompaction(new Compaction(std::move(params)));
   if (ioptions_.blob_gc_collect_bytes_stats) {
     RecordTick(ioptions_.statistics, GC_PICK_CANDIDATE_FILES, permitted_blobs);
-    RecordTick(ioptions_.statistics, GC_PICK_SELECTED_FILES, input.files.size());
-    RecordTick(ioptions_.statistics, GC_PICK_SELECTED_BYTES,
-               total_estimate_size);
+    RecordTick(ioptions_.statistics, GC_PICK_SELECTED_FILES,
+               selected_file_count);
+    RecordTick(ioptions_.statistics, GC_PICK_SELECTED_BYTES, selected_bytes);
     RecordTick(ioptions_.statistics, GC_PICK_SELECTED_GARBAGE_BYTES,
                size_antiquated);
     RecordTick(ioptions_.statistics, GC_PICK_SELECTED_LIVE_BYTES,
-               total_estimate_size -
-                   std::min(total_estimate_size, size_antiquated));
+               selected_live_bytes);
   ROCKS_LOG_INFO(
       ioptions_.info_log,
       "[%s] GC_PICK scanned=%" PRIu64 " permitted=%" PRIu64
-      " selected=%zu target_blob=%" PRIu64
-      " selected_garbage=%" PRIu64 "/%" PRIu64 " ratio=%.4f"
+      " selected=%zu estimated_output_bytes=%" PRIu64
+      " selected_bytes=%" PRIu64
+      " selected_garbage_bytes=%" PRIu64 "/%" PRIu64 " ratio=%.4f"
       " buckets=[<10%%=%" PRIu64 " <30%%=%" PRIu64
       " <50%%=%" PRIu64 " <70%%=%" PRIu64
       " <90%%=%" PRIu64 " >=90%%=%" PRIu64 "]",
-      cf_name.c_str(), scanned_blobs, permitted_blobs, input.files.size(),
-      total_estimate_size, num_antiquation,
-      std::max<uint64_t>(1, total_estimate_size), dirtiest_blob.score,
+      cf_name.c_str(), scanned_blobs, permitted_blobs, selected_file_count,
+      total_estimate_size, selected_bytes, size_antiquated,
+      std::max<uint64_t>(1, selected_bytes), dirtiest_blob.score,
       garbage_ratio_buckets[0], garbage_ratio_buckets[1],
       garbage_ratio_buckets[2], garbage_ratio_buckets[3],
       garbage_ratio_buckets[4], garbage_ratio_buckets[5]);
   }
   vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options);
 
+  return c;
+}
+
+Compaction* CompactionPicker::PickBlobDefragmentation(
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+    double dynamic_blob_gc_ratio, VersionStorageInfo* vstorage,
+    LogBuffer* /*log_buffer*/) {
+  (void)cf_name;
+  (void)dynamic_blob_gc_ratio;
+  size_t target_blob_file_size = MaxBlobSize(
+      mutable_cf_options, ioptions_.num_levels, ioptions_.compaction_style);
+  size_t fragment_size = mutable_cf_options.blob_file_defragment_size;
+  if (fragment_size == 0) {
+    fragment_size = target_blob_file_size / 8;
+  }
+
+  std::vector<GarbageFileInfo> candidate_blob_vec;
+  auto& hidden_files = vstorage->LevelFiles(-1);
+  for (size_t idx = 0;
+       idx < hidden_files.size() && !hidden_files[idx]->is_gc_forbidden();
+       ++idx) {
+    FileMetaData* f = hidden_files[idx];
+    if (!f->is_gc_permitted() || f->being_compacted ||
+        f->prop.sst_type == SstType::kHotMidBlob ||
+        f->prop.sst_type == SstType::kColdMidBlob) {
+      continue;
+    }
+    if (f->fd.GetFileSize() < fragment_size) {
+      candidate_blob_vec.emplace_back(f, mutable_cf_options.byte_precise_gc);
+    }
+  }
+
+  constexpr size_t kMaxFragmentedBlobCount = 8;
+  if (candidate_blob_vec.size() <= kMaxFragmentedBlobCount) {
+    return nullptr;
+  }
+
+  auto candidate_cmp = [](const GarbageFileInfo& l, const GarbageFileInfo& r) {
+    assert(l.f != nullptr && !l.f->being_compacted);
+    assert(r.f != nullptr && !r.f->being_compacted);
+    return l.estimate_size < r.estimate_size;
+  };
+  std::make_heap(candidate_blob_vec.begin(), candidate_blob_vec.end(),
+                 candidate_cmp);
+
+  std::vector<CompactionInputFiles> inputs(1);
+  auto& input = inputs.front();
+  input.level = -1;
+  uint64_t total_estimate_size = 0;
+  uint64_t num_antiquation = 0;
+  uint64_t size_antiquated = 0;
+  while (!candidate_blob_vec.empty() && input.files.size() < 8) {
+    auto* f = candidate_blob_vec.front().f;
+    if (total_estimate_size + candidate_blob_vec.front().estimate_size <
+        target_blob_file_size) {
+      total_estimate_size += candidate_blob_vec.front().estimate_size;
+      num_antiquation += f->num_antiquation;
+      size_antiquated += f->num_antiquation_bytes;
+      f->set_gc_candidate();
+      input.files.push_back(f);
+    }
+    std::pop_heap(candidate_blob_vec.begin(), candidate_blob_vec.end(),
+                  candidate_cmp);
+    candidate_blob_vec.pop_back();
+  }
+  if (input.files.empty()) {
+    return nullptr;
+  }
+
+  int bottommost_level = vstorage->num_levels() - 1;
+  CompactionParams params(vstorage, ioptions_, mutable_cf_options);
+  params.inputs = std::move(inputs);
+  params.output_level = -1;
+  params.num_antiquation = num_antiquation;
+  params.size_antiquated = size_antiquated;
+  params.max_compaction_bytes = LLONG_MAX;
+  params.output_path_id = GetPathId(ioptions_, mutable_cf_options, 1);
+  params.compression = GetCompressionType(
+      ioptions_, vstorage, mutable_cf_options, bottommost_level, 1, true);
+  params.compression_opts =
+      GetCompressionOptions(ioptions_, vstorage, bottommost_level, true);
+  params.max_subcompactions = 1;
+  params.score = vstorage->total_garbage_ratio();
+  params.compaction_type = kGarbageCollection;
+  params.compaction_reason = ConvertInputsCompactionReason(
+      params.inputs, CompactionReason::kGarbageCollection);
+
+  Compaction* c = RegisterCompaction(new Compaction(std::move(params)));
+  vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options);
   return c;
 }
 

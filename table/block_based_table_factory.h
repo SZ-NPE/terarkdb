@@ -77,8 +77,8 @@ class BlockBasedTableFactory : public TableFactory {
 
   bool IsDeleteRangeSupported() const override { return true; }
 
-  bool IsExactGarbageCollectionSupported() const override {
-    return table_options_.use_delta_block;
+  bool SupportsBytePreciseGC() const override {
+    return table_options_.use_separated_value_meta_block;
   }
 
   static const std::string kName;
@@ -164,8 +164,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"partition_filters",
          {offsetof(struct BlockBasedTableOptions, partition_filters),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
+        {"use_separated_value_meta_block",
+         {offsetof(struct BlockBasedTableOptions, use_separated_value_meta_block),
+          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"use_delta_block",
-         {offsetof(struct BlockBasedTableOptions, use_delta_block),
+         {offsetof(struct BlockBasedTableOptions, use_separated_value_meta_block),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"filter_policy",
          {offsetof(struct BlockBasedTableOptions, filter_policy),

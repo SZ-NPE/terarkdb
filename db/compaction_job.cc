@@ -563,7 +563,6 @@ struct CompactionJob::SubcompactionState {
       FileMetaData* meta = nullptr;
       uint64_t entry_count = 0;
       uint64_t byte_count = 0;
-      uint64_t byte_count_entry_count = 0;
     };
     auto saturating_add = [](uint64_t a, uint64_t b) {
       if (a > std::numeric_limits<uint64_t>::max() - b) {
@@ -618,20 +617,6 @@ struct CompactionJob::SubcompactionState {
         auto& acc = ib.first->second;
         acc.entry_count = saturating_add(acc.entry_count, pair.entry_count);
         acc.byte_count = saturating_add(acc.byte_count, pair.byte_count);
-        // Resolve exact-byte coverage per dependence before aggregating. A
-        // legacy dependence with byte_count != 0 and byte_count_entry_count == 0
-        // means all entries in that dependence have exact bytes; aggregating raw
-        // byte_count_entry_count first would charge those entries again through
-        // average-size fallback when mixed with newer dependences.
-        const uint64_t exact_entries =
-            pair.byte_count == 0
-                ? uint64_t{0}
-                : (pair.byte_count_entry_count == 0
-                       ? pair.entry_count
-                       : std::min(pair.entry_count,
-                                  pair.byte_count_entry_count));
-        acc.byte_count_entry_count =
-            saturating_add(acc.byte_count_entry_count, exact_entries);
       }
     }
     output->blobs.reserve(blob_map.size());
@@ -639,21 +624,8 @@ struct CompactionJob::SubcompactionState {
       const auto& acc = pair.second;
       auto meta = acc.meta;
       const uint64_t total_bytes = meta->fd.GetFileSize();
-      const uint64_t num_entries = meta->prop.num_entries;
-      if (num_entries == 0) {
-        return Status::Corruption(
-            "blob file has zero entries while calculating references");
-      }
       const uint64_t accounting_bytes = meta->BlobGcAccountingBytes();
-      const uint64_t exact_entries =
-          std::min(acc.entry_count, acc.byte_count_entry_count);
-      const uint64_t missing_entries = acc.entry_count - exact_entries;
       uint64_t ref_accounting_bytes = std::min(acc.byte_count, accounting_bytes);
-      ref_accounting_bytes = saturating_add(
-          ref_accounting_bytes,
-          mul_div_clamped(accounting_bytes, missing_entries, num_entries,
-                          accounting_bytes));
-      ref_accounting_bytes = std::min(ref_accounting_bytes, accounting_bytes);
       uint64_t ref_bytes = mul_div_clamped(total_bytes, ref_accounting_bytes,
                                            accounting_bytes, total_bytes);
       output->blobs.emplace_back(BlobRefInfo{pair.first, meta, ref_bytes});
@@ -1581,7 +1553,8 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
       }
     }
   }
-  if (status.ok() && db_options_.block_cache_obsolete_tracking) {
+  if (status.ok() &&
+      compact_->compaction->compaction_type() == kGarbageCollection) {
     Compaction* compaction = compact_->compaction;
     std::vector<uint64_t> input_file_numbers;
     std::vector<uint64_t> output_file_numbers;
@@ -1598,21 +1571,26 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
         output_file_numbers.push_back(output.meta.fd.GetNumber());
       }
     }
-    const bool has_replacement =
-        compaction->compaction_type() == kGarbageCollection ||
-        !output_file_numbers.empty();
+    const bool has_gc_inputs = !input_file_numbers.empty();
     auto* table_factory = cfd->ioptions()->table_factory;
-    if (has_replacement && table_factory != nullptr &&
+    if (has_gc_inputs && table_factory != nullptr &&
         table_factory->Name() == BlockBasedTableFactory::kName) {
       auto* block_based_factory =
           static_cast<BlockBasedTableFactory*>(table_factory);
       const auto& table_options = block_based_factory->table_options();
       if (table_options.block_cache != nullptr) {
+        // Optimization path: always move obsolete vSST data blocks to the LRU
+        // tail so they are evicted first.  This is independent of the
+        // diagnostic sampling switch below.
         table_options.block_cache->MarkBlockCacheFilesObsolete(
-            input_file_numbers, output_file_numbers,
-            compaction->compaction_type() == kGarbageCollection ? "gc"
-                                                                : "compaction",
+            input_file_numbers, output_file_numbers, "gc",
             static_cast<uint64_t>(job_id_), db_options_.info_log.get());
+        // Diagnostic path (motivation experiments only): emit the obsolete
+        // residency sample, which scans the cache and is gated by the option.
+        if (db_options_.block_cache_obsolete_tracking) {
+          table_options.block_cache->LogBlockCacheObsoleteSample(
+              "gc", static_cast<uint64_t>(job_id_), db_options_.info_log.get());
+        }
       }
     }
   }
@@ -1801,10 +1779,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
                                          LazyBuffer& value,
                                          ValueMetaData* meta) = nullptr;
     void* trans_to_separate_callback_args = nullptr;
-    bool update_value_size = false;
-
-    bool ShouldUpdateValueSize() const override { return update_value_size; }
-
     Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                            const Slice& meta, bool is_merge,
                            bool is_index) override {
@@ -1843,13 +1817,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       return separate_helper->TransToCombined(user_key, sequence, value);
     }
   } separate_helper;
-  // precise_gc needs exact value-size metadata to make byte-based garbage
-  // ratios diverge from entry-count ratios on variable-size workloads.  When
-  // an input entry does not already carry value_size from a delta block, allow
-  // SeparateHelper to repair it from the separated value during compaction;
-  // otherwise VersionBuilder must fall back to per-file average bytes and the
-  // M5 Pareto experiment collapses back to entry_ratio ~= byte_ratio.
-  separate_helper.update_value_size = mutable_cf_options->precise_gc;
   if (compact_->compaction->immutable_cf_options()
           ->value_meta_extractor_factory != nullptr) {
     ValueExtractorContext context = {cfd->GetID()};
@@ -1873,7 +1840,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       blob_builder = nullptr;
     }
     if (s.ok() && blob_builder == nullptr) {
-      s = OpenCompactionOutputBlob(sub_compact);
+      s = OpenCompactionOutputBlob(sub_compact, SstType::kLargeBlob);
       blob_builder = sub_compact->blob_builder.get();
       blob_meta = &sub_compact->current_blob_output()->meta;
     }
@@ -2025,13 +1992,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (!sub_compact->compaction->partial_compaction()) {
     dict_sample_data.reserve(kSampleBytes);
   }
-  // For KV separation, record how many entries and bytes in each blob SST are
-  // still referenced by this output kSST. Dependence.byte_count is
-  // opportunistic exact metadata: whenever the input iterator can expose
-  // separated value_size (for example from delta-block metadata), persist it
-  // with byte_count_entry_count regardless of the current precise_gc scoring
-  // switch. If precise_gc is enabled later, VersionBuilder can consume the
-  // already-persisted bytes and estimate only legacy/missing entries.
+  // For KV separation, record how many entries and separated-value bytes in
+  // each blob SST are still referenced by this output kSST.
   std::unordered_map<uint64_t, DependenceAccumulator> dependence;
 
   size_t yield_count = 0;
@@ -2053,7 +2015,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         } else {
           acc.byte_count += value_size;
         }
-        ++acc.byte_count_entry_count;
       }
     }
 
@@ -2316,8 +2277,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact != nullptr);
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
-  const MutableCFOptions* mutable_cf_options =
-      sub_compact->compaction->mutable_cf_options();
   Version* input_version = sub_compact->compaction->input_version();
   // Raw view of the optional drop-key cache. When the hotness tracker is
   // enabled, blob GC consults it to skip the GetKey() reverse lookup for
@@ -2382,13 +2341,41 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       c_style_callback(filter_conflict), &filter_conflict, nullptr /* arena */,
       shutting_down_);
 
-  Status status = OpenCompactionOutputBlob(sub_compact);
+  auto normalize_blob_sst_type = [](uint8_t raw_type) {
+    SstType type = static_cast<SstType>(raw_type);
+    return (type == SstType::kNormal || type == SstType::kMaxSstType)
+               ? SstType::kLargeBlob
+               : type;
+  };
+  SstType sst_type = SstType::kLargeBlob;
+  const auto& gc_inputs = *sub_compact->compaction->inputs();
+  bool has_gc_input = false;
+  for (const auto& input_level : gc_inputs) {
+    for (const auto* f : input_level.files) {
+      if (f == nullptr) {
+        continue;
+      }
+      const SstType file_sst_type = normalize_blob_sst_type(f->prop.sst_type);
+      if (!has_gc_input) {
+        sst_type = file_sst_type;
+        has_gc_input = true;
+      } else if (file_sst_type != sst_type) {
+        sub_compact->status = Status::Corruption(
+            "Blob GC input files have mixed sst_type");
+        return;
+      }
+    }
+  }
+  auto& dependence_map = input_version->storage_info()->dependence_map();
+  std::vector<uint64_t> inheritance_tree;
+  size_t inheritance_tree_pruge_count = 0;
+  Status status = BuildInheritanceTree(
+      *sub_compact->compaction->inputs(), dependence_map, input_version,
+      &inheritance_tree, &inheritance_tree_pruge_count);
   if (!status.ok()) {
     return;
   }
-  sub_compact->blob_builder->SetSecondPassIterator(&second_pass_iter);
-
-  auto& dependence_map = input_version->storage_info()->dependence_map();
+  TERARK_UNUSED_VAR(inheritance_tree_pruge_count);
   auto& comp = cfd->internal_comparator();
   std::string last_key;
   uint64_t last_file_number = uint64_t(-1);
@@ -2436,6 +2423,26 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     uint64_t block_dead_bytes = 0;
   };
   std::unordered_map<uint64_t, PerBlobBlockTracker> block_trackers;
+  auto ensure_gc_blob_output = [&](HotnessTracker::FlushRoute route) {
+    const int route_id = static_cast<int>(route);
+    // Blob GC installs rewritten value files through the inheritance map: every
+    // old blob file number in the GC input set is redirected to the new output
+    // file. That map is one-to-one, so a single GC job must not split live
+    // records for the same input/inherited blob file across multiple outputs.
+    // Hot/cold route switching is useful for flush-generated blobs, but doing it
+    // inside GC can make later outputs overwrite the inheritance owner for all
+    // input file numbers and leave older live records unfindable. Keep one GC
+    // output per job even if live records have mixed hotness.
+    if (sub_compact->blob_builder == nullptr) {
+      Status open_status = OpenCompactionOutputBlob(sub_compact, sst_type,
+                                                    route_id);
+      if (!open_status.ok()) {
+        return open_status;
+      }
+      sub_compact->blob_builder->SetSecondPassIterator(&second_pass_iter);
+    }
+    return Status::OK();
+  };
   auto finalize_block = [this](uint64_t block_bytes, uint64_t dead_bytes) {
     if (block_bytes == 0) return;
     ++gc_block_total_;
@@ -2571,6 +2578,14 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       }
       curr_file_number = value.file_number();
 
+      HotnessTracker::FlushRoute route = HotnessTracker::FlushRoute::kWarm;
+      if (sub_compact->blob_builder == nullptr && hotness_tracker != nullptr) {
+        route = hotness_tracker->ClassifyForRouting(ikey.user_key);
+      }
+      status = ensure_gc_blob_output(route);
+      if (!status.ok()) {
+        break;
+      }
       assert(sub_compact->blob_builder != nullptr);
       assert(sub_compact->current_blob_output() != nullptr);
       const uint64_t s5 = collect_gc_latency ? env_->NowNanos() : 0;
@@ -2646,15 +2661,11 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       finalize_block(entry.second.block_bytes, entry.second.block_dead_bytes);
     }
   }
-  std::vector<uint64_t> inheritance_tree;
-  size_t inheritance_tree_pruge_count = 0;
-  if (status.ok()) {
-    status = BuildInheritanceTree(
-        *sub_compact->compaction->inputs(), dependence_map, input_version,
-        &inheritance_tree, &inheritance_tree_pruge_count);
-  }
   const uint64_t s6 = collect_gc_latency ? env_->NowNanos() : 0;
-  Status s = FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
+  Status s;
+  if (sub_compact->blob_builder != nullptr) {
+    s = FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
+  }
   if (collect_gc_latency) {
     gc_t_meta_ += (env_->NowNanos() - s6);
   }
@@ -2662,10 +2673,62 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     status = s;
   }
   if (status.ok() && collect_gc_bytes && !sub_compact->blob_outputs.empty()) {
+    uint64_t rewritten_blob_bytes = 0;
+    for (const auto& output : sub_compact->blob_outputs) {
+      rewritten_blob_bytes += output.meta.fd.GetFileSize();
+    }
     RecordTick(db_options_.statistics.get(), GC_REWRITE_BLOB_BYTES,
-               sub_compact->blob_outputs.front().meta.fd.GetFileSize());
+               rewritten_blob_bytes);
   }
   if (status.ok()) {
+      uint64_t input_file_bytes = 0;
+      uint64_t output_file_bytes = 0;
+      const auto& gc_inputs_ref = *sub_compact->compaction->inputs();
+      for (const auto& input_level : gc_inputs_ref) {
+        for (const auto* f : input_level.files) {
+          input_file_bytes = input_file_bytes >
+                                     std::numeric_limits<uint64_t>::max() -
+                                         f->fd.GetFileSize()
+                                 ? std::numeric_limits<uint64_t>::max()
+                                 : input_file_bytes + f->fd.GetFileSize();
+        }
+      }
+      for (const auto& output : sub_compact->blob_outputs) {
+        output_file_bytes = output_file_bytes >
+                                    std::numeric_limits<uint64_t>::max() -
+                                        output.meta.fd.GetFileSize()
+                                ? std::numeric_limits<uint64_t>::max()
+                                : output_file_bytes +
+                                      output.meta.fd.GetFileSize();
+      }
+      const uint64_t cleared_bytes =
+          input_file_bytes > output_file_bytes ? input_file_bytes - output_file_bytes
+                                               : 0;
+      RecordTick(stats_, CF_GC_READ_BYTES, input_file_bytes);
+      RecordTick(stats_, CF_GC_WRITE_BYTES, output_file_bytes);
+      RecordTick(stats_, CF_GC_CLEAR_BYTES, cleared_bytes);
+      if (counter.input > 0) {
+        SetTickerCount(stats_, CF_GC_ANTIQUATED_ENTRY_PERMIL,
+                       sub_compact->compaction->num_antiquation() * 1000 /
+                           counter.input);
+      }
+      uint64_t input_accounting_bytes = 0;
+      for (const auto& input_level : gc_inputs_ref) {
+        for (const auto* f : input_level.files) {
+          const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
+          input_accounting_bytes = input_accounting_bytes >
+                                           std::numeric_limits<uint64_t>::max() -
+                                               accounting_bytes
+                                       ? std::numeric_limits<uint64_t>::max()
+                                       : input_accounting_bytes +
+                                             accounting_bytes;
+        }
+      }
+      if (input_accounting_bytes > 0) {
+        SetTickerCount(stats_, CF_GC_ANTIQUATED_BYTES_PERMIL,
+                       sub_compact->compaction->size_antiquated() * 1000 /
+                           input_accounting_bytes);
+      }
       if (counter.dropped_key_cache_hit > 0) {
         RecordTick(db_options_.statistics.get(), GC_DROP_KEY_CACHE_HIT,
                    counter.dropped_key_cache_hit);
@@ -2998,10 +3061,8 @@ Status CompactionJob::FinishCompactionOutputFile(
                                       : 0;
     meta->prop.num_entries = sub_compact->builder->NumEntries();
     for (auto& pair : dependence) {
-      meta->prop.dependence.emplace_back(
-          Dependence{pair.first, pair.second.entry_count,
-                     pair.second.byte_count,
-                     pair.second.byte_count_entry_count});
+        meta->prop.dependence.emplace_back(Dependence{
+            pair.first, pair.second.entry_count, pair.second.byte_count});
     }
     std::sort(meta->prop.dependence.begin(), meta->prop.dependence.end(),
               TERARK_CMP(file_number, <));
@@ -3558,13 +3619,14 @@ Status CompactionJob::OpenCompactionOutputFile(
       0 /* oldest_key_time */,
       sub_compact->compaction->compaction_type() == kMapCompaction
           ? kMapSst
-          : kEssenceSst));
+          : kEssenceSst,
+      SstType::kNormal));
   LogFlush(db_options_.info_log);
   return s;
 }
 
 Status CompactionJob::OpenCompactionOutputBlob(
-    SubcompactionState* sub_compact) {
+    SubcompactionState* sub_compact, SstType sst_type, int route) {
   assert(sub_compact != nullptr);
   assert(sub_compact->blob_builder == nullptr);
   // no need to lock because VersionSet::next_file_number_ is atomic
@@ -3605,11 +3667,20 @@ Status CompactionJob::OpenCompactionOutputBlob(
   SubcompactionState::Output out;
   out.meta.fd =
       FileDescriptor(file_number, sub_compact->compaction->output_path_id(), 0);
+  out.meta.prop.sst_type = static_cast<uint8_t>(sst_type);
   out.finished = false;
 
   sub_compact->blob_outputs.push_back(out);
   writable_file->SetIOPriority(Env::IO_LOW);
-  writable_file->SetWriteLifeTimeHint(Env::WLTH_EXTREME);
+  Env::WriteLifeTimeHint lifetime_hint = Env::WLTH_EXTREME;
+  if (route == static_cast<int>(HotnessTracker::FlushRoute::kEphemeral)) {
+    lifetime_hint = Env::WLTH_SHORT;
+  } else if (route == static_cast<int>(HotnessTracker::FlushRoute::kWarm)) {
+    lifetime_hint = Env::WLTH_MEDIUM;
+  } else if (route == static_cast<int>(HotnessTracker::FlushRoute::kCold)) {
+    lifetime_hint = Env::WLTH_EXTREME;
+  }
+  writable_file->SetWriteLifeTimeHint(lifetime_hint);
   writable_file->SetPreallocationBlockSize(static_cast<size_t>(
       sub_compact->compaction->OutputFilePreallocationSize()));
   const auto& listeners =
@@ -3644,7 +3715,8 @@ Status CompactionJob::OpenCompactionOutputBlob(
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(), -1 /* level */,
       c->compaction_load(), nullptr, true /* skip_filters */,
-      output_file_creation_time, 0 /* oldest_key_time */, kEssenceSst));
+      output_file_creation_time, 0 /* oldest_key_time */, kEssenceSst,
+      sst_type));
   LogFlush(db_options_.info_log);
   return s;
 }

@@ -40,6 +40,7 @@
 #include "monitoring/histogram.h"
 #include "monitoring/statistics.h"
 #include "options/cf_options.h"
+#include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/cache.h"
@@ -442,25 +443,9 @@ DEFINE_bool(use_gc_aware_block_cache, false,
             "Replace default LRU block cache with garbage-aware block cache "
             "for vSST data blocks.");
 
-DEFINE_double(gc_aware_cache_admission_ratio, 0.7,
-              "Fraction of garbage-aware block cache capacity reserved for the "
-              "normal LRU admission region.");
-
-DEFINE_double(gc_aware_cache_demote_score_threshold, 0.0,
-              "Demote vSST data blocks whose score is below this threshold. "
-              "score = access_frequency * (1 - file_garbage_ratio).");
-
 DEFINE_uint64(gc_aware_cache_log_interval, 10000,
               "Log garbage-aware block cache state every N demote/evict "
               "events. 0 disables periodic cache logs.");
-
-DEFINE_bool(enable_gc_aware_cache_aging, false,
-            "Enable epoch-based access frequency aging in garbage-aware block "
-            "cache.");
-
-DEFINE_uint64(gc_aware_cache_aging_interval, 10000,
-              "Advance one garbage-aware cache aging epoch every N cache "
-              "operations.");
 
 DEFINE_int64(simcache_size, -1,
              "Number of bytes to use as a simcache of "
@@ -526,10 +511,11 @@ DEFINE_bool(block_align,
             TERARKDB_NAMESPACE::BlockBasedTableOptions().block_align,
             "Align data blocks on page size");
 
-DEFINE_bool(use_delta_block,
-            TERARKDB_NAMESPACE::BlockBasedTableOptions().use_delta_block,
-            "Enable delta block metadata for separated values. Disabled by "
-            "default to keep the classic SST write/read path unchanged.");
+DEFINE_bool(use_separated_value_meta_block, false,
+            "Record separated value size/meta in SST metadata blocks.");
+
+DEFINE_bool(use_delta_block, false,
+            "Compatibility alias for --use_separated_value_meta_block.");
 
 DEFINE_bool(use_data_block_hash_index, false,
             "if use kDataBlockBinaryAndHash "
@@ -1072,8 +1058,18 @@ DEFINE_bool(read_separated_value_by_handle,
 
 DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
 
-DEFINE_bool(precise_gc, false,
-            "Enable byte-precise garbage ratio calculation for blob GC");
+DEFINE_string(
+    byte_precise_gc, "false",
+    "Enable byte-precise blob/vSST GC: false uses obsolete entry ratio; "
+    "true uses obsolete byte ratio from separated-value metadata.");
+
+DEFINE_string(precise_gc, "false",
+              "Compatibility alias for --byte_precise_gc.");
+
+DEFINE_string(
+    open_exact_gc, "false",
+    "Compatibility alias for --byte_precise_gc. Allowed values: "
+    "false|true|kExactGCUpdateValueSize; update-value-size maps to true.");
 
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
@@ -2484,12 +2480,7 @@ class Benchmark {
       cache_opts.capacity = static_cast<size_t>(capacity);
       cache_opts.num_shard_bits = FLAGS_cache_numshardbits;
       cache_opts.strict_capacity_limit = false;
-      cache_opts.admission_ratio = FLAGS_gc_aware_cache_admission_ratio;
-      cache_opts.demote_score_threshold =
-          FLAGS_gc_aware_cache_demote_score_threshold;
       cache_opts.log_interval = FLAGS_gc_aware_cache_log_interval;
-      cache_opts.enable_aging = FLAGS_enable_gc_aware_cache_aging;
-      cache_opts.aging_interval = FLAGS_gc_aware_cache_aging_interval;
       return NewGarbageAwareCache(cache_opts);
     } else {
       LRUCacheOptions cache_opts;
@@ -3578,8 +3569,40 @@ class Benchmark {
       block_based_options.enable_index_compression =
           FLAGS_enable_index_compression;
       block_based_options.block_align = FLAGS_block_align;
-      block_based_options.use_delta_block =
-          FLAGS_use_delta_block || FLAGS_precise_gc;
+      bool byte_precise_gc_flag = false;
+      if (!ParseOptionHelper(reinterpret_cast<char*>(&byte_precise_gc_flag),
+                             OptionType::kBoolean, FLAGS_byte_precise_gc)) {
+        fprintf(stderr,
+                "invalid value for --byte_precise_gc: %s, allowed: "
+                "false|true\n",
+                FLAGS_byte_precise_gc.c_str());
+        exit(1);
+      }
+      bool precise_gc_alias = false;
+      if (!ParseOptionHelper(reinterpret_cast<char*>(&precise_gc_alias),
+                             OptionType::kBoolean, FLAGS_precise_gc)) {
+        fprintf(stderr,
+                "invalid value for --precise_gc: %s, allowed: false|true\n",
+                FLAGS_precise_gc.c_str());
+        exit(1);
+      }
+      bool exact_gc_alias = false;
+      if (FLAGS_open_exact_gc == "kExactGCUpdateValueSize") {
+        exact_gc_alias = true;
+      } else if (!ParseOptionHelper(reinterpret_cast<char*>(&exact_gc_alias),
+                                    OptionType::kBoolean,
+                                    FLAGS_open_exact_gc)) {
+        fprintf(stderr,
+                "invalid value for --open_exact_gc: %s, allowed: "
+                "false|true|kExactGCUpdateValueSize\n",
+                FLAGS_open_exact_gc.c_str());
+        exit(1);
+      }
+      const bool enable_byte_precise_gc =
+          byte_precise_gc_flag || precise_gc_alias || exact_gc_alias;
+      block_based_options.use_separated_value_meta_block =
+          FLAGS_use_separated_value_meta_block || FLAGS_use_delta_block ||
+          enable_byte_precise_gc;
       if (FLAGS_use_data_block_hash_index) {
         block_based_options.data_block_index_type =
             TERARKDB_NAMESPACE::BlockBasedTableOptions::kDataBlockBinaryAndHash;
@@ -3722,8 +3745,7 @@ class Benchmark {
         FLAGS_blob_gc_collect_bytes_stats || FLAGS_blob_gc_diagnostics;
     options.blob_gc_diagnostics = FLAGS_blob_gc_diagnostics;
     options.block_cache_obsolete_tracking =
-        FLAGS_block_cache_obsolete_tracking || FLAGS_use_gc_aware_block_cache ||
-        FLAGS_blob_gc_diagnostics;
+        FLAGS_block_cache_obsolete_tracking || FLAGS_blob_gc_diagnostics;
     options.block_cache_obsolete_sample_interval_sec =
         FLAGS_block_cache_obsolete_sample_interval_sec;
     options.block_cache_obsolete_topk_files =
@@ -3732,7 +3754,37 @@ class Benchmark {
     options.read_separated_value_by_handle =
         FLAGS_read_separated_value_by_handle;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
-    options.precise_gc = FLAGS_precise_gc;
+    bool byte_precise_gc_flag = false;
+    if (!ParseOptionHelper(reinterpret_cast<char*>(&byte_precise_gc_flag),
+                           OptionType::kBoolean, FLAGS_byte_precise_gc)) {
+      fprintf(stderr,
+              "invalid value for --byte_precise_gc: %s, allowed: "
+              "false|true\n",
+              FLAGS_byte_precise_gc.c_str());
+      exit(1);
+    }
+    bool precise_gc_alias = false;
+    if (!ParseOptionHelper(reinterpret_cast<char*>(&precise_gc_alias),
+                           OptionType::kBoolean, FLAGS_precise_gc)) {
+      fprintf(stderr,
+              "invalid value for --precise_gc: %s, allowed: false|true\n",
+              FLAGS_precise_gc.c_str());
+      exit(1);
+    }
+    bool exact_gc_alias = false;
+    if (FLAGS_open_exact_gc == "kExactGCUpdateValueSize") {
+      exact_gc_alias = true;
+    } else if (!ParseOptionHelper(reinterpret_cast<char*>(&exact_gc_alias),
+                                  OptionType::kBoolean, FLAGS_open_exact_gc)) {
+      fprintf(stderr,
+              "invalid value for --open_exact_gc: %s, allowed: "
+              "false|true|kExactGCUpdateValueSize\n",
+              FLAGS_open_exact_gc.c_str());
+      exit(1);
+    }
+    options.byte_precise_gc =
+        byte_precise_gc_flag || precise_gc_alias || exact_gc_alias;
+    options.precise_gc = options.byte_precise_gc;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;

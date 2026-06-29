@@ -204,6 +204,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  middle_blob_size);
   ROCKS_LOG_INFO(log, "                      middle_combine_level: %zd",
                  middle_combine_level);
+  ROCKS_LOG_INFO(log, "                   enable_hotness_tracker: %d",
+                 enable_hotness_tracker);
   ROCKS_LOG_INFO(log, "                 hotness_window_capacity: %zu",
                  hotness_window_capacity);
   ROCKS_LOG_INFO(log, "                    hotness_hot_capacity: %zu",
@@ -226,6 +228,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  read_separated_value_by_handle);
   ROCKS_LOG_INFO(log, "                            blob_gc_ratio: %f",
                  blob_gc_ratio);
+  ROCKS_LOG_INFO(log, "                    byte_precise_gc: %d",
+                 static_cast<int>(byte_precise_gc));
   ROCKS_LOG_INFO(log, "                               precise_gc: %d",
                  precise_gc);
   ROCKS_LOG_INFO(log, "                    target_blob_file_size: %" PRIu64,
@@ -324,6 +328,7 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       enable_delta_separate(options.enable_delta_separate),
       middle_blob_size(options.middle_blob_size),
       middle_combine_level(options.middle_combine_level),
+      enable_hotness_tracker(options.enable_hotness_tracker),
       hotness_window_capacity(options.hotness_window_capacity),
       hotness_hot_capacity(options.hotness_hot_capacity),
       hotness_enable_write_window(options.hotness_enable_write_window),
@@ -336,7 +341,8 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       blob_large_key_ratio(options.blob_large_key_ratio),
       read_separated_value_by_handle(options.read_separated_value_by_handle),
       blob_gc_ratio(options.blob_gc_ratio),
-      precise_gc(options.precise_gc),
+      byte_precise_gc(options.byte_precise_gc),
+      precise_gc(options.precise_gc || options.byte_precise_gc),
       target_blob_file_size(options.target_blob_file_size),
       blob_file_defragment_size(options.blob_file_defragment_size),
       max_dependence_blob_overlap(options.max_dependence_blob_overlap),
@@ -366,6 +372,10 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       compression(options.compression),
       ttl_gc_ratio(options.ttl_gc_ratio),
       ttl_max_scan_gap(options.ttl_max_scan_gap) {
+  if (precise_gc && !byte_precise_gc) {
+    byte_precise_gc = true;
+  }
+  precise_gc = byte_precise_gc;
   RefreshDerivedOptions(options.num_levels);
 
   int_tbl_prop_collector_factories = std::make_shared<

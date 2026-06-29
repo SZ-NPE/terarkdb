@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 516" font-family="'Helvetica Neue','Noto Sans CJK SC','PingFang SC','Microsoft YaHei',Arial,sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="8" markerHeight="8" refX="5.5" refY="2.8" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L5.8,2.8 L0,5.6 Z" fill="#8a96a3"/>
+    </marker>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="5.5" refY="2.8" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L5.8,2.8 L0,5.6 Z" fill="#b0bac4"/>
+    </marker>
+  </defs>
+
+  <!-- title -->
+  <text x="34" y="34" font-size="19" font-weight="700" fill="#3a4250">Overall Architecture</text>
+  <text x="34" y="55" font-size="12" fill="#9aa3ad">KV-separation engine: kSST stores value indexes, vSST stores separated large values, and vSST GC reclaims obsolete values.</text>
+
+  <!-- engine container -->
+  <rect x="30" y="72" width="900" height="268" rx="12" fill="#fbfcfd" stroke="#dde3ea" stroke-width="1.4"/>
+
+  <!-- ===== write path (left) ===== -->
+  <rect x="50" y="110" width="120" height="58" rx="8" fill="#eef2f7" stroke="#9fb3cb" stroke-width="1.3"/>
+  <text x="110" y="135" text-anchor="middle" font-size="12.5" font-weight="700" fill="#4f6b88">Write</text>
+  <text x="110" y="155" text-anchor="middle" font-size="10.5" fill="#7b8392">Put / Merge</text>
+
+  <rect x="50" y="200" width="120" height="52" rx="8" fill="#eef2f7" stroke="#9fb3cb" stroke-width="1.3"/>
+  <text x="110" y="223" text-anchor="middle" font-size="12" font-weight="700" fill="#4f6b88">MemTable</text>
+  <text x="110" y="241" text-anchor="middle" font-size="10" fill="#9aa3ad">WAL persistence</text>
+
+  <line x1="110" y1="168" x2="110" y2="198" stroke="#8a96a3" stroke-width="1.5" marker-end="url(#ar)"/>
+  <line x1="170" y1="226" x2="208" y2="226" stroke="#8a96a3" stroke-width="1.5" marker-end="url(#ar)"/>
+  <text x="176" y="218" font-size="10.5" fill="#9aa3ad">Flush</text>
+
+  <!-- ===== LSM core: kSST ===== -->
+  <rect x="210" y="110" width="250" height="186" rx="9" fill="#f4f6f9" stroke="#c2ccd8" stroke-width="1.3"/>
+  <text x="226" y="132" font-size="12" font-weight="700" fill="#566b82">kSST (LSM levels · value index)</text>
+  <rect x="230" y="144" width="210" height="22" rx="3" fill="#dde6ef"/><text x="240" y="159" font-size="10" fill="#566b82">L0</text>
+  <rect x="230" y="172" width="210" height="22" rx="3" fill="#d5dfea"/><text x="240" y="187" font-size="10" fill="#566b82">L1</text>
+  <rect x="230" y="200" width="210" height="22" rx="3" fill="#ccd9e6"/><text x="240" y="215" font-size="10" fill="#566b82">L2 … Ln</text>
+  <text x="226" y="246" font-size="10" fill="#9aa3ad">each value → value_index(file_no + meta)</text>
+  <text x="226" y="266" font-size="10" fill="#9aa3ad">Compaction maintains levels and dependencies</text>
+
+  <!-- kSST -> vSST separation arrow -->
+  <line x1="460" y1="180" x2="510" y2="180" stroke="#8a96a3" stroke-width="1.5" marker-end="url(#ar)"/>
+  <text x="468" y="173" font-size="9.5" fill="#9aa3ad">separate large values</text>
+
+  <!-- ===== vSST (hot/cold) ===== -->
+  <rect x="512" y="110" width="250" height="120" rx="9" fill="#f7f9fb" stroke="#c2ccd8" stroke-width="1.3"/>
+  <text x="528" y="132" font-size="12" font-weight="700" fill="#566b82">vSST (separated values · hidden level -1)</text>
+  <rect x="528" y="144" width="218" height="30" rx="5" fill="#fbeeec" stroke="#d8a59e" stroke-width="1.1"/>
+  <text x="540" y="163" font-size="10.5" fill="#b96b62">hot vSST · concentrated garbage</text>
+  <rect x="528" y="180" width="218" height="30" rx="5" fill="#eef3f7" stroke="#a8c0d4" stroke-width="1.1"/>
+  <text x="540" y="199" font-size="10.5" fill="#5f7e9c">cold vSST · low garbage</text>
+
+  <!-- ===== vSST GC ===== -->
+  <rect x="512" y="250" width="250" height="76" rx="9" fill="#f3f1fb" stroke="#9b8fd0" stroke-width="1.4"/>
+  <text x="528" y="272" font-size="12" font-weight="700" fill="#6a5aa8">vSST GC</text>
+  <text x="528" y="292" font-size="10" fill="#7b8392">pick obsolete vSSTs → lookup liveness → rewrite live values</text>
+  <text x="528" y="310" font-size="10" fill="#9aa3ad">retire old vSSTs and install new vSSTs</text>
+  <line x1="637" y1="230" x2="637" y2="248" stroke="#8a96a3" stroke-width="1.4" marker-end="url(#ar)"/>
+
+  <!-- ===== read path + block cache (right) ===== -->
+  <rect x="800" y="110" width="112" height="120" rx="9" fill="#f7faf8" stroke="#9cc4ac" stroke-width="1.3"/>
+  <text x="856" y="132" text-anchor="middle" font-size="11.5" font-weight="700" fill="#4f7a62">Block Cache</text>
+  <text x="856" y="152" text-anchor="middle" font-size="9.5" fill="#9aa3ad">cache data blocks</text>
+  <rect x="814" y="162" width="84" height="16" rx="3" fill="#cfd6db"/>
+  <rect x="814" y="182" width="84" height="16" rx="3" fill="#e6a9a3"/>
+  <rect x="814" y="202" width="84" height="16" rx="3" fill="#cfd6db"/>
+
+  <rect x="800" y="250" width="112" height="46" rx="8" fill="#eef2f7" stroke="#9fb3cb" stroke-width="1.3"/>
+  <text x="856" y="270" text-anchor="middle" font-size="11.5" font-weight="700" fill="#4f6b88">Read</text>
+  <text x="856" y="287" text-anchor="middle" font-size="10" fill="#7b8392">Get / Scan</text>
+
+  <!-- read links -->
+  <line x1="800" y1="180" x2="764" y2="180" stroke="#b0bac4" stroke-width="1.4" marker-end="url(#arr)"/>
+  <line x1="856" y1="250" x2="856" y2="232" stroke="#b0bac4" stroke-width="1.4" marker-end="url(#arr)"/>
+  <path d="M800,273 C700,314 560,286 462,266" fill="none" stroke="#b0bac4" stroke-width="1.3" marker-end="url(#arr)"/>
+  <text x="620" y="292" font-size="9.5" fill="#b0bac4">lookup kSST index</text>
+
+  <!-- ===== optimization badges row ===== -->
+  <text x="50" y="372" font-size="12.5" font-weight="700" fill="#3a4250">Roles of the three optimizations</text>
+
+  <!-- badge 1 -->
+  <rect x="50" y="384" width="280" height="92" rx="9" fill="#fbeeec" stroke="#d8a59e" stroke-width="1.4"/>
+  <circle cx="74" cy="406" r="11" fill="#c98079"/><text x="74" y="410" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">1</text>
+  <text x="92" y="403" font-size="11.5" font-weight="700" fill="#b96b62">Hotness-Driven Routing &amp; GC Pruning</text>
+  <text x="92" y="421" font-size="10" fill="#5b6470">write hotness → hot/cold vSST flush routing</text>
+  <text x="92" y="438" font-size="10" fill="#5b6470">→ concentrated garbage; faster GC reverse lookup</text>
+  <text x="68" y="464" font-size="9.5" fill="#9aa3ad">scope: write hotness · vSST routing · GC lookup</text>
+
+  <!-- badge 2 -->
+  <rect x="342" y="384" width="280" height="92" rx="9" fill="#faf4ec" stroke="#dcb78f" stroke-width="1.4"/>
+  <circle cx="366" cy="406" r="11" fill="#d8ad84"/><text x="366" y="410" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">2</text>
+  <text x="384" y="403" font-size="11.5" font-weight="700" fill="#a9744a">Byte-Precise GC</text>
+  <text x="384" y="421" font-size="10" fill="#5b6470">delta block recovers each value_size</text>
+  <text x="384" y="438" font-size="10" fill="#5b6470">→ choose GC files by bytes, not entries</text>
+  <text x="360" y="464" font-size="9.5" fill="#9aa3ad">scope: vSST GC candidate picker</text>
+
+  <!-- badge 3 -->
+  <rect x="634" y="384" width="280" height="92" rx="9" fill="#f7faf8" stroke="#9cc4ac" stroke-width="1.4"/>
+  <circle cx="658" cy="406" r="11" fill="#86b29a"/><text x="658" y="410" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">3</text>
+  <text x="676" y="403" font-size="11.5" font-weight="700" fill="#4f7a62">GC-Aware Block Cache</text>
+  <text x="676" y="421" font-size="10" fill="#5b6470">demote GC-obsolete blocks → evict earlier</text>
+  <text x="676" y="438" font-size="10" fill="#5b6470">→ reserve cache for live hot data</text>
+  <text x="652" y="464" font-size="9.5" fill="#9aa3ad">scope: read-path block cache</text>
+
+  <!-- ===== badge anchor markers on components ===== -->
+  <!-- 1 on write box (top-right corner) -->
+  <circle cx="156" cy="122" r="9" fill="#c98079"/><text x="156" y="126" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">1</text>
+  <!-- 1 on hot vSST sub-block (right end) -->
+  <circle cx="734" cy="159" r="9" fill="#c98079"/><text x="734" y="163" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">1</text>
+  <!-- 1 and 2 on vSST GC box (top-right corner, side by side) -->
+  <circle cx="726" cy="262" r="9" fill="#c98079"/><text x="726" y="266" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">1</text>
+  <circle cx="748" cy="262" r="9" fill="#d8ad84"/><text x="748" y="266" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">2</text>
+  <!-- 3 on block cache box (top-right corner) -->
+  <circle cx="900" cy="122" r="9" fill="#86b29a"/><text x="900" y="126" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">3</text>
+
+  <text x="50" y="498" font-size="9.5" fill="#9aa3ad">Numbered badges show where each optimization attaches: ① write hotness, vSST routing, and GC lookup; ② vSST GC selection; ③ read-path cache.</text>
+</svg>

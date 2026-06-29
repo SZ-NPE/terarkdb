@@ -7,9 +7,7 @@
 
 #include <atomic>
 #include <list>
-#include <map>
 #include <memory>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,12 +27,11 @@ class GarbageAwareCacheShard : public CacheShard {
     uint64_t obsolete_blocks = 0;
     uint64_t obsolete_bytes = 0;
     uint64_t obsolete_file_count = 0;
+    std::unordered_set<uint64_t> obsolete_files;
   };
 
   GarbageAwareCacheShard(size_t capacity, bool strict_capacity_limit,
-                         double admission_ratio, double demote_score_threshold,
-                         uint64_t log_interval, bool enable_aging,
-                         uint64_t aging_interval);
+                         uint64_t log_interval);
   ~GarbageAwareCacheShard() override;
 
   Status Insert(const Slice& key, uint32_t hash, void* value, size_t charge,
@@ -67,33 +64,16 @@ class GarbageAwareCacheShard : public CacheShard {
       const std::vector<uint64_t>& file_numbers,
       const std::vector<uint64_t>& output_file_numbers, const char* reason,
       uint64_t job_id, Logger* info_log = nullptr);
-  void LogBlockCacheObsoleteSample(const char* reason, uint64_t job_id,
-                                   Logger* info_log = nullptr);
   ObsoleteSample GetObsoleteSample() const;
 
   void* Value(Cache::Handle* handle);
   size_t GetCharge(Cache::Handle* handle) const;
   uint32_t GetHash(Cache::Handle* handle) const;
 
-  size_t TEST_GetAdmissionSize() const;
-  size_t TEST_GetProbationSize() const;
+  size_t TEST_GetLRUSize() const;
 
  private:
   struct GAHandle;
-  struct ScoreKey {
-    double score;
-    uint64_t seq;
-    GAHandle* handle;
-  };
-  struct ScoreCmp {
-    bool operator()(const ScoreKey& a, const ScoreKey& b) const {
-      if (a.score != b.score) {
-        return a.score < b.score;
-      }
-      return a.seq < b.seq;
-    }
-  };
-
   struct GAHandle : public Cache::Handle {
     std::string key;
     void* value = nullptr;
@@ -103,20 +83,13 @@ class GarbageAwareCacheShard : public CacheShard {
     GAHandle* next_hash = nullptr;
     uint32_t refs = 0;
     bool in_cache = false;
-    bool in_admission = true;
     bool in_queue = false;
     bool garbage_aware = false;
     uint64_t file_number = 0;
     bool is_data_block = false;
-    bool is_blob_file = false;
     Cache::Priority priority = Cache::Priority::LOW;
-    uint64_t access_freq = 1;
-    uint64_t last_epoch = 0;
     double garbage_ratio = 0.0;
-    double score = 1.0;
     std::list<GAHandle*>::iterator lru_it;
-    std::set<ScoreKey, ScoreCmp>::iterator score_it;
-    uint64_t score_seq = 0;
 
     Slice key_slice() const { return Slice(key); }
   };
@@ -139,16 +112,12 @@ class GarbageAwareCacheShard : public CacheShard {
   void RemoveFromQueue(GAHandle* h);
   void AddToQueue(GAHandle* h, bool promote = true);
   void RemoveFromCache(GAHandle* h);
+  void RemoveReplacedFromCache(GAHandle* h);
   void AddToFileIndex(GAHandle* h);
   void RemoveFromFileIndex(GAHandle* h);
-  bool IsDemotable(GAHandle* h);
-  void MoveToProbation(GAHandle* h);
-  void AdvanceAgingEpoch();
-  void ApplyAccessFreqAging(GAHandle* h);
-  void UpdateScore(GAHandle* h);
-  void RefreshProbationScoresForAging();
-  GAHandle* FindAdmissionVictim(bool require_garbage_aware,
-                                bool require_low_priority);
+  void MoveToLRUTail(GAHandle* h);
+  bool IsObsoleteFile(uint64_t file_number) const;
+  GAHandle* FindLRUVictim();
   void EvictIfNeeded(std::vector<GAHandle*>* deleted);
   void MaybeLogLocked(const BlockCacheMetadata* metadata);
 
@@ -156,27 +125,15 @@ class GarbageAwareCacheShard : public CacheShard {
   std::vector<GAHandle*> table_;
   uint32_t table_elems_ = 0;
   std::unordered_map<uint64_t, std::unordered_set<GAHandle*>> file_index_;
-  std::list<GAHandle*> admission_lru_;
-  std::set<ScoreKey, ScoreCmp> probation_scores_;
+  std::unordered_set<uint64_t> obsolete_files_;
+  std::list<GAHandle*> lru_;
   size_t capacity_;
   size_t usage_ = 0;
-  size_t admission_usage_ = 0;
-  size_t probation_usage_ = 0;
   bool strict_capacity_limit_;
-  double admission_ratio_;
-  double demote_score_threshold_;
   uint64_t log_interval_;
-  uint64_t next_score_seq_ = 1;
   uint64_t demotions_ = 0;
   uint64_t low_score_evictions_ = 0;
-  uint64_t admission_hits_ = 0;
-  uint64_t probation_hits_ = 0;
   uint64_t obsolete_marked_blocks_ = 0;
-  uint64_t obsolete_marked_bytes_ = 0;
-  bool enable_aging_ = false;
-  uint64_t aging_interval_ = 0;
-  uint64_t operation_count_ = 0;
-  uint64_t current_epoch_ = 0;
   Statistics* statistics_ = nullptr;
 };
 
@@ -211,8 +168,7 @@ class GarbageAwareCache : public ShardedCache {
   void LogBlockCacheObsoleteSample(const char* reason, uint64_t job_id,
                                    Logger* info_log = nullptr) override;
 
-  size_t TEST_GetAdmissionSize() const;
-  size_t TEST_GetProbationSize() const;
+  size_t TEST_GetLRUSize() const;
 
  private:
   uint32_t ShardForHash(uint32_t hash) const;

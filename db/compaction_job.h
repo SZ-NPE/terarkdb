@@ -122,7 +122,6 @@ class CompactionJob {
   struct DependenceAccumulator {
     uint64_t entry_count = 0;
     uint64_t byte_count = 0;
-    uint64_t byte_count_entry_count = 0;
   };
 
   void AggregateStatistics();
@@ -149,7 +148,8 @@ class CompactionJob {
   Status InstallCompactionResults(const MutableCFOptions& mutable_cf_options);
   void RecordCompactionIOStats();
   Status OpenCompactionOutputFile(SubcompactionState* sub_compact);
-  Status OpenCompactionOutputBlob(SubcompactionState* sub_compact);
+  Status OpenCompactionOutputBlob(SubcompactionState* sub_compact,
+                                  SstType sst_type, int route = -1);
   void CleanupCompaction();
   void UpdateCompactionJobStats(
       const InternalStats::CompactionStats& stats) const;

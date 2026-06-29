@@ -67,7 +67,7 @@ static bool InheritanceMismatch(const FileMetaData& sst_meta,
   auto sst_begin = sst_meta.prop.dependence.begin(),
        sst_end = sst_meta.prop.dependence.end();
   if (std::binary_search(sst_begin, sst_end,
-                         Dependence{blob_meta.fd.GetNumber(), 0, 0, 0},
+                         Dependence{blob_meta.fd.GetNumber(), 0, 0},
                          TERARK_CMP(file_number, <))) {
     return false;
   }

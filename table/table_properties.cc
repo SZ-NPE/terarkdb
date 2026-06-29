@@ -85,8 +85,17 @@ std::string TablePropertiesBase::ToString(const std::string& prop_delim,
   AppendProperty(result, "raw average value size",
                  num_entries != 0 ? 1.0 * raw_value_size / num_entries : 0.0,
                  prop_delim, kv_delim);
+  AppendProperty(result, "separated total size", separated_total_size,
+                 prop_delim, kv_delim);
+  AppendProperty(result, "separated entry count", separated_entry_count,
+                 prop_delim, kv_delim);
+  AppendProperty(result, "value meta total size", value_meta_total_size,
+                 prop_delim, kv_delim);
   AppendProperty(result, "delta block size", delta_block_size, prop_delim,
                  kv_delim);
+  AppendProperty(result, "remote value size", remote_value_size, prop_delim,
+                 kv_delim);
+  AppendProperty(result, "sst type", sst_type, prop_delim, kv_delim);
 
   AppendProperty(result, "data block size", data_size, prop_delim, kv_delim);
   char index_block_size_str[80];
@@ -171,7 +180,11 @@ void TableProperties::Add(const TableProperties& tp) {
   filter_size += tp.filter_size;
   raw_key_size += tp.raw_key_size;
   raw_value_size += tp.raw_value_size;
+  separated_total_size += tp.separated_total_size;
+  separated_entry_count += tp.separated_entry_count;
+  value_meta_total_size += tp.value_meta_total_size;
   delta_block_size += tp.delta_block_size;
+  remote_value_size += tp.remote_value_size;
   num_data_blocks += tp.num_data_blocks;
   num_entries += tp.num_entries;
   num_deletions += tp.num_deletions;
@@ -193,8 +206,16 @@ const std::string TablePropertiesNames::kFilterSize = "rocksdb.filter.size";
 const std::string TablePropertiesNames::kRawKeySize = "rocksdb.raw.key.size";
 const std::string TablePropertiesNames::kRawValueSize =
     "rocksdb.raw.value.size";
+const std::string TablePropertiesNames::kSeparatedTotalSize =
+    "rocksdb.separated.total.size";
+const std::string TablePropertiesNames::kSeparatedEntryCount =
+    "rocksdb.separated.entry.count";
+const std::string TablePropertiesNames::kValueMetaTotalSize =
+    "rocksdb.value.meta.size";
 const std::string TablePropertiesNames::kDeltaBlockSize =
     "rocksdb.delta.block.size";
+const std::string TablePropertiesNames::kRemoteValueSize =
+    "rocksdb.remote.value.size";
 const std::string TablePropertiesNames::kNumDataBlocks =
     "rocksdb.num.data.blocks";
 const std::string TablePropertiesNames::kNumEntries = "rocksdb.num.entries";
@@ -229,13 +250,12 @@ const std::string TablePropertiesNames::kSnapshots =
     "rocksdb.property.snapshots";
 const std::string TablePropertiesNames::kPurpose = "rocksdb.sst.purpose";
 const std::string TablePropertiesNames::kReadAmp = "rocksdb.sst.read-amp";
+const std::string TablePropertiesNames::kFileSstType = "rocksdb.file.sst.type";
 const std::string TablePropertiesNames::kDependence = "rocksdb.sst.dependence";
 const std::string TablePropertiesNames::kDependenceEntryCount =
     "rocksdb.sst.dependence.entry-count";
-const std::string TablePropertiesNames::kDependenceByteCount =
-    "rocksdb.sst.dependence.byte-count";
-const std::string TablePropertiesNames::kDependenceByteCountEntryCount =
-    "rocksdb.sst.dependence.byte-count-entry-count";
+const std::string TablePropertiesNames::kDependenceSeparatedSize =
+    "rocksdb.sst.dependence.separated-size";
 const std::string TablePropertiesNames::kInheritanceChain =
     "rocksdb.sst.inheritance-chain";
 const std::string TablePropertiesNames::kInheritanceTree =
