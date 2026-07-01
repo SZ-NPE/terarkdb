@@ -421,11 +421,7 @@ class ColumnFamilyData {
   }
 
   std::shared_ptr<HotnessTracker> hotness_tracker() const {
-    return hotness_tracker_;
-  }
-
-  HotnessTracker* hotness_tracker_ptr() const {
-    return hotness_tracker_.get();
+    return std::atomic_load(&hotness_tracker_);
   }
 
   Env::WriteLifeTimeHint CalculateSSTWriteHint(int level);

@@ -14,7 +14,7 @@ If it conflicts with current scripts or logs, trust the scripts/logs and update 
 - M5 uses key-correlated mixed value size plus `byte_precise_gc=true` and `use_separated_value_meta_block=true`.
 - Final/interface ablations live in `test-sh/new-ycsb/interface.sh`; motivation figures explain why the optimizations are needed.
 
-Relevant code: `test-sh/new-ycsb/motivation.sh:111`, `test-sh/new-ycsb/motivation.sh:97`, `test-sh/new-ycsb/motivation.sh:314`.
+Relevant code: `test-sh/new-ycsb/motivation.sh:114`, `test-sh/new-ycsb/motivation.sh:100`, `test-sh/new-ycsb/motivation.sh:318`.
 
 ---
 
@@ -65,6 +65,8 @@ Use these only as structural guides:
 
 - `third-party/terarkdb/paper/motivation-expected-figures-m1-m2-m4-m5-m6.svg`
 - `third-party/terarkdb/paper/m3-expected-gc-foreground-timeline.svg`
+
+The first SVG keeps its historical filename and a legacy M6 panel; the current runnable motivation suite is M1-M5 only, so M6 is not an active case or figure target.
 
 If an SVG disagrees with current code/log semantics, update the SVG or this note; do not let the sketch override reality.
 

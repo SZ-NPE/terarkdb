@@ -168,17 +168,15 @@ struct MutableCFOptions {
         middle_blob_size(size_t(-1)),
         middle_combine_level(size_t(-1)),
         enable_hotness_tracker(false),
-        hotness_window_capacity(0),
         hotness_hot_capacity(0),
-        hotness_enable_write_window(false),
         hotness_enable_compaction_feedback(false),
         hotness_enable_drop_key_cache(false),
-        hotness_admit_threshold(2),
         hotness_decay_interval(0),
         hotness_decay_window(0),
         blob_large_key_ratio(0),
         read_separated_value_by_handle(true),
         blob_gc_ratio(0),
+        hot_warm_blob_gc_max_files(0),
         byte_precise_gc(false),
         precise_gc(false),
         target_blob_file_size(0),
@@ -249,17 +247,15 @@ struct MutableCFOptions {
   size_t middle_blob_size;
   size_t middle_combine_level;
   bool enable_hotness_tracker;
-  size_t hotness_window_capacity;
   size_t hotness_hot_capacity;
-  bool hotness_enable_write_window;
   bool hotness_enable_compaction_feedback;
   bool hotness_enable_drop_key_cache;
-  uint32_t hotness_admit_threshold;
   uint64_t hotness_decay_interval;
   uint64_t hotness_decay_window;
   double blob_large_key_ratio;
   bool read_separated_value_by_handle;
   double blob_gc_ratio;
+  uint64_t hot_warm_blob_gc_max_files;
   bool byte_precise_gc;
   // Compatibility alias copied from legacy ColumnFamilyOptions::precise_gc.
   // Engine code should use byte_precise_gc.

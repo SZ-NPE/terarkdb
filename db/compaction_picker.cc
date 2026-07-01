@@ -95,9 +95,37 @@ struct GarbageFileInfo {
   GarbageFileInfo(FileMetaData* _f, bool byte_precise_gc = false)
       : f(_f), score(ComputeScore(_f, byte_precise_gc)), estimate_size(0) {
     if (f == nullptr) return;
-    estimate_size = static_cast<uint64_t>(f->fd.file_size * (1 - score));
+    if (byte_precise_gc) {
+      const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
+      estimate_size = accounting_bytes - std::min(accounting_bytes,
+                                                  f->num_antiquation_bytes);
+    } else {
+      estimate_size = static_cast<uint64_t>(f->fd.file_size * (1 - score));
+    }
   }
 };
+
+bool IsFullEntryGarbage(const FileMetaData* f) {
+  return f != nullptr && f->prop.num_entries > 0 &&
+         f->num_antiquation >= f->prop.num_entries;
+}
+
+bool IsFullByteGarbage(const FileMetaData* f) {
+  if (f == nullptr) {
+    return false;
+  }
+  const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
+  return accounting_bytes > 0 && f->num_antiquation_bytes >= accounting_bytes;
+}
+
+bool IsFullGarbageBlob(const FileMetaData* f) {
+  return IsFullEntryGarbage(f) || IsFullByteGarbage(f);
+}
+
+bool HotWarmPolicyEnabled(const MutableCFOptions& options) {
+  return options.hot_warm_blob_gc_max_files > 0;
+}
+
 struct FileUseInfo {
   uint64_t size;
   uint64_t used;
@@ -896,6 +924,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   uint64_t idx = 0;
   uint64_t scanned_blobs = 0;
   uint64_t permitted_blobs = 0;
+  uint64_t hot_warm_policy_skipped = 0;
   uint64_t garbage_ratio_buckets[6] = {0, 0, 0, 0, 0, 0};
   auto bucket_idx = [](double score) {
     return score < 0.1 ? 0 : score < 0.3 ? 1 : score < 0.5 ? 2
@@ -904,17 +933,49 @@ Compaction* CompactionPicker::PickGarbageCollection(
   // Find largest score blob
   GarbageFileInfo dirtiest_blob{nullptr,
                                 mutable_cf_options.byte_precise_gc};
+  const bool hot_warm_policy_enabled = HotWarmPolicyEnabled(mutable_cf_options);
+  const bool hot_warm_fallback_to_normal_gc =
+      vstorage->hot_warm_blob_gc_fallback();
+  auto passes_gc_threshold = [&](const FileMetaData* f,
+                                 const GarbageFileInfo& info) {
+    if (f == nullptr) {
+      return false;
+    }
+    const bool is_hot_warm_blob =
+        IsHotWarmBlobSstType(static_cast<SstType>(f->prop.sst_type));
+    if (is_hot_warm_blob && hot_warm_policy_enabled &&
+        !hot_warm_fallback_to_normal_gc) {
+      return IsFullGarbageBlob(f);
+    }
+    if (f->marked_for_compaction) {
+      return true;
+    }
+    return info.score >= blob_gc_ratio;
+  };
+  auto allow_fragment_pick = [&](const FileMetaData* f) {
+    const bool is_hot_warm_blob =
+        IsHotWarmBlobSstType(static_cast<SstType>(f->prop.sst_type));
+    return !is_hot_warm_blob || !hot_warm_policy_enabled ||
+           hot_warm_fallback_to_normal_gc;
+  };
   for (; idx < hidden_files.size() && !hidden_files[idx]->is_gc_forbidden();
        ++idx) {
     ++scanned_blobs;
     FileMetaData* f = hidden_files[idx];
-    if (!f->is_gc_permitted() || f->being_compacted ||
-        f->prop.sst_type == SstType::kHotMidBlob ||
-        f->prop.sst_type == SstType::kColdMidBlob) {
+    if (!f->is_gc_permitted() || f->being_compacted) {
       continue;
     }
     ++permitted_blobs;
     GarbageFileInfo info{f, mutable_cf_options.byte_precise_gc};
+    if (!passes_gc_threshold(f, info)) {
+      const bool is_hot_warm_blob =
+          IsHotWarmBlobSstType(static_cast<SstType>(f->prop.sst_type));
+      if (is_hot_warm_blob && hot_warm_policy_enabled &&
+          !hot_warm_fallback_to_normal_gc) {
+        ++hot_warm_policy_skipped;
+      }
+      continue;
+    }
     if (ioptions_.blob_gc_diagnostics && ioptions_.info_log != nullptr) {
       const uint64_t entries = f->prop.num_entries;
       const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
@@ -947,8 +1008,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   }
 
   if (dirtiest_blob.f == nullptr ||
-      (!dirtiest_blob.f->marked_for_compaction &&
-       dirtiest_blob.score < blob_gc_ratio)) {
+      !passes_gc_threshold(dirtiest_blob.f, dirtiest_blob)) {
     return nullptr;
   }
   // Set up inputs for garbage collection.
@@ -1007,9 +1067,9 @@ Compaction* CompactionPicker::PickGarbageCollection(
     if (f->is_gc_permitted() && !f->being_compacted &&
         f->prop.sst_type == target_sst_type) {
       GarbageFileInfo gc_blob(f, mutable_cf_options.byte_precise_gc);
-      if (gc_blob.estimate_size <= fragment_size ||
-          gc_blob.score >= blob_gc_ratio ||
-          gc_blob.f->marked_for_compaction) {
+      if (passes_gc_threshold(f, gc_blob) ||
+          (allow_fragment_pick(f) &&
+           gc_blob.estimate_size <= fragment_size)) {
         candidate_blob_vec.emplace_back(gc_blob);
       }
     }
@@ -1080,21 +1140,25 @@ Compaction* CompactionPicker::PickGarbageCollection(
                size_antiquated);
     RecordTick(ioptions_.statistics, GC_PICK_SELECTED_LIVE_BYTES,
                selected_live_bytes);
-  ROCKS_LOG_INFO(
-      ioptions_.info_log,
-      "[%s] GC_PICK scanned=%" PRIu64 " permitted=%" PRIu64
-      " selected=%zu estimated_output_bytes=%" PRIu64
-      " selected_bytes=%" PRIu64
-      " selected_garbage_bytes=%" PRIu64 "/%" PRIu64 " ratio=%.4f"
-      " buckets=[<10%%=%" PRIu64 " <30%%=%" PRIu64
-      " <50%%=%" PRIu64 " <70%%=%" PRIu64
-      " <90%%=%" PRIu64 " >=90%%=%" PRIu64 "]",
-      cf_name.c_str(), scanned_blobs, permitted_blobs, selected_file_count,
-      total_estimate_size, selected_bytes, size_antiquated,
-      std::max<uint64_t>(1, selected_bytes), dirtiest_blob.score,
-      garbage_ratio_buckets[0], garbage_ratio_buckets[1],
-      garbage_ratio_buckets[2], garbage_ratio_buckets[3],
-      garbage_ratio_buckets[4], garbage_ratio_buckets[5]);
+      ROCKS_LOG_INFO(
+          ioptions_.info_log,
+          "[%s] GC_PICK scanned=%" PRIu64 " permitted=%" PRIu64
+          " selected=%zu estimated_output_bytes=%" PRIu64
+          " selected_bytes=%" PRIu64
+          " selected_garbage_bytes=%" PRIu64 "/%" PRIu64 " ratio=%.4f"
+          " hot_warm_files=%" PRIu64 " hot_warm_fallback=%d"
+          " hot_warm_policy_skipped=%" PRIu64
+          " buckets=[<10%%=%" PRIu64 " <30%%=%" PRIu64
+          " <50%%=%" PRIu64 " <70%%=%" PRIu64
+          " <90%%=%" PRIu64 " >=90%%=%" PRIu64 "]",
+          cf_name.c_str(), scanned_blobs, permitted_blobs, selected_file_count,
+          total_estimate_size, selected_bytes, size_antiquated,
+          std::max<uint64_t>(1, selected_bytes), dirtiest_blob.score,
+          vstorage->hot_warm_blob_file_count(),
+          hot_warm_fallback_to_normal_gc ? 1 : 0, hot_warm_policy_skipped,
+          garbage_ratio_buckets[0], garbage_ratio_buckets[1],
+          garbage_ratio_buckets[2], garbage_ratio_buckets[3],
+          garbage_ratio_buckets[4], garbage_ratio_buckets[5]);
   }
   vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options);
 
@@ -1120,9 +1184,13 @@ Compaction* CompactionPicker::PickBlobDefragmentation(
        idx < hidden_files.size() && !hidden_files[idx]->is_gc_forbidden();
        ++idx) {
     FileMetaData* f = hidden_files[idx];
-    if (!f->is_gc_permitted() || f->being_compacted ||
-        f->prop.sst_type == SstType::kHotMidBlob ||
-        f->prop.sst_type == SstType::kColdMidBlob) {
+    if (!f->is_gc_permitted() || f->being_compacted) {
+      continue;
+    }
+    const bool is_hot_warm_blob =
+        IsHotWarmBlobSstType(static_cast<SstType>(f->prop.sst_type));
+    if (is_hot_warm_blob && HotWarmPolicyEnabled(mutable_cf_options) &&
+        !vstorage->hot_warm_blob_gc_fallback()) {
       continue;
     }
     if (f->fd.GetFileSize() < fragment_size) {

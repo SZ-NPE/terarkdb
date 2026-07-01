@@ -307,7 +307,7 @@ class VersionBuilder::Rep {
       return 0;
     }
     if (!(bytes_depended > 0)) {
-      return 0;
+      return 1;
     }
     const double max_safe = static_cast<double>(upper_bound);
     if (bytes_depended >= max_safe) {

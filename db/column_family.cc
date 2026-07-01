@@ -424,18 +424,38 @@ void SuperVersionUnrefHandle(void* ptr) {
 }
 
 HotnessTracker::Options MakeHotnessTrackerOptions(
-    const ColumnFamilyOptions& cf_options) {
+    const MutableCFOptions& cf_options) {
   HotnessTracker::Options options;
-  options.window_capacity = cf_options.hotness_window_capacity;
   options.hot_capacity = cf_options.hotness_hot_capacity;
-  options.enable_write_window = cf_options.hotness_enable_write_window;
   options.enable_compaction_feedback =
       cf_options.hotness_enable_compaction_feedback;
   options.enable_drop_key_cache = cf_options.hotness_enable_drop_key_cache;
-  options.admit_threshold = cf_options.hotness_admit_threshold;
   options.decay_interval = cf_options.hotness_decay_interval;
   options.decay_window = cf_options.hotness_decay_window;
   return options;
+}
+
+std::shared_ptr<HotnessTracker> MakeHotnessTracker(
+    const MutableCFOptions& cf_options) {
+  if (!cf_options.enable_hotness_tracker) {
+    return nullptr;
+  }
+  return std::make_shared<HotnessTracker>(
+      MakeHotnessTrackerOptions(cf_options));
+}
+
+bool HotnessTrackerConfigChanged(const MutableCFOptions& old_options,
+                                 const MutableCFOptions& new_options) {
+  return old_options.enable_hotness_tracker !=
+             new_options.enable_hotness_tracker ||
+         old_options.hotness_hot_capacity != new_options.hotness_hot_capacity ||
+         old_options.hotness_enable_compaction_feedback !=
+             new_options.hotness_enable_compaction_feedback ||
+         old_options.hotness_enable_drop_key_cache !=
+             new_options.hotness_enable_drop_key_cache ||
+         old_options.hotness_decay_interval !=
+             new_options.hotness_decay_interval ||
+         old_options.hotness_decay_window != new_options.hotness_decay_window;
 }
 }  // anonymous namespace
 
@@ -476,10 +496,7 @@ ColumnFamilyData::ColumnFamilyData(
       prev_compaction_needed_bytes_(0),
       allow_2pc_(db_options.allow_2pc),
       last_memtable_id_(0),
-      hotness_tracker_(cf_options.enable_hotness_tracker
-                           ? std::make_shared<HotnessTracker>(
-                                 MakeHotnessTrackerOptions(cf_options))
-                           : nullptr) {
+      hotness_tracker_(MakeHotnessTracker(mutable_cf_options_)) {
   Ref();
 
   // if _dummy_versions is nullptr, then this is a dummy column family.
@@ -1315,6 +1332,11 @@ Status ColumnFamilyData::SetOptions(
     optimize_filters_for_hits_.store(
         new_mutable_cf_options.optimize_filters_for_hits,
         std::memory_order_relaxed);
+    if (HotnessTrackerConfigChanged(mutable_cf_options_,
+                                    new_mutable_cf_options)) {
+      std::atomic_store(&hotness_tracker_,
+                        MakeHotnessTracker(new_mutable_cf_options));
+    }
     mutable_cf_options_ = new_mutable_cf_options;
     mutable_cf_options_.RefreshDerivedOptions(ioptions_);
   }

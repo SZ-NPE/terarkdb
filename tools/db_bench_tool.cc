@@ -1010,22 +1010,15 @@ DEFINE_uint64(middle_combine_level,
               "when compaction input level reaches this level.");
 DEFINE_bool(enable_hotness_tracker, false,
             "Enable hotness-based hot/cold blob routing");
-DEFINE_uint64(hotness_window_capacity, 1000000,
-              "FIFO observation window capacity for HotnessTracker");
 DEFINE_uint64(hotness_hot_capacity, 1000000,
               "Promoted hot-set capacity for HotnessTracker");
-DEFINE_bool(hotness_enable_write_window, true,
-            "Enable write-window repeated-write feedback for HotnessTracker");
 DEFINE_bool(hotness_enable_compaction_feedback, true,
             "Enable compaction obsolete-version feedback for HotnessTracker");
 DEFINE_bool(hotness_enable_drop_key_cache, true,
             "Enable compaction drop-key cache for blob GC GetKey avoidance");
-DEFINE_uint32(hotness_admit_threshold, 2,
-              "Number of writes within HotnessTracker's recent window before "
-              "admitting a key to the hot flush route");
 DEFINE_uint64(hotness_decay_interval, 0,
-              "Advance one HotnessTracker decay epoch every N RecordWrite "
-              "calls. 0 disables decay");
+              "Advance one HotnessTracker decay epoch every N hotness activity "
+              "observations. 0 disables decay");
 DEFINE_uint64(hotness_decay_window, 0,
               "Mark admitted hot keys cold after this many idle decay epochs. "
               "0 disables decay");
@@ -1057,6 +1050,10 @@ DEFINE_bool(read_separated_value_by_handle,
             "Encode and use data-block handles in separated value indexes");
 
 DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
+
+DEFINE_uint64(hot_warm_blob_gc_max_files, 0,
+              "Max hot/warm vSST file count before falling back to normal "
+              "blob_gc_ratio. 0 disables the hot/warm 100%-garbage policy.");
 
 DEFINE_string(
     byte_precise_gc, "false",
@@ -3727,14 +3724,10 @@ class Benchmark {
     options.middle_blob_size = FLAGS_middle_blob_size;
     options.middle_combine_level = FLAGS_middle_combine_level;
     options.enable_hotness_tracker = FLAGS_enable_hotness_tracker;
-    options.hotness_window_capacity = FLAGS_hotness_window_capacity;
     options.hotness_hot_capacity = FLAGS_hotness_hot_capacity;
-    options.hotness_enable_write_window =
-        FLAGS_hotness_enable_write_window;
     options.hotness_enable_compaction_feedback =
         FLAGS_hotness_enable_compaction_feedback;
     options.hotness_enable_drop_key_cache = FLAGS_hotness_enable_drop_key_cache;
-    options.hotness_admit_threshold = FLAGS_hotness_admit_threshold;
     options.hotness_decay_interval = FLAGS_hotness_decay_interval;
     options.hotness_decay_window = FLAGS_hotness_decay_window;
     options.blob_gc_collect_block_stats =
@@ -3754,6 +3747,7 @@ class Benchmark {
     options.read_separated_value_by_handle =
         FLAGS_read_separated_value_by_handle;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
+    options.hot_warm_blob_gc_max_files = FLAGS_hot_warm_blob_gc_max_files;
     bool byte_precise_gc_flag = false;
     if (!ParseOptionHelper(reinterpret_cast<char*>(&byte_precise_gc_flag),
                            OptionType::kBoolean, FLAGS_byte_precise_gc)) {

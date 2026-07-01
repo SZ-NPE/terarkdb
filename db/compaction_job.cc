@@ -214,7 +214,7 @@ struct CompactionJob::SubcompactionState {
   uint64_t num_input_records;
   uint64_t num_output_records;
   CompactionJobStats compaction_job_stats;
-  std::vector<std::pair<std::string, SequenceNumber>> dropped_keys;
+  HotnessTracker::DroppedSeqsByKey dropped_keys;
   size_t dropped_keys_bytes = 0;
   uint64_t approx_size;
   // An index that used to speed up ShouldStopBefore().
@@ -562,7 +562,6 @@ struct CompactionJob::SubcompactionState {
     struct BlobDependenceAccumulator {
       FileMetaData* meta = nullptr;
       uint64_t entry_count = 0;
-      uint64_t byte_count = 0;
     };
     auto saturating_add = [](uint64_t a, uint64_t b) {
       if (a > std::numeric_limits<uint64_t>::max() - b) {
@@ -616,7 +615,6 @@ struct CompactionJob::SubcompactionState {
                                    BlobDependenceAccumulator{find->second});
         auto& acc = ib.first->second;
         acc.entry_count = saturating_add(acc.entry_count, pair.entry_count);
-        acc.byte_count = saturating_add(acc.byte_count, pair.byte_count);
       }
     }
     output->blobs.reserve(blob_map.size());
@@ -624,10 +622,8 @@ struct CompactionJob::SubcompactionState {
       const auto& acc = pair.second;
       auto meta = acc.meta;
       const uint64_t total_bytes = meta->fd.GetFileSize();
-      const uint64_t accounting_bytes = meta->BlobGcAccountingBytes();
-      uint64_t ref_accounting_bytes = std::min(acc.byte_count, accounting_bytes);
-      uint64_t ref_bytes = mul_div_clamped(total_bytes, ref_accounting_bytes,
-                                           accounting_bytes, total_bytes);
+      uint64_t ref_bytes = mul_div_clamped(
+          total_bytes, acc.entry_count, meta->prop.num_entries, total_bytes);
       output->blobs.emplace_back(BlobRefInfo{pair.first, meta, ref_bytes});
     }
     std::sort(output->blobs.begin(), output->blobs.end(),
@@ -1543,14 +1539,25 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
     status = InstallCompactionResults(mutable_cf_options);
   }
   if (status.ok()) {
-    auto* hotness_tracker = cfd->hotness_tracker().get();
+    auto hotness_tracker_holder = cfd->hotness_tracker();
+    HotnessTracker* hotness_tracker = hotness_tracker_holder.get();
     if (hotness_tracker != nullptr) {
+      std::vector<HotnessTracker::CompactionFeedback> feedback_batch;
       for (const auto& sub_compact : compact_->sub_compact_states) {
+        feedback_batch.reserve(feedback_batch.size() +
+                               sub_compact.dropped_keys.size());
         for (const auto& dropped_key : sub_compact.dropped_keys) {
-          hotness_tracker->RecordCompactionFeedback(Slice(dropped_key.first),
-                                                    dropped_key.second);
+          HotnessTracker::CompactionFeedback feedback;
+          feedback.user_key = dropped_key.first;
+          feedback.dropped_seqs = dropped_key.second;
+          feedback.drop_count =
+              static_cast<uint32_t>(std::min<size_t>(
+                  dropped_key.second.size(),
+                  static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+          feedback_batch.emplace_back(std::move(feedback));
         }
       }
+      hotness_tracker->ApplyCompactionFeedbackBatch(feedback_batch);
     }
   }
   if (status.ok() &&
@@ -1779,6 +1786,10 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
                                          LazyBuffer& value,
                                          ValueMetaData* meta) = nullptr;
     void* trans_to_separate_callback_args = nullptr;
+    bool update_value_size = false;
+
+    bool ShouldUpdateValueSize() const override { return update_value_size; }
+
     Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                            const Slice& meta, bool is_merge,
                            bool is_index) override {
@@ -1817,6 +1828,12 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       return separate_helper->TransToCombined(user_key, sequence, value);
     }
   } separate_helper;
+  // The reference implementation only refreshes separated value sizes during
+  // compaction in the explicit kExactGCUpdateValueSize mode.  Plain
+  // byte_precise_gc is supposed to consume the separated-value metadata block
+  // and must not fetch large separated values just to repair missing sizes; that
+  // heavy path severely hurts the precise_opt write workload.
+  separate_helper.update_value_size = false;
   if (compact_->compaction->immutable_cf_options()
           ->value_meta_extractor_factory != nullptr) {
     ValueExtractorContext context = {cfd->GetID()};
@@ -1906,6 +1923,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     rebuild_blobs_info.pop_count = 0;
     status = Status::OK();
   }
+  auto hotness_tracker_holder = cfd->hotness_tracker();
+  HotnessTracker* hotness_tracker = hotness_tracker_holder.get();
 
   sub_compact->c_iter.reset(new CompactionIterator(
       input.get(), &separate_helper, end, cfd->user_comparator(), &merge,
@@ -1914,8 +1933,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       ShouldReportDetailedTime(env_, stats_), false, &range_del_agg,
       sub_compact->compaction, mutable_cf_options->get_blob_config(),
       compaction_filter, shutting_down_, preserve_deletes_seqnum_,
-      &rebuild_blobs_info.blobs, cfd->hotness_tracker().get(),
-      &sub_compact->dropped_keys, &sub_compact->dropped_keys_bytes));
+      &rebuild_blobs_info.blobs, hotness_tracker, &sub_compact->dropped_keys,
+      &sub_compact->dropped_keys_bytes));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
 
@@ -1969,8 +1988,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         snapshot_checker_, env_, false, false, range_del_agg_ptr,
         sub_compact->compaction, mutable_cf_options->get_blob_config(),
         second_pass_iter_storage.compaction_filter, shutting_down_,
-        preserve_deletes_seqnum_, &rebuild_blobs_info.blobs,
-        cfd->hotness_tracker().get());
+        preserve_deletes_seqnum_, &rebuild_blobs_info.blobs, hotness_tracker);
   };
   std::unique_ptr<InternalIterator> second_pass_iter(
       NewCompactionIterator(c_style_callback(make_compaction_iterator),

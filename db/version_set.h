@@ -269,6 +269,14 @@ class VersionStorageInfo {
 
   double total_garbage_ratio() const { return total_garbage_ratio_; }
 
+  bool hot_warm_blob_gc_fallback() const {
+    return hot_warm_blob_gc_fallback_;
+  }
+
+  uint64_t hot_warm_blob_file_count() const {
+    return hot_warm_blob_file_count_;
+  }
+
   bool blob_marked_for_compaction() const {
     return blob_marked_for_compaction_;
   }
@@ -627,6 +635,7 @@ class VersionStorageInfo {
   uint64_t blob_num_deletions_;
   uint64_t blob_num_antiquation_;
   uint64_t blob_num_antiquation_bytes_;
+  uint64_t hot_warm_blob_file_count_;
   uint64_t lsm_file_size_;
   uint64_t lsm_num_entries_;
   uint64_t lsm_num_deletions_;
@@ -648,6 +657,7 @@ class VersionStorageInfo {
 
   bool blob_marked_for_compaction_;
   bool blob_needs_defragmentation_;
+  bool hot_warm_blob_gc_fallback_;
 
   std::unique_ptr<VersionBuilder::Context> version_builder_context_;
 

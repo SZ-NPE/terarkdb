@@ -325,14 +325,8 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Enable Hotness Tracker for Hot-Cold Separation
   bool enable_hotness_tracker = false;
 
-  // Capacity of the FIFO observation window used by HotnessTracker.
-  size_t hotness_window_capacity = 1000000;
-
   // Capacity of the promoted hot set used by HotnessTracker.
   size_t hotness_hot_capacity = 1000000;
-
-  // Enable write-window repeated-write feedback for HotnessTracker.
-  bool hotness_enable_write_window = true;
 
   // Enable compaction obsolete-version feedback for HotnessTracker.
   bool hotness_enable_compaction_feedback = true;
@@ -342,14 +336,11 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // can evaluate drop-key cache without promoting keys to the hot flush route.
   bool hotness_enable_drop_key_cache = true;
 
-  // Number of writes in the recent write window required before a key is
-  // admitted to the hot flush route. Default 2 preserves legacy behavior.
-  uint32_t hotness_admit_threshold = 2;
-
-  // Simple hotness decay controls. Every hotness_decay_interval RecordWrite
-  // calls advances a global epoch. If hotness_decay_window is non-zero, admitted
-  // hot keys idle for more than that many epochs become cold again. Set either
-  // value to 0 to disable decay (default, for compatibility).
+  // Simple hotness decay controls. Every hotness_decay_interval hotness
+  // activity observations advances a global epoch. If hotness_decay_window is
+  // non-zero, admitted hot keys idle for more than that many epochs become
+  // cold again. Set either value to 0 to disable decay (default, for
+  // compatibility).
   uint64_t hotness_decay_interval = 0;
   uint64_t hotness_decay_window = 0;
 
@@ -366,6 +357,11 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Startup GC when garbage ratio larger than blob_gc_ratio
   // valid [0 , 0.5]
   double blob_gc_ratio = 0.05;
+
+  // Max hot/warm vSST file count before falling back to normal blob_gc_ratio.
+  // When non-zero, hot/warm vSSTs are normally GC'ed only when entry or byte
+  // garbage ratio reaches 100%.
+  uint64_t hot_warm_blob_gc_max_files = 0;
 
   // Use byte-level garbage ratio for blob/vSST GC. This relies on separated
   // value size metadata, normally written by use_separated_value_meta_block.

@@ -81,9 +81,9 @@
   <rect x="50" y="384" width="280" height="92" rx="9" fill="#fbeeec" stroke="#d8a59e" stroke-width="1.4"/>
   <circle cx="74" cy="406" r="11" fill="#c98079"/><text x="74" y="410" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">1</text>
   <text x="92" y="403" font-size="11.5" font-weight="700" fill="#b96b62">Hotness-Driven Routing &amp; GC Pruning</text>
-  <text x="92" y="421" font-size="10" fill="#5b6470">write hotness → hot/cold vSST flush routing</text>
+  <text x="92" y="421" font-size="10" fill="#5b6470">compaction feedback → hot/cold vSST routing</text>
   <text x="92" y="438" font-size="10" fill="#5b6470">→ concentrated garbage; faster GC reverse lookup</text>
-  <text x="68" y="464" font-size="9.5" fill="#9aa3ad">scope: write hotness · vSST routing · GC lookup</text>
+  <text x="68" y="464" font-size="9.5" fill="#9aa3ad">scope: routing heat · vSST routing · GC lookup</text>
 
   <!-- badge 2 -->
   <rect x="342" y="384" width="280" height="92" rx="9" fill="#faf4ec" stroke="#dcb78f" stroke-width="1.4"/>
@@ -112,5 +112,5 @@
   <!-- 3 on block cache box (top-right corner) -->
   <circle cx="900" cy="122" r="9" fill="#86b29a"/><text x="900" y="126" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">3</text>
 
-  <text x="50" y="498" font-size="9.5" fill="#9aa3ad">Numbered badges show where each optimization attaches: ① write hotness, vSST routing, and GC lookup; ② vSST GC selection; ③ read-path cache.</text>
+  <text x="50" y="498" font-size="9.5" fill="#9aa3ad">Numbered badges show where each optimization attaches: ① feedback hotness, vSST routing, and GC lookup; ② vSST GC selection; ③ read-path cache.</text>
 </svg>

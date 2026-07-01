@@ -14,7 +14,8 @@ Language rule: keep all knowledge-base documents and figure sketches in English.
 - Motivation suite: `test-sh/new-ycsb/motivation.sh`, 5 cases mapped to M1-M5.
 - Interface suite: `test-sh/new-ycsb/interface.sh`, 14 cases across `baseline`, `hotness`, `gc-cache`, `precise`, `full`, `baseline-rw`, and `full-rw`.
 - All-on TerarkDB: `test-sh/new-ycsb/final_config.sh`.
-- Mixed-value distribution: `uniform_fixed`; current M5 motivation path also uses key-correlated value size.
+- Mixed-value distribution: `uniform_fixed` with 50% uniform 550B-800B values and 50% fixed 16KB values; current M5 motivation path also uses key-correlated value size.
+- Hot/cold routing learns from background compaction feedback batches only: routing heat is approximate hash-bucket state, drop-key lookup uses exact `(user_key, sequence)` state, foreground write-window learning/options are removed, and the hot/warm vSST 100%-garbage policy still uses `hot_warm_blob_gc_max_files` fallback.
 - Third paper optimization: byte-precise GC with `use_separated_value_meta_block` explicitly enabled; old middle-value delta-separate and read-by-handle are not part of the current paper path.
 - Runner outputs summaries only; figures require a separate `plot_tools/` step.
 
@@ -29,6 +30,7 @@ Language rule: keep all knowledge-base documents and figure sketches in English.
 | `motivation-test-figures.md` | M1-M5 case-to-figure semantics and diagnostic sources | Explaining/generating motivation figures |
 | `terarkdb-kv-separation-and-gc.md` | Mechanism baseline: KV separation, vSST/kSST, Blob GC, precise GC | Explaining or changing engine/paper mechanism wording |
 | `three-optimizations-summary.md` | Concise paper-facing narrative for the three optimizations | Writing contribution/design text |
+| `delta-block-exact-gc-port-diff.md` | Port-diff between reference `temp/terarkdb` and this tree for `delta_block`/`exact_gc`; name mapping + full usage-chain differences | Extending byte-precise GC / separated-value-meta-block in this tree |
 
 SVG files in this directory are figure sketches only. They do not override current scripts, logs, or measured results.
 

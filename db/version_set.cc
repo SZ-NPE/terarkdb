@@ -1236,6 +1236,8 @@ VersionStorageInfo::VersionStorageInfo(
       blob_num_entries_(0),
       blob_num_deletions_(0),
       blob_num_antiquation_(0),
+      blob_num_antiquation_bytes_(0),
+      hot_warm_blob_file_count_(0),
       lsm_file_size_(0),
       lsm_num_entries_(0),
       lsm_num_deletions_(0),
@@ -1246,7 +1248,8 @@ VersionStorageInfo::VersionStorageInfo(
       is_pick_garbage_collection_fail(false),
       force_consistency_checks_(_force_consistency_checks),
       blob_marked_for_compaction_(false),
-      blob_needs_defragmentation_(false) {
+      blob_needs_defragmentation_(false),
+      hot_warm_blob_gc_fallback_(false) {
   ++files_;  // level -1 used for dependence files
 }
 
@@ -1871,33 +1874,82 @@ void VersionStorageInfo::ComputeCompactionScore(
   if (fragment_size == 0) {
     fragment_size = target_blob_file_size / 8;
   }
+  auto add_saturated = [](uint64_t lhs, uint64_t rhs) {
+    return lhs > std::numeric_limits<uint64_t>::max() - rhs
+               ? std::numeric_limits<uint64_t>::max()
+               : lhs + rhs;
+  };
+  hot_warm_blob_file_count_ = 0;
   for (auto& f : LevelFiles(-1)) {
-    if (!f->is_gc_permitted()) {
+    if (f->is_gc_forbidden()) {
       continue;
     }
-    marked |= f->marked_for_compaction;
-    if (!f->being_compacted && f->fd.GetFileSize() < fragment_size) {
-      ++fragment_count;
+    if (IsHotWarmBlobSstType(static_cast<SstType>(f->prop.sst_type))) {
+      ++hot_warm_blob_file_count_;
     }
-    num_antiquation = num_antiquation > std::numeric_limits<uint64_t>::max() -
-                                           f->num_antiquation
-                          ? std::numeric_limits<uint64_t>::max()
-                          : num_antiquation + f->num_antiquation;
-    num_antiquation_bytes =
-        num_antiquation_bytes > std::numeric_limits<uint64_t>::max() -
-                                    f->num_antiquation_bytes
-            ? std::numeric_limits<uint64_t>::max()
-            : num_antiquation_bytes + f->num_antiquation_bytes;
-    num_entries = num_entries > std::numeric_limits<uint64_t>::max() -
-                                    f->prop.num_entries
-                      ? std::numeric_limits<uint64_t>::max()
-                      : num_entries + f->prop.num_entries;
+  }
+  const uint64_t hot_warm_max_files =
+      mutable_cf_options.hot_warm_blob_gc_max_files;
+  if (hot_warm_max_files == 0) {
+    hot_warm_blob_gc_fallback_ = false;
+  } else if (hot_warm_blob_gc_fallback_) {
+    hot_warm_blob_gc_fallback_ =
+        hot_warm_blob_file_count_ > hot_warm_max_files / 2;
+  } else {
+    hot_warm_blob_gc_fallback_ =
+        hot_warm_blob_file_count_ > hot_warm_max_files;
+  }
+  auto is_full_entry_garbage = [](const FileMetaData* f) {
+    return f->prop.num_entries > 0 &&
+           f->num_antiquation >= f->prop.num_entries;
+  };
+  auto is_full_byte_garbage = [](const FileMetaData* f,
+                                 uint64_t accounting_bytes) {
+    return accounting_bytes > 0 &&
+           f->num_antiquation_bytes >= accounting_bytes;
+  };
+  for (auto& f : LevelFiles(-1)) {
+    if (f->is_gc_forbidden()) {
+      continue;
+    }
+    const bool is_hot_warm_blob =
+        IsHotWarmBlobSstType(static_cast<SstType>(f->prop.sst_type));
     const uint64_t accounting_bytes = f->BlobGcAccountingBytes();
-    blob_accounting_bytes =
-        blob_accounting_bytes > std::numeric_limits<uint64_t>::max() -
-                                    accounting_bytes
-            ? std::numeric_limits<uint64_t>::max()
-            : blob_accounting_bytes + accounting_bytes;
+    if (f->is_gc_permitted()) {
+      if (!f->being_compacted && f->fd.GetFileSize() < fragment_size &&
+          (!is_hot_warm_blob || hot_warm_max_files == 0 ||
+           hot_warm_blob_gc_fallback_)) {
+        ++fragment_count;
+      }
+      const bool hot_warm_waiting_for_full_garbage =
+          is_hot_warm_blob && hot_warm_max_files > 0 &&
+          !hot_warm_blob_gc_fallback_ &&
+          !is_full_entry_garbage(f) &&
+          !is_full_byte_garbage(f, accounting_bytes);
+      if (hot_warm_waiting_for_full_garbage) {
+        continue;
+      }
+      marked |= f->marked_for_compaction;
+      num_antiquation = add_saturated(num_antiquation, f->num_antiquation);
+      num_antiquation_bytes =
+          add_saturated(num_antiquation_bytes, f->num_antiquation_bytes);
+      num_entries = add_saturated(num_entries, f->prop.num_entries);
+      blob_accounting_bytes =
+          add_saturated(blob_accounting_bytes, accounting_bytes);
+    } else {
+      // Candidate/in-flight GC files already have their garbage selected for
+      // reclamation. Keep only their live remainder in the next trigger's
+      // denominator so byte-precise GC does not double-count obsolete bytes.
+      const uint64_t live_entries =
+          std::max(f->prop.num_entries, f->num_antiquation) -
+          f->num_antiquation;
+      const uint64_t live_accounting_bytes =
+          accounting_bytes - std::min(accounting_bytes,
+                                      f->num_antiquation_bytes);
+      num_entries = add_saturated(num_entries, live_entries);
+      blob_accounting_bytes =
+          add_saturated(blob_accounting_bytes, live_accounting_bytes);
+    }
   }
   blob_marked_for_compaction_ = marked;
   blob_needs_defragmentation_ = fragment_count > 8;

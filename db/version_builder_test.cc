@@ -587,7 +587,7 @@ TEST_F(VersionBuilderTest, PreciseGcByteCountFromDependence) {
 
 TEST_F(VersionBuilderTest, PreciseGcByteCountDirectWhenZero) {
   // Match exact_gc semantics: byte_count is the live-byte term directly.
-  // A zero byte_count means zero depended bytes.
+  // A zero byte_count is clamped to one depended byte.
   Add(-1, 101U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100);
   UpdateVersionStorageInfo();
 
@@ -608,7 +608,7 @@ TEST_F(VersionBuilderTest, PreciseGcByteCountDirectWhenZero) {
   ASSERT_TRUE(it != dep_map.end());
   FileMetaData* b = it->second;
   ASSERT_EQ(30U, b->num_antiquation);
-  ASSERT_EQ(10000U, b->num_antiquation_bytes);
+  ASSERT_EQ(9999U, b->num_antiquation_bytes);
 
   UnrefFilesInVersion(&new_vstorage);
 }

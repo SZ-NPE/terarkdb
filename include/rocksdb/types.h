@@ -16,9 +16,10 @@ namespace TERARKDB_NAMESPACE {
 
 // SST role used by middle-value delta-separate. Normal key SSTs contain inline
 // values plus value indexes. Large blob SSTs contain values whose size is at or
-// above middle_blob_size. Hot/cold middle blob SSTs contain values in
+// above middle_blob_size. Middle blob SSTs contain values in
 // [blob_size, middle_blob_size), split by whether they were produced by flush
-// or compaction/GC.
+// or compaction/GC. The "Hot/Cold" names here are legacy delta-separate names,
+// not access-hotness routing decisions.
 //
 // kWarmLargeBlob/kColdLargeBlob are access-hotness variants of kLargeBlob, used
 // only when enable_hotness_tracker is on. Flush emits warm; GC keeps inputs
@@ -34,6 +35,14 @@ enum SstType : uint8_t {
   kColdLargeBlob = 5,
   kMaxSstType = 64,
 };
+
+inline bool IsHotWarmBlobSstType(SstType type) {
+  return type == SstType::kWarmLargeBlob;
+}
+
+inline bool IsColdBlobSstType(SstType type) {
+  return type == SstType::kColdLargeBlob;
+}
 
 // Represents a sequence number in a WAL file.
 typedef uint64_t SequenceNumber;

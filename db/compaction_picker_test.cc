@@ -186,6 +186,263 @@ TEST_F(CompactionPickerTest, GarbageCollectionGroupsByPersistedSstType) {
             static_cast<SstType>(compaction->input(0, 0)->prop.sst_type));
 }
 
+  TEST_F(CompactionPickerTest, HotWarmBlobNotPickedBelowFullGarbage) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 100;
+
+    Add(-1, 11U, "100", "199", 10000U);
+    FileMetaData* warm = file_map_[11U].first;
+    warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+    warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    warm->prop.num_entries = 100;
+    warm->num_antiquation = 90;
+    warm->num_antiquation_bytes = 9000;
+    UpdateVersionStorageInfo();
+    ASSERT_DOUBLE_EQ(0.0, vstorage_->total_garbage_ratio());
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickGarbageCollection(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_EQ(nullptr, compaction.get());
+  }
+
+  TEST_F(CompactionPickerTest, MarkedHotWarmBlobStillWaitsForFullGarbage) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 100;
+
+    Add(-1, 13U, "100", "199", 10000U);
+    FileMetaData* warm = file_map_[13U].first;
+    warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+    warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    warm->marked_for_compaction = true;
+    warm->prop.num_entries = 100;
+    warm->num_antiquation = 90;
+    warm->num_antiquation_bytes = 9000;
+    UpdateVersionStorageInfo();
+    ASSERT_FALSE(vstorage_->blob_marked_for_compaction());
+    ASSERT_DOUBLE_EQ(0.0, vstorage_->total_garbage_ratio());
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickGarbageCollection(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_EQ(nullptr, compaction.get());
+  }
+
+  TEST_F(CompactionPickerTest, HotWarmBlobPickedAtFullEntryGarbage) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 100;
+
+    Add(-1, 11U, "100", "199", 10000U);
+    FileMetaData* warm = file_map_[11U].first;
+    warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+    warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    warm->prop.num_entries = 100;
+    warm->num_antiquation = 100;
+    warm->num_antiquation_bytes = 100;
+    UpdateVersionStorageInfo();
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickGarbageCollection(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_NE(nullptr, compaction.get());
+    ASSERT_EQ(11U, compaction->input(0, 0)->fd.GetNumber());
+  }
+
+  TEST_F(CompactionPickerTest, HotWarmBlobPickedAtFullByteGarbage) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 100;
+
+    Add(-1, 11U, "100", "199", 10000U);
+    FileMetaData* warm = file_map_[11U].first;
+    warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+    warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    warm->prop.num_entries = 100;
+    warm->num_antiquation = 1;
+    warm->num_antiquation_bytes = warm->BlobGcAccountingBytes();
+    UpdateVersionStorageInfo();
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickGarbageCollection(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_NE(nullptr, compaction.get());
+    ASSERT_EQ(11U, compaction->input(0, 0)->fd.GetNumber());
+  }
+
+  TEST_F(CompactionPickerTest, ColdBlobUsesNormalBlobGcRatio) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 100;
+
+    Add(-1, 12U, "200", "299", 10000U);
+    FileMetaData* cold = file_map_[12U].first;
+    cold->prop.sst_type = static_cast<uint8_t>(SstType::kColdLargeBlob);
+    cold->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    cold->prop.num_entries = 100;
+    cold->num_antiquation = 60;
+    cold->num_antiquation_bytes = 6000;
+    UpdateVersionStorageInfo();
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickGarbageCollection(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_NE(nullptr, compaction.get());
+    ASSERT_EQ(12U, compaction->input(0, 0)->fd.GetNumber());
+  }
+
+  TEST_F(CompactionPickerTest, MiddleBlobUsesNormalBlobGcRatio) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 100;
+
+    Add(-1, 14U, "300", "399", 10000U);
+    FileMetaData* middle = file_map_[14U].first;
+    middle->prop.sst_type = static_cast<uint8_t>(SstType::kHotMidBlob);
+    middle->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    middle->prop.num_entries = 100;
+    middle->num_antiquation = 60;
+    middle->num_antiquation_bytes = 6000;
+    UpdateVersionStorageInfo();
+    ASSERT_EQ(0U, vstorage_->hot_warm_blob_file_count());
+    ASSERT_FALSE(vstorage_->hot_warm_blob_gc_fallback());
+    ASSERT_GT(vstorage_->total_garbage_ratio(), 0.0);
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickGarbageCollection(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_NE(nullptr, compaction.get());
+    ASSERT_EQ(14U, compaction->input(0, 0)->fd.GetNumber());
+  }
+
+  TEST_F(CompactionPickerTest, HotWarmBlobFallsBackAboveMaxFiles) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 1;
+
+    for (uint32_t i = 0; i < 2; ++i) {
+      Add(-1, 20U + i, i == 0 ? "100" : "200", i == 0 ? "199" : "299",
+          10000U);
+      FileMetaData* warm = file_map_[20U + i].first;
+      warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+      warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+      warm->prop.num_entries = 100;
+      warm->num_antiquation = 60;
+      warm->num_antiquation_bytes = 6000;
+    }
+    UpdateVersionStorageInfo();
+    ASSERT_TRUE(vstorage_->hot_warm_blob_gc_fallback());
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickGarbageCollection(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_NE(nullptr, compaction.get());
+  }
+
+  TEST_F(CompactionPickerTest, HotWarmBlobFallbackUsesLowWatermark) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 4;
+
+    for (uint32_t i = 0; i < 5; ++i) {
+      Add(-1, 60U + i, ("100" + ToString(i)).c_str(),
+          ("199" + ToString(i)).c_str(), 10000U);
+      FileMetaData* warm = file_map_[60U + i].first;
+      warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+      warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+      warm->prop.num_entries = 100;
+      warm->num_antiquation = 60;
+      warm->num_antiquation_bytes = 6000;
+    }
+    UpdateVersionStorageInfo();
+    ASSERT_TRUE(vstorage_->hot_warm_blob_gc_fallback());
+
+    file_map_[64U].first->gc_status = FileMetaData::kGarbageCollectionForbidden;
+    vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_);
+    ASSERT_TRUE(vstorage_->hot_warm_blob_gc_fallback());
+
+    file_map_[63U].first->gc_status = FileMetaData::kGarbageCollectionForbidden;
+    file_map_[62U].first->gc_status = FileMetaData::kGarbageCollectionForbidden;
+    vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_);
+    ASSERT_FALSE(vstorage_->hot_warm_blob_gc_fallback());
+  }
+
+  TEST_F(CompactionPickerTest, HotWarmBlobRestoresPolicyAtOrBelowMaxFiles) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.blob_gc_ratio = 0.5;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 2;
+
+    for (uint32_t i = 0; i < 3; ++i) {
+      Add(-1, 30U + i, i == 0 ? "100" : i == 1 ? "200" : "300",
+          i == 0 ? "199" : i == 1 ? "299" : "399", 10000U);
+      FileMetaData* warm = file_map_[30U + i].first;
+      warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+      warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+      warm->prop.num_entries = 100;
+      warm->num_antiquation = 60;
+      warm->num_antiquation_bytes = 6000;
+    }
+    UpdateVersionStorageInfo();
+    ASSERT_TRUE(vstorage_->hot_warm_blob_gc_fallback());
+
+    file_map_[31U].first->gc_status = FileMetaData::kGarbageCollectionForbidden;
+    file_map_[32U].first->gc_status = FileMetaData::kGarbageCollectionForbidden;
+    vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_);
+    ASSERT_FALSE(vstorage_->hot_warm_blob_gc_fallback());
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickGarbageCollection(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_EQ(nullptr, compaction.get());
+  }
+
+  TEST_F(CompactionPickerTest, HotWarmBlobSkippedByDefragmentation) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.target_blob_file_size = 1 << 20;
+    mutable_cf_options_.blob_file_defragment_size = 1024;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 100;
+
+    for (uint32_t i = 0; i < 9; ++i) {
+      Add(-1, 40U + i, ("100" + ToString(i)).c_str(),
+          ("199" + ToString(i)).c_str(), 100U);
+      FileMetaData* warm = file_map_[40U + i].first;
+      warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+      warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+      warm->prop.num_entries = 100;
+    }
+    UpdateVersionStorageInfo();
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickBlobDefragmentation(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_EQ(nullptr, compaction.get());
+  }
+
+  TEST_F(CompactionPickerTest, HotWarmBlobDefragmentAllowedInFallback) {
+    NewVersionStorage(6, kCompactionStyleLevel);
+    mutable_cf_options_.target_blob_file_size = 1 << 20;
+    mutable_cf_options_.blob_file_defragment_size = 1024;
+    mutable_cf_options_.hot_warm_blob_gc_max_files = 1;
+
+    for (uint32_t i = 0; i < 9; ++i) {
+      Add(-1, 50U + i, ("100" + ToString(i)).c_str(),
+          ("199" + ToString(i)).c_str(), 100U);
+      FileMetaData* warm = file_map_[50U + i].first;
+      warm->prop.sst_type = static_cast<uint8_t>(SstType::kWarmLargeBlob);
+      warm->gc_status = FileMetaData::kGarbageCollectionPermitted;
+      warm->prop.num_entries = 100;
+    }
+    UpdateVersionStorageInfo();
+    ASSERT_TRUE(vstorage_->hot_warm_blob_gc_fallback());
+
+    std::unique_ptr<Compaction> compaction(
+        level_compaction_picker.PickBlobDefragmentation(
+            cf_name_, mutable_cf_options_, 2.0, vstorage_.get(), &log_buffer_));
+    ASSERT_NE(nullptr, compaction.get());
+  }
+
 TEST_F(CompactionPickerTest, Level0Trigger) {
   NewVersionStorage(6, kCompactionStyleLevel);
   mutable_cf_options_.level0_file_num_compaction_trigger = 2;

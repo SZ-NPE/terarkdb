@@ -1222,21 +1222,10 @@ class MemTableInserter : public WriteBatch::Handler {
         ret_status = Status::TryAgain("key+seq exists");
         const bool BATCH_BOUNDRY = true;
         MaybeAdvanceSeq(BATCH_BOUNDRY);
-      } else {
-        auto cfd = cf_mems_->current();
-        HotnessTracker* hotness_tracker = cfd ? cfd->hotness_tracker_ptr() : nullptr;
-        if (recovering_log_number_ == 0 && hotness_tracker != nullptr) {
-          hotness_tracker->RecordWrite(key);
         }
-      }
     } else if (moptions->inplace_callback == nullptr) {
       assert(!concurrent_memtable_writes_);
       mem->Update(sequence_, key, value);
-      auto cfd = cf_mems_->current();
-        HotnessTracker* hotness_tracker = cfd ? cfd->hotness_tracker_ptr() : nullptr;
-        if (recovering_log_number_ == 0 && hotness_tracker != nullptr) {
-          hotness_tracker->RecordWrite(key);
-      }
     } else {
       assert(!concurrent_memtable_writes_);
       if (mem->UpdateCallback(sequence_, key, value)) {
@@ -1274,22 +1263,12 @@ class MemTableInserter : public WriteBatch::Handler {
                              Slice(prev_buffer, prev_size));
           assert(mem_res);
           RecordTick(moptions->statistics, NUMBER_KEYS_WRITTEN);
-          auto cfd = cf_mems_->current();
-            HotnessTracker* hotness_tracker = cfd ? cfd->hotness_tracker_ptr() : nullptr;
-            if (recovering_log_number_ == 0 && hotness_tracker != nullptr) {
-              hotness_tracker->RecordWrite(key);
-          }
         } else if (status == UpdateStatus::UPDATED) {
           // merged_value contains the final value.
           bool mem_res __attribute__((__unused__));
           mem_res = mem->Add(sequence_, value_type, key, Slice(merged_value));
           assert(mem_res);
           RecordTick(moptions->statistics, NUMBER_KEYS_WRITTEN);
-          auto cfd = cf_mems_->current();
-          HotnessTracker* hotness_tracker = cfd ? cfd->hotness_tracker_ptr() : nullptr;
-          if (recovering_log_number_ == 0 && hotness_tracker != nullptr) {
-            hotness_tracker->RecordWrite(key);
-          }
         }
       }
     }
@@ -1325,13 +1304,7 @@ class MemTableInserter : public WriteBatch::Handler {
       ret_status = Status::TryAgain("key+seq exists");
       const bool BATCH_BOUNDRY = true;
       MaybeAdvanceSeq(BATCH_BOUNDRY);
-    } else {
-      auto cfd = cf_mems_->current();
-      HotnessTracker* hotness_tracker = cfd ? cfd->hotness_tracker_ptr() : nullptr;
-      if (recovering_log_number_ == 0 && hotness_tracker != nullptr) {
-        hotness_tracker->RecordWrite(key);
       }
-    }
     MaybeAdvanceSeq();
     CheckMemtableFull();
     return ret_status;
@@ -1552,12 +1525,7 @@ class MemTableInserter : public WriteBatch::Handler {
             ret_status = Status::TryAgain("key+seq exists");
             const bool BATCH_BOUNDRY = true;
             MaybeAdvanceSeq(BATCH_BOUNDRY);
-          } else {
-            auto cfd = cf_mems_->current();
-            if (recovering_log_number_ == 0 && cfd && cfd->hotness_tracker()) {
-              cfd->hotness_tracker()->RecordWrite(key);
             }
-          }
         } else {
           ret_status = std::move(s);
         }
@@ -1572,12 +1540,7 @@ class MemTableInserter : public WriteBatch::Handler {
         ret_status = Status::TryAgain("key+seq exists");
         const bool BATCH_BOUNDRY = true;
         MaybeAdvanceSeq(BATCH_BOUNDRY);
-      } else {
-        auto cfd = cf_mems_->current();
-        if (recovering_log_number_ == 0 && cfd && cfd->hotness_tracker()) {
-          cfd->hotness_tracker()->RecordWrite(key);
         }
-      }
     }
 
     // optimize for non-recovery mode

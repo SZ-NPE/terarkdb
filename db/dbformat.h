@@ -880,6 +880,10 @@ class SeparateHelper {
                  slice.size() - sizeof(uint64_t));
   }
 
+  // Whether compaction may fetch an existing separated value to fill
+  // ValueMetaData::value_size when old SST metadata does not carry it.
+  virtual bool ShouldUpdateValueSize() const { return false; }
+
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                 uint64_t file_number, const Slice& meta,
                                 bool is_merge, bool is_index,

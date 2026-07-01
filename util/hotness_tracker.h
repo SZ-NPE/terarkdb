@@ -5,8 +5,10 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-#include "cache/fifo_cache.h"
 #include "cache/sharded_cache.h"
 #include "port/port.h"
 #include "rocksdb/cache.h"
@@ -18,13 +20,15 @@
 
 namespace TERARKDB_NAMESPACE {
 
-// HotnessTracker estimates per-key update hotness so that a flush can route a
-// key to a hot or cold vSST. The write path uses a FIFO recent-write window as
-// an observation window and promotes repeated writes into the write-hot region.
-// Compaction feedback is stronger evidence: when compaction drops an obsolete
-// version, the key is promoted into the drop-hot region. Flush and GC rewrite
-// routing consult both regions; GC reverse-lookup avoidance only consults the
-// drop-hot region with exact (user_key, sequence) matches.
+// HotnessTracker is owned by ColumnFamilyData, so one tracker instance belongs
+// to one column family. Within that CF, the tracker estimates routing hotness so
+// that a flush can route a key to a hot/warm/cold vSST. It does not classify
+// block-cache blocks as hot: a hot key does not imply every data block
+// containing or neighboring that key is hot. Foreground write-window learning
+// has been removed; hotness now comes from background compaction feedback
+// batches. The unified module keeps two internal index surfaces fed by that same
+// compaction feedback stream: an approximate hash-bucket routing surface and an
+// exact (user_key, sequence) drop-key surface for GC reverse-lookup avoidance.
 class HotnessTracker {
  public:
   enum class FlushRoute {
@@ -33,11 +37,20 @@ class HotnessTracker {
     kCold = 2,       // strong-cold route
   };
 
-  // Metadata stored as the value of every hotness LRU entry.  The tracker keeps
-  // two logical hot regions: a write-hot region populated by foreground writes,
-  // and a drop-hot region populated by compaction feedback.  Routing consults
-  // both regions, while GC GetKey() avoidance only consults the drop-hot region
-  // and requires an exact (user_key, sequence) match.
+  // Compaction feedback staged by each sub-compaction before the compaction
+  // commit publishes it to the tracker. Each user key maps to the exact set of
+  // dropped separated-value sequence numbers observed for that sub-compaction.
+  using DroppedSeqsByKey =
+      std::unordered_map<std::string, std::vector<SequenceNumber>>;
+
+  struct CompactionFeedback {
+    std::string user_key;
+    std::vector<SequenceNumber> dropped_seqs;
+    uint32_t drop_count = 0;
+  };
+
+  // Metadata stored as the value of every exact drop-key cache entry. It is not
+  // used for routing hotness; routing is represented by fixed hash buckets.
   struct HotEntry {
     // Per-key upper bound on retained dropped sequences. Bounded so memory
     // stays controlled; on overflow the oldest sequence is discarded. This
@@ -45,11 +58,6 @@ class HotnessTracker {
     static constexpr size_t kMaxDroppedSeqs = 32;
 
     mutable port::Mutex mu;
-    bool admitted_hot = false;
-    uint32_t write_count = 0;
-    uint32_t drop_count = 0;
-    uint32_t stable_observe_count = 0;
-    uint64_t last_update_epoch = 0;
     // Sequences of separated-value versions confirmed dead by compaction,
     // in append order ([0] is oldest). Linear search; deduplicated.
     std::array<SequenceNumber, kMaxDroppedSeqs> dropped_seqs;
@@ -62,9 +70,6 @@ class HotnessTracker {
           return;
         }
       }
-      if (drop_count < UINT32_MAX) {
-        ++drop_count;
-      }
       if (num_dropped_seqs >= kMaxDroppedSeqs) {
         for (size_t i = 1; i < num_dropped_seqs; ++i) {
           dropped_seqs[i - 1] = dropped_seqs[i];
@@ -73,20 +78,6 @@ class HotnessTracker {
         return;
       }
       dropped_seqs[num_dropped_seqs++] = seq;
-    }
-
-    void AddDropSignal() {
-      MutexLock l(&mu);
-      if (drop_count < UINT32_MAX) {
-        ++drop_count;
-      }
-    }
-
-    void AddStableObservation() {
-      MutexLock l(&mu);
-      if (stable_observe_count < UINT32_MAX) {
-        ++stable_observe_count;
-      }
     }
 
     bool ContainsDroppedSeq(SequenceNumber seq) const {
@@ -99,157 +90,110 @@ class HotnessTracker {
       return false;
     }
 
-    uint32_t StableObserveCount() const {
-      MutexLock l(&mu);
-      return stable_observe_count;
-    }
   };
 
   struct Options {
-    // Capacity (in bytes) of the recent write window FIFO set.
-    size_t window_capacity = 0;
-    // Total capacity budget shared by write-hot, drop-hot, and cold-candidate
-    // LRU sets.
+    // Total capacity budget shared by the approximate routing buckets and the
+    // exact drop-key cache.
     size_t hot_capacity = 0;
-    // Whether repeated writes inside the window contribute to hotness.
-    bool enable_write_window = true;
     // Whether compaction obsolete-version feedback contributes to hotness.
     bool enable_compaction_feedback = true;
     // Whether compaction obsolete-version feedback records exact dropped
     // sequence numbers for blob GC GetKey() short-circuiting.
     bool enable_drop_key_cache = true;
-    // Number of writes within the recent window needed before a key is admitted
-    // to the hot flush route. Default 2 preserves the legacy behavior: first
-    // write enters the window, second write becomes hot.
-    uint32_t admit_threshold = 2;
-    // Simple epoch decay. Every `decay_interval` RecordWrite calls advances one
-    // global epoch. 0 disables decay by default for compatibility.
+    // Simple epoch decay. Every `decay_interval` background batch publishes
+    // advances one global epoch. 0 disables decay by default for compatibility.
     uint64_t decay_interval = 0;
-    // If non-zero, an admitted hot key whose last write is older than this many
-    // epochs is considered cold again and its write counter is decayed.
+    // If non-zero, an admitted hot key whose last hotness observation is older
+    // than this many epochs is considered cold again.
     uint64_t decay_window = 0;
   };
 
   explicit HotnessTracker(const Options& options, int num_shard_bits = 6)
-      : enable_write_window_(options.enable_write_window &&
-                             options.window_capacity > 0 &&
-                             options.hot_capacity > 0),
-        enable_compaction_feedback_(options.enable_compaction_feedback &&
+      : enable_compaction_feedback_(options.enable_compaction_feedback &&
                                     options.hot_capacity > 0),
         enable_drop_key_cache_(options.enable_drop_key_cache &&
                                options.hot_capacity > 0),
-        admit_threshold_(std::max<uint32_t>(1, options.admit_threshold)),
         decay_interval_(options.decay_interval),
         decay_window_(options.decay_window) {
-    const size_t write_hot_capacity = std::max<size_t>(1, options.hot_capacity / 4);
-    const size_t cold_capacity = std::max<size_t>(1, options.hot_capacity / 4);
-    const size_t drop_hot_capacity =
-        options.hot_capacity > write_hot_capacity + cold_capacity
-            ? options.hot_capacity - write_hot_capacity - cold_capacity
-            : 1;
-    if (enable_write_window_) {
-      window_cache_ =
-          NewFIFOCache(options.window_capacity, num_shard_bits, false, 0.0);
-      write_hot_cache_ = NewLRUCache(std::max<size_t>(1, write_hot_capacity),
-                                     num_shard_bits, false, 0.0);
-    }
-    if (drop_hot_capacity > 0 &&
-        (enable_compaction_feedback_ || enable_drop_key_cache_)) {
-      drop_hot_cache_ =
-          NewLRUCache(drop_hot_capacity, num_shard_bits, false, 0.0);
-    }
     if (options.hot_capacity > 0) {
-      cold_candidate_cache_ =
-          NewLRUCache(cold_capacity, num_shard_bits, false, 0.0);
+      routing_bucket_count_ = ComputeRoutingBucketCount(options.hot_capacity);
+      routing_buckets_.reset(new RoutingBucket[routing_bucket_count_]);
+      cold_current_.assign(routing_bucket_count_, 0);
+      cold_previous_.assign(routing_bucket_count_, 0);
+    }
+    if (enable_drop_key_cache_) {
+      const size_t drop_key_capacity =
+          std::max<size_t>(1, options.hot_capacity / 2);
+      drop_key_cache_ =
+          NewLRUCache(drop_key_capacity, num_shard_bits, false, 0.0);
     }
   }
 
-  // Records a write of key. A repeated write inside the FIFO observation
-  // window increases the key's write counter. The key is admitted into the hot
-  // LRU only after the counter reaches admit_threshold_.
-  void RecordWrite(const Slice& key) {
+  void ApplyCompactionFeedbackBatch(
+      const std::vector<CompactionFeedback>& feedbacks) {
+    ApplyCompactionFeedbackBatch(feedbacks.data(), feedbacks.size());
+  }
+
+  void ApplyCompactionFeedbackBatch(const CompactionFeedback* feedbacks,
+                                    size_t count) {
+    if (feedbacks == nullptr || count == 0 ||
+        (!enable_compaction_feedback_ && !enable_drop_key_cache_)) {
+      return;
+    }
     const uint64_t epoch = AdvanceAndGetEpoch();
-    ResetColdCandidate(key);
-    if (admit_threshold_ <= 1) {
-      // For short overwrite-heavy runs the second observation may be delayed
-      // until after the current memtable flushes.  Threshold=1 is an explicit
-      // benchmark mode: sampled foreground overwrites are enough evidence to
-      // route subsequent flushed versions to the ephemeral/hot file class.
-      // Sampling keeps the foreground write path cheaper than touching the LRU
-      // on every overwrite while still preserving a stable signal under Zipfian
-      // skew.
-      uint32_t hash = Hash(key);
-      if ((hash & 0x3) == 0) {
-        AdmitWriteHotKey(key);
-      }
-      return;
+    std::unordered_map<uint32_t, uint32_t> routing_delta_by_bucket;
+    if (enable_compaction_feedback_ && routing_bucket_count_ > 0) {
+      routing_delta_by_bucket.reserve(count);
     }
-    if (enable_write_window_ && window_cache_ != nullptr) {
-      uint32_t hash = Hash(key);
-      Cache::Handle* handle =
-          window_cache_->Lookup(key, hash, false /* record_hit */);
-      if (handle != nullptr) {
-        // Repeated write while still inside the recent window: an overwrite.
-        window_cache_->Release(handle);
-        if (WriteHotCacheContainsAdmitted(key, true /* record_hit */)) {
-          // Once a key has been admitted, routing only needs the hot LRU entry.
-          // Avoid refreshing the FIFO window on every subsequent overwrite;
-          // this keeps the write-window signal cheap for skewed workloads where
-          // a small hot set receives most updates.
-          return;
+    for (size_t i = 0; i < count; ++i) {
+      const CompactionFeedback& feedback = feedbacks[i];
+      if (feedback.user_key.empty()) {
+        continue;
+      }
+      Slice key(feedback.user_key);
+      const uint32_t routing_bucket = RoutingBucketForKey(key);
+      if (enable_compaction_feedback_) {
+        const uint32_t signal = std::max<uint32_t>(1, feedback.drop_count);
+        uint32_t& delta = routing_delta_by_bucket[routing_bucket];
+        const uint32_t room = UINT32_MAX - delta;
+        delta += std::min<uint32_t>(signal, room);
+        ResetColdBucket(routing_bucket);
+      }
+      if (enable_drop_key_cache_ && !feedback.dropped_seqs.empty()) {
+        Cache::Handle* handle = GetOrCreateDropEntryHandle(key);
+        if (handle == nullptr) {
+          continue;
         }
-        RecordWindowWrite(key, epoch, true /* repeated */);
+        auto* entry = static_cast<HotEntry*>(drop_key_cache_->Value(handle));
+        if (entry != nullptr) {
+          for (SequenceNumber seq : feedback.dropped_seqs) {
+            if (seq != 0) {
+              entry->AddDroppedSeq(seq);
+            }
+          }
+        }
+        drop_key_cache_->Release(handle);
       }
-      // Insert (or refresh) the key in the recent window.
-      window_cache_->Insert(key, hash, nullptr, key.size(), &NoopDeleter);
+    }
+    for (const auto& delta : routing_delta_by_bucket) {
+      MarkRoutingBucketHot(delta.first, delta.second, epoch);
     }
   }
 
-  // Records that compaction dropped an obsolete version of key. This must only
-  // be called from places where the version is known to be dead, otherwise it
-  // would mistake ordinary scans for hotness.
-  void RecordCompactionFeedback(const Slice& key) {
-    if (!enable_compaction_feedback_) {
+  void ApplyColdObservationBatch(const std::vector<uint32_t>& buckets) {
+    if (routing_bucket_count_ == 0 || buckets.empty()) {
       return;
     }
-    ResetColdCandidate(key);
-    Cache::Handle* handle =
-        GetOrCreateDropEntryHandle(key, true /* admit_hot */);
-    if (handle == nullptr) {
-      return;
+    AdvanceAndGetEpoch();
+    MutexLock l(&cold_mu_);
+    std::swap(cold_previous_, cold_current_);
+    std::fill(cold_current_.begin(), cold_current_.end(), 0);
+    for (uint32_t bucket : buckets) {
+      if (bucket < routing_bucket_count_) {
+        cold_current_[bucket] = 1;
+      }
     }
-    auto* entry = static_cast<HotEntry*>(drop_hot_cache_->Value(handle));
-    if (entry != nullptr) {
-      entry->AddDropSignal();
-    }
-    drop_hot_cache_->Release(handle);
-  }
-
-  // Overload that, in addition to promoting the key into the hot LRU, records
-  // that the separated-value version identified by (key, seq) was confirmed
-  // dead by compaction. Blob GC can later short-circuit its GetKey() reverse
-  // lookup when (key, seq) is found in this cache. Purely opportunistic: a
-  // miss simply falls back to the legacy GetKey() path.
-  void RecordCompactionFeedback(const Slice& key, SequenceNumber seq) {
-    if (seq == 0) {
-      return;
-    }
-    if (!enable_compaction_feedback_ && !enable_drop_key_cache_) {
-      return;
-    }
-    ResetColdCandidate(key);
-    Cache::Handle* handle =
-        GetOrCreateDropEntryHandle(key, enable_compaction_feedback_);
-    if (handle == nullptr) {
-      return;
-    }
-    auto* entry = static_cast<HotEntry*>(drop_hot_cache_->Value(handle));
-    if (enable_drop_key_cache_ && entry != nullptr) {
-      entry->AddDroppedSeq(seq);
-    } else if (entry != nullptr) {
-      entry->AddDropSignal();
-    }
-    drop_hot_cache_->Release(handle);
   }
 
   // Returns whether the separated-value version identified by (key, seq) was
@@ -257,41 +201,27 @@ class HotnessTracker {
   // matching only the user key is not enough (would be a false hit). A miss
   // (including after LRU eviction) is allowed and falls back to GetKey().
   bool IsDropped(const Slice& key, SequenceNumber seq) const {
-    if (!enable_drop_key_cache_ || drop_hot_cache_ == nullptr || seq == 0) {
+    if (!enable_drop_key_cache_ || drop_key_cache_ == nullptr || seq == 0) {
       return false;
     }
     uint32_t hash = Hash(key);
     Cache::Handle* handle =
-        drop_hot_cache_->Lookup(key, hash, false /* record_hit */);
+        drop_key_cache_->Lookup(key, hash, false /* record_hit */);
     if (handle == nullptr) {
       return false;
     }
-    auto* entry = static_cast<HotEntry*>(drop_hot_cache_->Value(handle));
+    auto* entry = static_cast<HotEntry*>(drop_key_cache_->Value(handle));
     bool dropped = entry != nullptr && entry->ContainsDroppedSeq(seq);
-    drop_hot_cache_->Release(handle);
+    drop_key_cache_->Release(handle);
     return dropped;
   }
 
-  // Returns whether the key is currently admitted into the hot LRU.
-  bool IsHot(const Slice& key) const {
-    return HasAnyHotSignal(key);
-  }
-
-  bool IsHotForRouting(const Slice& key) const {
-    return ClassifyForRouting(key) == FlushRoute::kEphemeral;
-  }
-
   FlushRoute ClassifyForRouting(const Slice& key) const {
-    uint32_t drop_count = 0;
-    const bool drop_hot = GetAdmittedDropCount(key, &drop_count);
-    uint32_t write_count = 0;
-    const bool write_hot = GetAdmittedWriteCount(key, &write_count);
-    if ((drop_hot && drop_count >= kStrongHotDropThreshold) ||
-        (write_hot && write_count >= kStrongHotWriteThreshold) ||
-        (drop_hot && write_hot)) {
+    const uint32_t bucket = RoutingBucketForKey(key);
+    if (IsRoutingBucketHot(bucket)) {
       return FlushRoute::kEphemeral;
     }
-    if (!drop_hot && !write_hot && RecordStableObservation(key)) {
+    if (IsRepeatedColdMiss(bucket)) {
       return FlushRoute::kCold;
     }
     return FlushRoute::kWarm;
@@ -301,73 +231,64 @@ class HotnessTracker {
 
   FlushRoute ClassifyForFlush(const Slice& key) const {
     // Flush classification should consume the hotness signal without refreshing
-    // LRU recency. Hotness is advanced by writes and compaction feedback, not by
+    // LRU recency. Hotness is advanced by explicit activity observations, not by
     // background flush scans.
     return ClassifyForRouting(key);
-  }
-
-  static void NoopDeleter(const Slice& /*key*/, void* /*value*/) {
-    // Intentionally empty because the window cache stores keys as a set only.
   }
 
   static uint32_t Hash(const Slice& key) {
     return ShardedCache::HashSlice(key);
   }
 
-  // --- Test-only helpers -------------------------------------------------
-
-  bool TEST_RecentWindowContains(const Slice& key) const {
-    if (window_cache_ == nullptr) {
-      return false;
+  uint32_t RoutingBucketForKey(const Slice& key) const {
+    if (routing_bucket_count_ == 0) {
+      return 0;
     }
-    Cache::Handle* handle =
-        window_cache_->Lookup(key, Hash(key), false /* record_hit */);
-    if (handle == nullptr) {
-      return false;
-    }
-    window_cache_->Release(handle);
-    return true;
+    return Hash(key) % static_cast<uint32_t>(routing_bucket_count_);
   }
+
+  // --- Test-only helpers -------------------------------------------------
 
   bool TEST_HotCacheContains(const Slice& key) const {
     return HasAnyHotSignal(key);
   }
 
   bool TEST_DropKeyCacheContains(const Slice& key) const {
-    return DropHotCacheContainsAny(key, false /* record_hit */);
+    return CacheContainsAny(drop_key_cache_, key, false /* record_hit */);
+  }
+
+  bool TEST_RoutingBucketHot(const Slice& key) const {
+    return IsRoutingBucketHot(RoutingBucketForKey(key));
   }
 
  private:
-  static constexpr uint32_t kStrongHotWriteThreshold = 2;
-  static constexpr uint32_t kStrongHotDropThreshold = 1;
-  static constexpr uint32_t kStrongColdObserveThreshold = 3;
+  static constexpr uint32_t kStrongHotRoutingScore = 2;
+
+  struct RoutingBucket {
+    std::atomic<uint32_t> hot_score{0};
+    std::atomic<uint64_t> last_update_epoch{0};
+  };
+
+  static size_t ComputeRoutingBucketCount(size_t hot_capacity) {
+    size_t buckets = std::max<size_t>(64, hot_capacity / 64);
+    buckets = std::min<size_t>(buckets, 64 * 1024);
+    return buckets;
+  }
 
   static void DeleteHotEntry(const Slice& /*key*/, void* value) {
     delete static_cast<HotEntry*>(value);
   }
 
-  // Looks up a hotness entry for key, inserting a fresh one if absent, and
-  // returns a referenced handle (or nullptr when the hot LRU is disabled).
-  // Looking up an existing entry refreshes its LRU position and preserves any
-  // dropped sequences it already holds. Caller must Release the handle.
-  Cache::Handle* GetOrCreateEntryHandle(const std::shared_ptr<Cache>& cache,
-                                        const Slice& key, bool admit_hot,
-                                        uint32_t initial_write_count = 0) const {
-    if (cache == nullptr) {
+  // Looks up an exact drop-key entry for key, inserting a fresh one if absent.
+  // Caller must Release the returned handle.
+  Cache::Handle* GetOrCreateDropEntryHandle(const Slice& key) const {
+    if (drop_key_cache_ == nullptr) {
       return nullptr;
     }
     uint32_t hash = Hash(key);
-    Cache::Handle* handle = cache->Lookup(key, hash, true /* record_hit */);
+    Cache::Handle* handle =
+        drop_key_cache_->Lookup(key, hash, true /* record_hit */);
     if (handle != nullptr) {
-      if (admit_hot) {
-        auto* entry = static_cast<HotEntry*>(cache->Value(handle));
-        if (entry != nullptr) {
-          MutexLock l(&entry->mu);
-          entry->admitted_hot = true;
-          entry->write_count = std::max(entry->write_count, admit_threshold_);
-          entry->last_update_epoch = CurrentEpoch();
-        }
-      }
       return handle;
     }
     size_t charge = key.size() + sizeof(HotEntry);
@@ -375,11 +296,8 @@ class HotnessTracker {
       charge = 1;
     }
     HotEntry* entry = new HotEntry();
-    entry->admitted_hot = admit_hot;
-    entry->write_count = admit_hot ? admit_threshold_ : initial_write_count;
-    entry->last_update_epoch = CurrentEpoch();
-    Status s = cache->Insert(key, hash, entry, charge, &DeleteHotEntry,
-                             &handle);
+    Status s = drop_key_cache_->Insert(key, hash, entry, charge,
+                                       &DeleteHotEntry, &handle);
     if (!s.ok() || handle == nullptr) {
       // Insert refused the entry without taking ownership (e.g. a strict
       // capacity limit). Free it ourselves to avoid leaking.
@@ -389,80 +307,18 @@ class HotnessTracker {
     return handle;
   }
 
-  Cache::Handle* GetOrCreateWriteEntryHandle(
-      const Slice& key, bool admit_hot, uint32_t initial_write_count = 0) const {
-    return GetOrCreateEntryHandle(write_hot_cache_, key, admit_hot,
-                                  initial_write_count);
-  }
-
-  Cache::Handle* GetOrCreateDropEntryHandle(const Slice& key, bool admit_hot) const {
-    return GetOrCreateEntryHandle(drop_hot_cache_, key, admit_hot);
-  }
-
-  void AdmitWriteHotKey(const Slice& key) {
-    Cache::Handle* handle =
-        GetOrCreateWriteEntryHandle(key, true /* admit_hot */);
-    if (handle != nullptr) {
-      write_hot_cache_->Release(handle);
-    }
-  }
-
   uint64_t AdvanceAndGetEpoch() {
     if (decay_interval_ == 0) {
       return 0;
     }
-    const uint64_t tick = write_tick_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t tick = batch_tick_.fetch_add(1, std::memory_order_relaxed) + 1;
     return tick / decay_interval_;
   }
 
   uint64_t CurrentEpoch() const {
     return decay_interval_ == 0
                ? 0
-               : write_tick_.load(std::memory_order_relaxed) / decay_interval_;
-  }
-
-  void RecordWindowWrite(const Slice& key, uint64_t epoch, bool repeated) {
-    if (!repeated) {
-      return;
-    }
-    // The FIFO window is the observation structure for one-hit keys.  Only a
-    // repeated write is admitted into the hot LRU candidate set, so long-tail
-    // cold keys do not evict truly hot keys or drop-key feedback entries.
-    Cache::Handle* handle = GetOrCreateWriteEntryHandle(
-        key, false /* admit_hot */, 1 /* initial_write_count */);
-    if (handle == nullptr) {
-      return;
-    }
-    auto* entry = static_cast<HotEntry*>(write_hot_cache_->Value(handle));
-    if (entry != nullptr) {
-      MutexLock l(&entry->mu);
-      if (IsExpiredLocked(*entry, epoch)) {
-        entry->admitted_hot = false;
-        entry->write_count = 0;
-      }
-      if (repeated && entry->write_count == 0) {
-        // The first write was represented by the FIFO hit; count it when an
-        // existing non-admitted entry came from drop-key feedback or was reset
-        // by decay.
-        entry->write_count = 1;
-      }
-      if (entry->write_count == 0 || repeated) {
-        if (entry->write_count < admit_threshold_) {
-          ++entry->write_count;
-        }
-      }
-      entry->last_update_epoch = epoch;
-      if (entry->write_count >= admit_threshold_) {
-        entry->admitted_hot = true;
-      }
-    }
-    write_hot_cache_->Release(handle);
-  }
-
-  bool IsExpiredLocked(const HotEntry& entry, uint64_t epoch) const {
-    return decay_interval_ > 0 && decay_window_ > 0 &&
-           epoch > entry.last_update_epoch &&
-           epoch - entry.last_update_epoch > decay_window_;
+               : batch_tick_.load(std::memory_order_relaxed) / decay_interval_;
   }
 
   bool CacheContainsAny(const std::shared_ptr<Cache>& cache, const Slice& key,
@@ -479,121 +335,74 @@ class HotnessTracker {
     return true;
   }
 
-  bool CacheContainsAdmitted(const std::shared_ptr<Cache>& cache,
-                             const Slice& key, bool record_hit) const {
-    if (cache == nullptr) {
-      return false;
-    }
-    uint32_t hash = Hash(key);
-    Cache::Handle* handle = cache->Lookup(key, hash, record_hit);
-    if (handle == nullptr) {
-      return false;
-    }
-    auto* entry = static_cast<HotEntry*>(cache->Value(handle));
-    bool hot = false;
-    if (entry != nullptr) {
-      MutexLock l(&entry->mu);
-      if (IsExpiredLocked(*entry, CurrentEpoch())) {
-        entry->admitted_hot = false;
-        entry->write_count = 0;
-      }
-      hot = entry->admitted_hot;
-    }
-    cache->Release(handle);
-    return hot;
-  }
-
-  bool WriteHotCacheContainsAdmitted(const Slice& key, bool record_hit) const {
-    return CacheContainsAdmitted(write_hot_cache_, key, record_hit);
-  }
-
-  bool DropHotCacheContainsAdmitted(const Slice& key, bool record_hit) const {
-    return CacheContainsAdmitted(drop_hot_cache_, key, record_hit);
-  }
-
-  bool DropHotCacheContainsAny(const Slice& key, bool record_hit) const {
-    return CacheContainsAny(drop_hot_cache_, key, record_hit);
-  }
-
   bool HasAnyHotSignal(const Slice& key) const {
-    return DropHotCacheContainsAdmitted(key, false /* record_hit */) ||
-           WriteHotCacheContainsAdmitted(key, false /* record_hit */);
+    return IsRoutingBucketHot(RoutingBucketForKey(key));
   }
 
-  bool GetAdmittedWriteCount(const Slice& key, uint32_t* count) const {
-    return GetAdmittedSignalCount(write_hot_cache_, key, count,
-                                  true /* write_count */);
-  }
-
-  bool GetAdmittedDropCount(const Slice& key, uint32_t* count) const {
-    return GetAdmittedSignalCount(drop_hot_cache_, key, count,
-                                  false /* write_count */);
-  }
-
-  bool GetAdmittedSignalCount(const std::shared_ptr<Cache>& cache,
-                              const Slice& key, uint32_t* count,
-                              bool write_count) const {
-    if (count != nullptr) {
-      *count = 0;
+  void MarkRoutingBucketHot(uint32_t bucket, uint32_t signal, uint64_t epoch) {
+    if (routing_bucket_count_ == 0 || bucket >= routing_bucket_count_ ||
+        routing_buckets_ == nullptr || signal == 0) {
+      return;
     }
-    if (cache == nullptr) {
+    RoutingBucket& b = routing_buckets_[bucket];
+    uint32_t old = b.hot_score.load(std::memory_order_relaxed);
+    while (old < UINT32_MAX &&
+           !b.hot_score.compare_exchange_weak(
+               old, std::min<uint32_t>(UINT32_MAX, old + signal),
+               std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+    b.last_update_epoch.store(epoch, std::memory_order_relaxed);
+  }
+
+  bool IsRoutingBucketHot(uint32_t bucket) const {
+    if (routing_bucket_count_ == 0 || bucket >= routing_bucket_count_ ||
+        routing_buckets_ == nullptr) {
       return false;
     }
-    Cache::Handle* handle = cache->Lookup(key, Hash(key), false /* record_hit */);
-    if (handle == nullptr) {
+    const RoutingBucket& b = routing_buckets_[bucket];
+    const uint32_t score = b.hot_score.load(std::memory_order_relaxed);
+    if (score < kStrongHotRoutingScore) {
       return false;
     }
-    auto* entry = static_cast<HotEntry*>(cache->Value(handle));
-    bool admitted = false;
-    if (entry != nullptr) {
-      MutexLock l(&entry->mu);
-      if (IsExpiredLocked(*entry, CurrentEpoch())) {
-        entry->admitted_hot = false;
-        entry->write_count = 0;
-      }
-      admitted = entry->admitted_hot;
-      if (admitted && count != nullptr) {
-        *count = write_count ? entry->write_count : entry->drop_count;
+    if (decay_interval_ > 0 && decay_window_ > 0) {
+      const uint64_t epoch = CurrentEpoch();
+      const uint64_t last = b.last_update_epoch.load(std::memory_order_relaxed);
+      if (epoch > last && epoch - last > decay_window_) {
+        return false;
       }
     }
-    cache->Release(handle);
-    return admitted;
+    return true;
   }
 
-  bool RecordStableObservation(const Slice& key) const {
-    Cache::Handle* handle = GetOrCreateEntryHandle(
-        cold_candidate_cache_, key, false /* admit_hot */);
-    if (handle == nullptr) {
+  bool IsRepeatedColdMiss(uint32_t bucket) const {
+    if (routing_bucket_count_ == 0 || bucket >= routing_bucket_count_) {
       return false;
     }
-    auto* entry = static_cast<HotEntry*>(cold_candidate_cache_->Value(handle));
-    bool strong_cold = false;
-    if (entry != nullptr) {
-      entry->AddStableObservation();
-      strong_cold = entry->StableObserveCount() >= kStrongColdObserveThreshold;
-    }
-    cold_candidate_cache_->Release(handle);
-    return strong_cold;
+    MutexLock l(&cold_mu_);
+    return cold_current_[bucket] != 0 && cold_previous_[bucket] != 0;
   }
 
-  void ResetColdCandidate(const Slice& key) {
-    if (cold_candidate_cache_ != nullptr) {
-      cold_candidate_cache_->Erase(key, Hash(key));
+  void ResetColdBucket(uint32_t bucket) {
+    if (routing_bucket_count_ == 0 || bucket >= routing_bucket_count_) {
+      return;
     }
+    MutexLock l(&cold_mu_);
+    cold_current_[bucket] = 0;
+    cold_previous_[bucket] = 0;
   }
 
-  const bool enable_write_window_;
   const bool enable_compaction_feedback_;
   const bool enable_drop_key_cache_;
-  const uint32_t admit_threshold_;
   const uint64_t decay_interval_;
   const uint64_t decay_window_;
-  mutable std::atomic<uint64_t> write_tick_{0};
+  mutable std::atomic<uint64_t> batch_tick_{0};
 
-  std::shared_ptr<Cache> window_cache_;
-  mutable std::shared_ptr<Cache> write_hot_cache_;
-  mutable std::shared_ptr<Cache> drop_hot_cache_;
-  mutable std::shared_ptr<Cache> cold_candidate_cache_;
+  size_t routing_bucket_count_ = 0;
+  std::unique_ptr<RoutingBucket[]> routing_buckets_;
+  mutable port::Mutex cold_mu_;
+  mutable std::vector<uint8_t> cold_current_;
+  mutable std::vector<uint8_t> cold_previous_;
+  mutable std::shared_ptr<Cache> drop_key_cache_;
 };
 
 }  // namespace TERARKDB_NAMESPACE

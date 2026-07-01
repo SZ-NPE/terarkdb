@@ -33,6 +33,7 @@ paper_full_run.log
 motivation/motivation_suite.env
 motivation/case_plan.txt
 motivation/motivation_log_inventory.tsv
+motivation/motivation_metrics.tsv
 motivation/**/case.env
 motivation/**/out/updatex*.txt
 interface/run_manifest.txt
@@ -51,7 +52,7 @@ Pull `info_log/` only after the high-level completeness check, or for figures th
 Expected full-run status:
 
 - wrapper log ends with `All requested paper experiments finished`;
-- motivation has 5 cases and `motivation_log_inventory.tsv`;
+- motivation has 5 cases plus `motivation_log_inventory.tsv` and `motivation_metrics.tsv`;
 - interface has 14 cases and `summary.tsv`.
 
 Current motivation cases (5):
@@ -73,7 +74,7 @@ rocksdb_baseline_rw, blobdb_baseline_rw, terarkdb_baseline_rw,
 terarkdb_full_rw
 ```
 
-Relevant code: `test-sh/new-ycsb/motivation.sh:111`, `test-sh/new-ycsb/interface.sh:128`.
+Relevant code: `test-sh/new-ycsb/motivation.sh:114`, `test-sh/new-ycsb/interface.sh:140`.
 
 ---
 
@@ -105,7 +106,7 @@ python3 plot_tools/plot_paper_figures.py \
   --out-dir result/paper_full_<RUN_ID>/paper_figures
 ```
 
-The wrapper prefers `python3.13` when available. It calls the motivation plotter and the interface plotter. `plot_interface.py` renders Base-vs-Opt benefit figures for all three optimizations plus an overall and cross-engine view; figures whose cases are missing are skipped (printed as `[skipped]`) so partial interface results still produce whatever is available.
+The wrapper prefers `python3.13` when available. It calls the motivation plotter and the interface plotter, and writes all figures directly under the requested `--out-dir` (default: `result/paper_full_<RUN_ID>/paper_figures`). The individual plotters only use `paper_figures/motivation` or `paper_figures/interface` subdirectories when run directly without `--out-dir`. `plot_interface.py` renders Base-vs-Opt benefit figures for all three optimizations plus overall and cross-engine views for both write-hotspot and read/write-mixed workloads; figures whose cases are missing are skipped (printed as `[skipped]`) so partial interface results still produce whatever is available.
 
 Interface benefit figures (all driven by statistics tickers in `out/updatex*.txt` + run-phase timechart CSV, no extra instrumentation, no foreground overhead):
 
@@ -117,21 +118,23 @@ Interface benefit figures (all driven by statistics tickers in `out/updatex*.txt
 | Overall gain | `terarkdb_baseline`, `terarkdb_full` | `ops_sec`, chart P99, GC total I/O, write-amp |
 | Cross-engine | `rocksdb/blobdb/terarkdb_baseline`, `terarkdb_full` | `ops_sec`, chart P99 |
 
-`plot_interface.py` accepts `--only <group...>` (`hotness gc-cache precise full cross`) for single-group debugging. Run-phase timechart is auto-discovered by excluding the `load_` warm-up file, so it is workload-prefix agnostic.
+`plot_interface.py` accepts `--only <group...>` (`hotness gc-cache precise full full-rw cross cross-rw`) for single-group debugging. Run-phase timechart is auto-discovered by excluding the `load_` warm-up file, so it is workload-prefix agnostic.
 
-Relevant code: `plot_tools/plot_paper_figures.py:13`, `plot_tools/plot_paper_figures.py:31`, `plot_tools/plot_interface.py` (`FIGURES` registry + `main`).
+Relevant code: `plot_tools/plot_paper_figures.py:13`, `plot_tools/plot_paper_figures.py:31`, `plot_tools/plot_interface.py:453`, `plot_tools/plot_interface.py:468`.
 
 ---
 
 ## 6. Current progress snapshot to remember
 
-The current workspace contains these useful but non-authoritative batches:
+The current workspace contains these useful but non-authoritative devbox batches:
 
-- `result/paper_full_20260626_033855`: motivation completed all 6 cases (old 6-case matrix, predates the M6 removal); interface is partial (baseline + hotness completed, `gc_cache_base` started, no `summary.tsv`). Treat as analysis material, not final paper result.
-- `result/motivation_devbox10g_20260626_194547`: 10GB motivation validation with generated figures.
-- `result/motivation_devbox10g_m5fix_20260626_204808` and `result/motivation_devbox10g_m6fix_20260626_210912`: targeted 10GB M5/M6 reruns after enabling key-correlated mixed value size in the current script path.
+- `result/paper_full_smoke_1gb_20260630_221207`: complete 1GB/2-thread full-wrapper smoke run. It finished both stages, has 5 motivation cases, 14 interface cases, `motivation_metrics.tsv`, and `interface/summary.tsv`; use it to verify the current wrapper, compact case matrix, artifact layout, and plotting plumbing, not to judge optimization benefit.
+- `result/interface_10g_t1_20260630`: complete 10GB/1-thread interface matrix with all 14 current cases and `summary.tsv`; useful for checking result layout, summaries, plotting, and qualitative direction, not for final paper numbers.
+- `result/interface_10g_t1_rerun_20260630_105151`: 10GB/1-thread focused hotness/gc-cache/precise rerun with `summary.tsv`.
+- `result/interface_10g_t1_precise_fixed_20260630_181215`: targeted precise-GC rerun after the mixed-value widening to 550B-800B plus 16KB.
+- `result/interface_10g_t1_gccache_gc002_20260630_192500`: targeted gc-cache rerun with lower GC ratio; `result/interface_10g_t1_gccache_stress300_20260630_194700` is partial and was used for stress/debug only.
 
-Do not copy numeric conclusions from these batches into the paper without rechecking the current logs and regenerated figures.
+Do not copy numeric conclusions from these batches into the paper without rechecking the current logs and regenerated figures. The 1GB smoke run is a plumbing check only. Current 10GB/1-thread snapshots show the scripts and summaries working, but several optimization groups still need physical-machine validation: hotness/precise reduce space or write volume in some runs but may lose throughput on devbox scale, and gc-cache benefit is small unless the cache/working-set and GC pressure expose eviction.
 
 ---
 
@@ -163,7 +166,7 @@ skipped with `[skipped]`; check stdout for the rendered/skipped list.
 
 ### 7.3 Per-figure: data source, how it is read, expected shape
 
-Motivation (problem evidence; figures live in `paper_figures/motivation`):
+Motivation (problem evidence; one-command figures live directly under `paper_figures`):
 
 | Fig | Read from | Parser | Expected reading |
 | --- | --- | --- | --- |
@@ -173,7 +176,7 @@ Motivation (problem evidence; figures live in `paper_figures/motivation`):
 | M4 obsolete residency | `BLOCK_CACHE_OBSOLETE_SAMPLE` + timechart | `parse_obsolete_samples` | obsolete-byte ratio stays high over time (standard LRU) |
 | M5 entry-vs-byte | `BLOB_GC_FILE_GARBAGE_STATS.entry_ratio/byte_ratio` | `parse_garbage_ratios` | scatter departs from y=x: entry-ratio is a poor proxy for byte-ratio |
 
-Interface (benefit; figures live in `paper_figures/interface`, metrics from
+Interface (benefit; one-command figures live directly under `paper_figures`, metrics from
 statistics tickers in `out/updatex3.txt` + run timechart):
 
 | Fig | Cases | Expected (opt vs base / full vs stock) |
@@ -193,7 +196,7 @@ statistics tickers in `out/updatex3.txt` + run timechart):
      `GC_AWARE_CACHE_SIZE` so eviction actually happens.
    - precise entry-vs-byte not separated → values not all separated or sizes too
      uniform; ensure mixed range is all ≥ `blob_size` with a wide span
-     (current: 50% uniform [512,1024], 50% fixed 4096).
+     (current: 50% uniform [550,800], 50% fixed 16KB).
    - too few GC events → raise write volume (`UPDATE_REPEAT`) or lower
      `BLOB_GC_RATIO`; confirm run actually entered the run phase, not just load.
    - timeline empty → run-phase timechart missing; check `timechart=true` and the

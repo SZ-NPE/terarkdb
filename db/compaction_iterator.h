@@ -8,6 +8,7 @@
 #include <deque>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include "db/compaction.h"
@@ -85,8 +86,7 @@ class CompactionIterator {
                      const SequenceNumber preserve_deletes_seqnum = 0,
                      const chash_set<uint64_t>* b = nullptr,
                      HotnessTracker* hotness_tracker = nullptr,
-                     std::vector<std::pair<std::string, SequenceNumber>>*
-                         dropped_keys = nullptr,
+                     HotnessTracker::DroppedSeqsByKey* dropped_keys = nullptr,
                      size_t* dropped_keys_bytes = nullptr);
 
   // Constructor with custom CompactionProxy, used for tests.
@@ -105,8 +105,7 @@ class CompactionIterator {
                      const SequenceNumber preserve_deletes_seqnum = 0,
                      const chash_set<uint64_t>* b = nullptr,
                      HotnessTracker* hotness_tracker = nullptr,
-                     std::vector<std::pair<std::string, SequenceNumber>>*
-                         dropped_keys = nullptr,
+                     HotnessTracker::DroppedSeqsByKey* dropped_keys = nullptr,
                      size_t* dropped_keys_bytes = nullptr);
 
   ~CompactionIterator();
@@ -254,7 +253,7 @@ class CompactionIterator {
   // that it confirms are dead so that overwrite-heavy keys are routed to the
   // hot vSST on the next flush. This never affects compaction output.
   HotnessTracker* hotness_tracker_;
-  std::vector<std::pair<std::string, SequenceNumber>>* dropped_keys_;
+  HotnessTracker::DroppedSeqsByKey* dropped_keys_;
   size_t* dropped_keys_bytes_;
 
   // Records the (user_key, sequence) of the current entry into the hotness

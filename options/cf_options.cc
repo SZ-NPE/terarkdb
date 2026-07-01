@@ -206,18 +206,12 @@ void MutableCFOptions::Dump(Logger* log) const {
                  middle_combine_level);
   ROCKS_LOG_INFO(log, "                   enable_hotness_tracker: %d",
                  enable_hotness_tracker);
-  ROCKS_LOG_INFO(log, "                 hotness_window_capacity: %zu",
-                 hotness_window_capacity);
   ROCKS_LOG_INFO(log, "                    hotness_hot_capacity: %zu",
                  hotness_hot_capacity);
-  ROCKS_LOG_INFO(log, "             hotness_enable_write_window: %d",
-                 hotness_enable_write_window);
   ROCKS_LOG_INFO(log, "      hotness_enable_compaction_feedback: %d",
                  hotness_enable_compaction_feedback);
   ROCKS_LOG_INFO(log, "          hotness_enable_drop_key_cache: %d",
                  hotness_enable_drop_key_cache);
-  ROCKS_LOG_INFO(log, "              hotness_admit_threshold: %u",
-                 hotness_admit_threshold);
   ROCKS_LOG_INFO(log, "               hotness_decay_interval: %" PRIu64,
                  hotness_decay_interval);
   ROCKS_LOG_INFO(log, "                 hotness_decay_window: %" PRIu64,
@@ -228,6 +222,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  read_separated_value_by_handle);
   ROCKS_LOG_INFO(log, "                            blob_gc_ratio: %f",
                  blob_gc_ratio);
+  ROCKS_LOG_INFO(log, "              hot_warm_blob_gc_max_files: %" PRIu64,
+                 hot_warm_blob_gc_max_files);
   ROCKS_LOG_INFO(log, "                    byte_precise_gc: %d",
                  static_cast<int>(byte_precise_gc));
   ROCKS_LOG_INFO(log, "                               precise_gc: %d",
@@ -329,18 +325,16 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       middle_blob_size(options.middle_blob_size),
       middle_combine_level(options.middle_combine_level),
       enable_hotness_tracker(options.enable_hotness_tracker),
-      hotness_window_capacity(options.hotness_window_capacity),
       hotness_hot_capacity(options.hotness_hot_capacity),
-      hotness_enable_write_window(options.hotness_enable_write_window),
       hotness_enable_compaction_feedback(
           options.hotness_enable_compaction_feedback),
       hotness_enable_drop_key_cache(options.hotness_enable_drop_key_cache),
-      hotness_admit_threshold(options.hotness_admit_threshold),
       hotness_decay_interval(options.hotness_decay_interval),
       hotness_decay_window(options.hotness_decay_window),
       blob_large_key_ratio(options.blob_large_key_ratio),
       read_separated_value_by_handle(options.read_separated_value_by_handle),
       blob_gc_ratio(options.blob_gc_ratio),
+      hot_warm_blob_gc_max_files(options.hot_warm_blob_gc_max_files),
       byte_precise_gc(options.byte_precise_gc),
       precise_gc(options.precise_gc || options.byte_precise_gc),
       target_blob_file_size(options.target_blob_file_size),

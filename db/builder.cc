@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 
 #include "db/compaction_iterator.h"
@@ -352,6 +353,7 @@ Status BuildTable(
     if (cfd) {
       hotness_tracker = cfd->hotness_tracker();
     }
+    std::unordered_set<uint32_t> cold_observation_buckets;
 
     auto trans_to_separate = [&](const Slice& key, LazyBuffer& value,
                                  SeparateHelper::ValueMetaData* value_meta) {
@@ -359,8 +361,10 @@ Status BuildTable(
       Status status;
 
       auto route = HotnessTracker::FlushRoute::kWarm;
+      uint32_t routing_bucket = 0;
       if (hotness_tracker) {
         Slice user_key = ExtractUserKey(key);
+        routing_bucket = hotness_tracker->RoutingBucketForKey(user_key);
         route = hotness_tracker->ClassifyForFlush(user_key);
       }
       auto s = value.fetch();
@@ -453,6 +457,10 @@ Status BuildTable(
             RecordTick(ioptions.statistics, HOTNESS_FLUSH_COLD_KEYS);
             RecordTick(ioptions.statistics, HOTNESS_FLUSH_COLD_BYTES,
                        route_record_bytes);
+          }
+          if (hotness_tracker &&
+              route != HotnessTracker::FlushRoute::kEphemeral) {
+            cold_observation_buckets.insert(routing_bucket);
           }
         FileMetaData& blob_meta = current_blob_meta(bstate);
         blob_meta.UpdateBoundaries(key, GetInternalKeySeqno(key));
@@ -671,6 +679,15 @@ Status BuildTable(
           break;
         }
       }
+    }
+    if (s.ok() && !empty && hotness_tracker &&
+        !cold_observation_buckets.empty()) {
+      std::vector<uint32_t> cold_batch;
+      cold_batch.reserve(cold_observation_buckets.size());
+      for (uint32_t bucket : cold_observation_buckets) {
+        cold_batch.push_back(bucket);
+      }
+      hotness_tracker->ApplyColdObservationBatch(cold_batch);
     }
   }
 

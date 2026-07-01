@@ -186,21 +186,19 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.middle_blob_size = mutable_cf_options.middle_blob_size;
   cf_opts.middle_combine_level = mutable_cf_options.middle_combine_level;
   cf_opts.enable_hotness_tracker = mutable_cf_options.enable_hotness_tracker;
-  cf_opts.hotness_window_capacity = mutable_cf_options.hotness_window_capacity;
   cf_opts.hotness_hot_capacity = mutable_cf_options.hotness_hot_capacity;
-  cf_opts.hotness_enable_write_window =
-      mutable_cf_options.hotness_enable_write_window;
   cf_opts.hotness_enable_compaction_feedback =
       mutable_cf_options.hotness_enable_compaction_feedback;
   cf_opts.hotness_enable_drop_key_cache =
       mutable_cf_options.hotness_enable_drop_key_cache;
-  cf_opts.hotness_admit_threshold = mutable_cf_options.hotness_admit_threshold;
   cf_opts.hotness_decay_interval = mutable_cf_options.hotness_decay_interval;
   cf_opts.hotness_decay_window = mutable_cf_options.hotness_decay_window;
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.read_separated_value_by_handle =
       mutable_cf_options.read_separated_value_by_handle;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
+  cf_opts.hot_warm_blob_gc_max_files =
+      mutable_cf_options.hot_warm_blob_gc_max_files;
   cf_opts.byte_precise_gc = mutable_cf_options.byte_precise_gc;
   cf_opts.precise_gc = mutable_cf_options.precise_gc ||
                        mutable_cf_options.byte_precise_gc;
@@ -2002,24 +2000,15 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::enable_hotness_tracker),
           OptionType::kBoolean, OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, enable_hotness_tracker)}},
-        {"hotness_window_capacity",
-         {offset_of(&ColumnFamilyOptions::hotness_window_capacity),
-          OptionType::kSizeT, OptionVerificationType::kNormal, false, 0}},
         {"hotness_hot_capacity",
          {offset_of(&ColumnFamilyOptions::hotness_hot_capacity),
           OptionType::kSizeT, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_enable_write_window",
-         {offset_of(&ColumnFamilyOptions::hotness_enable_write_window),
-          OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"hotness_enable_compaction_feedback",
          {offset_of(&ColumnFamilyOptions::hotness_enable_compaction_feedback),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
         {"hotness_enable_drop_key_cache",
          {offset_of(&ColumnFamilyOptions::hotness_enable_drop_key_cache),
           OptionType::kBoolean, OptionVerificationType::kNormal, false, 0}},
-        {"hotness_admit_threshold",
-         {offset_of(&ColumnFamilyOptions::hotness_admit_threshold),
-          OptionType::kUInt32T, OptionVerificationType::kNormal, false, 0}},
         {"hotness_decay_interval",
          {offset_of(&ColumnFamilyOptions::hotness_decay_interval),
           OptionType::kUInt64T, OptionVerificationType::kNormal, false, 0}},
@@ -2038,6 +2027,10 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::blob_gc_ratio), OptionType::kDouble,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, blob_gc_ratio)}},
+        {"hot_warm_blob_gc_max_files",
+         {offset_of(&ColumnFamilyOptions::hot_warm_blob_gc_max_files),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, hot_warm_blob_gc_max_files)}},
         {"byte_precise_gc",
          {offset_of(&ColumnFamilyOptions::byte_precise_gc),
           OptionType::kBoolean, OptionVerificationType::kNormal,

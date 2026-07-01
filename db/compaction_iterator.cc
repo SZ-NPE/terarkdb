@@ -121,7 +121,7 @@ CompactionIterator::CompactionIterator(
     const SequenceNumber preserve_deletes_seqnum,
     const chash_set<uint64_t>* need_rebuild_blobs,
     HotnessTracker* hotness_tracker,
-    std::vector<std::pair<std::string, SequenceNumber>>* dropped_keys,
+    HotnessTracker::DroppedSeqsByKey* dropped_keys,
     size_t* dropped_keys_bytes)
     : CompactionIterator(
           input, separate_helper, end, cmp, merge_helper, last_sequence,
@@ -147,7 +147,7 @@ CompactionIterator::CompactionIterator(
     const SequenceNumber preserve_deletes_seqnum,
     const chash_set<uint64_t>* need_rebuild_blobs,
     HotnessTracker* hotness_tracker,
-    std::vector<std::pair<std::string, SequenceNumber>>* dropped_keys,
+    HotnessTracker::DroppedSeqsByKey* dropped_keys,
     size_t* dropped_keys_bytes)
     : input_(input, separate_helper),
       end_(end),
@@ -260,7 +260,14 @@ void CompactionIterator::MaybeRecordDroppedKey(const ParsedInternalKey& ikey) {
        entry_charge > kMaxPendingDroppedKeyBytes - *dropped_keys_bytes_)) {
     return;
   }
-  dropped_keys_->emplace_back(ikey.user_key.ToString(), ikey.sequence);
+  std::string user_key = ikey.user_key.ToString();
+  auto& seqs = (*dropped_keys_)[user_key];
+  for (SequenceNumber seq : seqs) {
+    if (seq == ikey.sequence) {
+      return;
+    }
+  }
+  seqs.push_back(ikey.sequence);
   if (dropped_keys_bytes_ != nullptr) {
     *dropped_keys_bytes_ += entry_charge;
   }
@@ -960,6 +967,18 @@ void CompactionIterator::PrepareOutput() {
     } else {
       if (!blob_config_.read_separated_value_by_handle) {
         output_value_meta_.block_handle = BlockHandle();
+      }
+      if (output_value_meta_.value_size == 0 &&
+          input_.separate_helper()->ShouldUpdateValueSize()) {
+        auto s = value_.fetch();
+        if (!s.ok()) {
+          valid_ = false;
+          status_ = std::move(s);
+          return;
+        }
+        if (!set_output_value_size()) {
+          return;
+        }
       }
       auto s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_, &output_value_meta_,

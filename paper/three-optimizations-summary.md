@@ -42,21 +42,36 @@ This leads to:
 
 ### Method
 
-- Hotness tracking and compaction feedback identify hot and cold data.
+- Background compaction feedback identifies hot overwrite/drop patterns; foreground write-window learning is no longer part of the current mechanism.
+- Routing heat is approximate hash-bucket state with a strong-hot threshold, while cold routing is coarse two-epoch miss evidence collected after successful flushes.
 - Flush and compaction output route values by temperature so garbage becomes more concentrated.
-- The drop-key cache records overwritten or deleted keys so GC can skip part of the expensive reverse-lookup path.
+- The drop-key cache records exact `(user_key, sequence)` pairs for compaction-confirmed dropped separated values so GC can skip part of the expensive reverse-lookup path without false positives.
+- Cold vSSTs keep the normal `blob_gc_ratio` trigger. Hot/warm vSSTs are
+  normally reclaimed only when their entry or byte garbage ratio reaches 100%,
+  favoring whole-file deletion instead of relocating still-hot live values.
+- The hot/warm policy has a single max-file threshold: if the number of
+  hot/warm vSSTs exceeds `hot_warm_blob_gc_max_files`, they fall back to the
+  normal `blob_gc_ratio` trigger; otherwise the 100%-garbage policy is used.
+- Hot/warm vSSTs must not be selected for GC only because their file size is
+  below the small-file defragmentation threshold.
 
 ### Boundary
 
 - The benefit depends on clear hot/cold skew; uniform updates provide limited signal.
 - It reduces inefficient GC work but does not remove GC.
-- The drop-key cache is not a complete version index; it accelerates only safely identifiable records.
-- Tracking and cache maintenance add overhead, so the hotness interface ablation is required to validate net benefit.
+- The routing heat surface is approximate and may collide by hash bucket; it is intentionally not a per-key hot LRU.
+- The drop-key cache is not a complete version index; it accelerates only safely identifiable records and cache eviction may turn a potential hit into a safe miss.
+- Tracking and cache maintenance are moved to background batch publication where possible, but the hotness interface ablation is still required to validate net benefit.
+- The hot/warm 100%-garbage policy needs count-based fallback to avoid
+  unbounded file-count or space-amplification growth when a small amount of live
+  data remains in otherwise obsolete hot/warm vSSTs.
 
 ### Evidence form
 
 - M1/M2/M3 show garbage distribution, GC I/O, and foreground disturbance.
-- `hotness_base` vs `hotness_opt` validates the optimization benefit.
+- `hotness_base` vs `hotness_opt` must show the core expected benefits:
+  more colored dropped-key records, shorter GC task duration, fewer GC read
+  bytes, lower space amplification, and fewer reverse lookups.
 
 ---
 
@@ -79,7 +94,9 @@ The cache policy uses GC and file-obsolescence information to demote or evict ob
 ### Evidence form
 
 - M4 shows obsolete block residency.
-- `gc_cache_base` vs `gc_cache_opt` validates cache and read-performance benefit.
+- `gc_cache_base` vs `gc_cache_opt` must show the core expected benefits:
+  lower read latency, higher block-cache hit rate, and higher reverse-lookup
+  hit rate.
 
 ---
 
@@ -111,7 +128,8 @@ This is not the old `enable_delta_separate`, `middle_blob_size`, `middle_combine
 ### Evidence form
 
 - M5 shows divergence between entry ratio and byte ratio (entry ratio is a poor proxy for reclaimable bytes under mixed values).
-- `precise_base` vs `precise_opt` validates benefit under mixed-value workloads.
+- `precise_base` vs `precise_opt` must show the core expected benefits:
+  fewer GC read bytes, higher throughput, and lower space amplification.
 
 ---
 
