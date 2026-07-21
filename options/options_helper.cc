@@ -171,6 +171,9 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.blob_size = mutable_cf_options.blob_size;
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
+  cf_opts.blob_gc_defer_enabled =
+      mutable_cf_options.blob_gc_defer_enabled;
+  cf_opts.blob_gc_defer_ratio = mutable_cf_options.blob_gc_defer_ratio;
   cf_opts.target_blob_file_size = mutable_cf_options.target_blob_file_size;
   cf_opts.blob_file_defragment_size =
       mutable_cf_options.blob_file_defragment_size;
@@ -1935,6 +1938,14 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::blob_gc_ratio), OptionType::kDouble,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, blob_gc_ratio)}},
+        {"blob_gc_defer_enabled",
+         {offset_of(&ColumnFamilyOptions::blob_gc_defer_enabled),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, blob_gc_defer_enabled)}},
+        {"blob_gc_defer_ratio",
+         {offset_of(&ColumnFamilyOptions::blob_gc_defer_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, blob_gc_defer_ratio)}},
         {"target_blob_file_size",
          {offset_of(&ColumnFamilyOptions::target_blob_file_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal, true,

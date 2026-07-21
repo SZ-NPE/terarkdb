@@ -25,13 +25,16 @@
 #include <stdlib.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "db/db_impl.h"
 #include "db/malloc_stats.h"
@@ -155,6 +158,10 @@ DEFINE_string(
     "\treadmissing   -- read N missing keys in random order\n"
     "\treadwhilewriting      -- 1 writer, N threads doing random "
     "reads\n"
+    "\tmultireadwriting      -- split foreground threads into random readers "
+    "and random writers\n"
+    "\tmultiscanwriting      -- split foreground threads into range scanners "
+    "and random writers\n"
     "\treadwhilemerging      -- 1 merger, N threads doing random "
     "reads\n"
     "\treadwhilescanning     -- 1 thread doing full table scan, "
@@ -299,6 +306,10 @@ DEFINE_double(read_random_exp_range, 0.0,
               "num * exp(-r) where r is uniform number from 0 to this value. "
               "The larger the number is, the more skewed the reads are. "
               "Only used in readrandom and multireadrandom benchmarks.");
+
+DEFINE_double(read_random_zipfian_alpha, 0.0,
+              "If positive, read random keys are generated from a Zipfian "
+              "distribution with this alpha. Overrides read_random_exp_range.");
 
 DEFINE_bool(histogram, false, "Print histogram of operation timings");
 
@@ -487,6 +498,9 @@ DEFINE_int32(
     read_amp_bytes_per_bit,
     TERARKDB_NAMESPACE::BlockBasedTableOptions().read_amp_bytes_per_bit,
     "Number of bytes per bit to be used in block read-amp bitmap");
+
+DEFINE_int32(scan_length, 128,
+             "Number of Next() calls per scan in multiscanwriting.");
 
 DEFINE_bool(
     enable_index_compression,
@@ -976,6 +990,12 @@ DEFINE_uint64(blob_size, size_t(-1), "Key Value Separate blob size");
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
 DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
+
+DEFINE_bool(blob_gc_defer_enabled, false,
+            "Enable deferred automatic Blob SST GC ratio floor");
+
+DEFINE_double(blob_gc_defer_ratio, 0.65,
+              "Deferred automatic Blob SST GC ratio floor");
 
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
@@ -2079,9 +2099,12 @@ class Benchmark {
   int64_t reads_;
   int64_t deletes_;
   double read_random_exp_range_;
+  double read_random_zipfian_alpha_;
+  std::vector<long double> zipfian_cdf_;
   int64_t writes_;
   int64_t readwrites_;
   int64_t merge_keys_;
+  int active_read_threads_;
   bool report_file_operations_;
 
   class ErrorHandlerListener : public EventListener {
@@ -2403,12 +2426,14 @@ class Benchmark {
         entries_per_batch_(1),
         reads_(FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads),
         read_random_exp_range_(0.0),
+        read_random_zipfian_alpha_(0.0),
         writes_(FLAGS_writes < 0 ? FLAGS_num : FLAGS_writes),
         readwrites_(
             (FLAGS_writes < 0 && FLAGS_reads < 0)
                 ? FLAGS_num
                 : ((FLAGS_writes > FLAGS_reads) ? FLAGS_writes : FLAGS_reads)),
         merge_keys_(FLAGS_merge_keys < 0 ? FLAGS_num : FLAGS_merge_keys),
+        active_read_threads_(-1),
         report_file_operations_(FLAGS_report_file_operations) {
     // use simcache instead of cache
     if (FLAGS_simcache_size >= 0) {
@@ -2601,6 +2626,8 @@ class Benchmark {
       max_num_range_tombstones_ = FLAGS_max_num_range_tombstones;
       write_options_ = WriteOptions();
       read_random_exp_range_ = FLAGS_read_random_exp_range;
+      read_random_zipfian_alpha_ = FLAGS_read_random_zipfian_alpha;
+      BuildZipfianCdf();
       if (FLAGS_sync) {
         write_options_.sync = true;
       }
@@ -2611,6 +2638,7 @@ class Benchmark {
 
       bool fresh_db = false;
       int num_threads = FLAGS_threads;
+      active_read_threads_ = -1;
       if (FLAGS_write_threads >= 0 && FLAGS_read_threads >= 0)
         num_threads = FLAGS_write_threads + FLAGS_read_threads;
 
@@ -2744,13 +2772,11 @@ class Benchmark {
         num_threads++;  // Add extra thread for writing
         method = &Benchmark::ReadWhileWriting;
       } else if (name == "multireadwriting") {
-        if (FLAGS_read_threads < 0 || FLAGS_write_threads < 0) {
-          fprintf(stdout,
-                  "readwhilewriting must specify the read_threads and "
-                  "write_threads");
-          exit(1);
-        }
+        num_threads = ConfigureReadWriteThreads("multireadwriting");
         method = &Benchmark::MultiReadWriting;
+      } else if (name == "multiscanwriting") {
+        num_threads = ConfigureReadWriteThreads("multiscanwriting");
+        method = &Benchmark::MultiScanWriting;
       } else if (name == "readwhilemerging") {
         num_threads++;  // Add extra thread for writing
         method = &Benchmark::ReadWhileMerging;
@@ -3024,7 +3050,9 @@ class Benchmark {
       arg[i].thread = new ThreadState(i);
       arg[i].thread->stats.SetReporterAgent(reporter_agent.get());
       arg[i].thread->shared = &shared;
-      if (i < FLAGS_read_threads) arg[i].thread->write = false;
+      if (active_read_threads_ >= 0 && i < active_read_threads_) {
+        arg[i].thread->write = false;
+      }
       FLAGS_env->StartThread(ThreadBody, &arg[i]);
     }
 
@@ -3571,6 +3599,8 @@ class Benchmark {
     options.blob_size = FLAGS_blob_size;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
+    options.blob_gc_defer_enabled = FLAGS_blob_gc_defer_enabled;
+    options.blob_gc_defer_ratio = FLAGS_blob_gc_defer_ratio;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;
@@ -4479,7 +4509,16 @@ class Benchmark {
   int64_t GetRandomKey(Random64* rand) {
     uint64_t rand_int = rand->Next();
     int64_t key_rand;
-    if (read_random_exp_range_ == 0) {
+    if (read_random_zipfian_alpha_ > 0.0 && !zipfian_cdf_.empty()) {
+      const uint64_t kBigInt = static_cast<uint64_t>(1U) << 62;
+      long double p = static_cast<long double>(rand_int % kBigInt) /
+                      static_cast<long double>(kBigInt);
+      auto it = std::lower_bound(zipfian_cdf_.begin(), zipfian_cdf_.end(), p);
+      key_rand = static_cast<int64_t>(it - zipfian_cdf_.begin());
+      if (key_rand >= FLAGS_num) {
+        key_rand = FLAGS_num - 1;
+      }
+    } else if (read_random_exp_range_ == 0) {
       key_rand = rand_int % FLAGS_num;
     } else {
       const uint64_t kBigInt = static_cast<uint64_t>(1U) << 62;
@@ -4495,6 +4534,54 @@ class Benchmark {
       key_rand = static_cast<int64_t>((rand_num * kBigPrime) % FLAGS_num);
     }
     return key_rand;
+  }
+
+  void BuildZipfianCdf() {
+    zipfian_cdf_.clear();
+    if (read_random_zipfian_alpha_ <= 0.0 || FLAGS_num <= 0) {
+      return;
+    }
+    zipfian_cdf_.resize(static_cast<size_t>(FLAGS_num));
+    long double sum = 0.0;
+    for (int64_t i = 0; i < FLAGS_num; ++i) {
+      sum += 1.0L / std::pow(static_cast<long double>(i + 1),
+                             read_random_zipfian_alpha_);
+      zipfian_cdf_[static_cast<size_t>(i)] = sum;
+    }
+    for (auto& v : zipfian_cdf_) {
+      v /= sum;
+    }
+    zipfian_cdf_.back() = 1.0;
+  }
+
+  int ConfigureReadWriteThreads(const char* benchmark_name) {
+    int active_write_threads = -1;
+    if (FLAGS_read_threads < 0 && FLAGS_write_threads < 0) {
+      if (FLAGS_threads < 2 || FLAGS_threads % 2 != 0) {
+        fprintf(stdout,
+                "%s requires an even --threads value >= 2 when "
+                "--read_threads/--write_threads are not specified\n",
+                benchmark_name);
+        exit(1);
+      }
+      active_read_threads_ = FLAGS_threads / 2;
+      active_write_threads = FLAGS_threads / 2;
+    } else if (FLAGS_read_threads < 0 || FLAGS_write_threads < 0) {
+      fprintf(stdout,
+              "%s must specify both --read_threads and --write_threads, or "
+              "neither\n",
+              benchmark_name);
+      exit(1);
+    } else {
+      active_read_threads_ = FLAGS_read_threads;
+      active_write_threads = FLAGS_write_threads;
+    }
+    if (active_read_threads_ <= 0 || active_write_threads <= 0) {
+      fprintf(stdout, "%s requires positive read and write thread counts\n",
+              benchmark_name);
+      exit(1);
+    }
+    return active_read_threads_ + active_write_threads;
   }
 
   void ReadRandom(ThreadState* thread) {
@@ -4803,6 +4890,56 @@ class Benchmark {
     }
   }
 
+  void ScanRandom(ThreadState* thread) {
+    if (FLAGS_num_multi_db > 0) {
+      fprintf(stderr, "multiscanwriting does not support multiple DBs.\n");
+      abort();
+    }
+    assert(db_.db != nullptr);
+    ReadOptions options(FLAGS_verify_checksum, true);
+    std::unique_ptr<Iterator> iter(db_.db->NewIterator(options));
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    int64_t scanned = 0;
+    int64_t scan_rounds = 0;
+    int64_t bytes = 0;
+    Duration duration(FLAGS_duration, reads_);
+
+    while (!duration.Done(1)) {
+      GenerateKeyFromInt(GetRandomKey(&thread->rand), FLAGS_num, &key, -1);
+      iter->Seek(key);
+      scan_rounds++;
+      for (int i = 0; i < FLAGS_scan_length && iter->Valid(); ++i) {
+        bytes += iter->key().size() + iter->value().size();
+        iter->Next();
+        scanned++;
+        thread->stats.FinishedOps(nullptr, db_.db, 1, kRead);
+        if (duration.Done(0)) {
+          break;
+        }
+      }
+      if (!iter->status().ok()) {
+        fprintf(stderr, "Iterator error: %s\n",
+                iter->status().ToString().c_str());
+        abort();
+      }
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "( scan_rounds:%" PRIu64 " scanned:%" PRIu64
+                               " scan_length:%d )",
+             scan_rounds, scanned, FLAGS_scan_length);
+    thread->stats.AddBytes(bytes);
+    thread->stats.AddMessage(msg);
+  }
+
+  void MultiScanWriting(ThreadState* thread) {
+    if (!thread->write) {
+      ScanRandom(thread);
+    } else {
+      DoWrite(thread, RANDOM);
+    }
+  }
+
   void BGWriter(ThreadState* thread, enum OperationType write_merge) {
     // Special thread that keeps writing until other threads are done.
     RandomGenerator gen;
@@ -5080,7 +5217,6 @@ class Benchmark {
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
       DB* db = SelectDB(thread);
-      GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key, -1);
       if (get_weight == 0 && put_weight == 0) {
         // one batch completed, reinitialize for next batch
         get_weight = FLAGS_readwritepercent;
@@ -5088,6 +5224,7 @@ class Benchmark {
       }
       if (get_weight > 0) {
         // do all the gets first
+        GenerateKeyFromInt(GetRandomKey(&thread->rand), FLAGS_num, &key, -1);
         Status s = db->Get(options, key, &value);
         if (!s.ok() && !s.IsNotFound()) {
           fprintf(stderr, "get error: %s\n", s.ToString().c_str());
@@ -5102,6 +5239,7 @@ class Benchmark {
       } else if (put_weight > 0) {
         // then do all the corresponding number of puts
         // for all the gets we have done earlier
+        GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key, -1);
         Status s = db->Put(write_options_, key, gen.Generate(value_size_));
         if (!s.ok()) {
           fprintf(stderr, "put error: %s\n", s.ToString().c_str());

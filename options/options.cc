@@ -270,6 +270,12 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log, "                          Options.blob_gc_ratio: %f",
                    blob_gc_ratio);
   ROCKS_LOG_HEADER(log,
+                   "                  Options.blob_gc_defer_enabled: %d",
+                   blob_gc_defer_enabled);
+  ROCKS_LOG_HEADER(log,
+                   "                    Options.blob_gc_defer_ratio: %f",
+                   blob_gc_defer_ratio);
+  ROCKS_LOG_HEADER(log,
                    "                  Options.target_blob_file_size: %" PRIu64,
                    target_blob_file_size);
   ROCKS_LOG_HEADER(log,

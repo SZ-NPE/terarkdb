@@ -316,6 +316,14 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // valid [0 , 0.5]
   double blob_gc_ratio = 0.05;
 
+  // If true, use blob_gc_defer_ratio as a floor for automatic vSST GC
+  // selection. Marked-for-compaction files can still be selected.
+  bool blob_gc_defer_enabled = true;
+
+  // Effective automatic vSST GC ratio is max(blob_gc_ratio,
+  // blob_gc_defer_ratio) when blob_gc_defer_enabled is true.
+  double blob_gc_defer_ratio = 1.0;
+
   // Blob file size
   // Default : same as bottommost level sst file size
   uint64_t target_blob_file_size = 0;

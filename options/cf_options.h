@@ -159,6 +159,8 @@ struct MutableCFOptions {
         blob_size(0),
         blob_large_key_ratio(0),
         blob_gc_ratio(0),
+        blob_gc_defer_enabled(true),
+        blob_gc_defer_ratio(1.0),
         target_blob_file_size(0),
         blob_file_defragment_size(0),
         max_dependence_blob_overlap(0),
@@ -220,6 +222,8 @@ struct MutableCFOptions {
   size_t blob_size;
   double blob_large_key_ratio;
   double blob_gc_ratio;
+  bool blob_gc_defer_enabled;
+  double blob_gc_defer_ratio;
   uint64_t target_blob_file_size;
   uint64_t blob_file_defragment_size;
   size_t max_dependence_blob_overlap;

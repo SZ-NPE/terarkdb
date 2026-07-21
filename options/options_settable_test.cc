@@ -475,6 +475,8 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "blob_large_key_ratio=0.5;"
       "blob_size=1024;"
       "blob_gc_ratio=0.05;"
+      "blob_gc_defer_enabled=true;"
+      "blob_gc_defer_ratio=0.65;"
       "target_blob_file_size=0;"
       "blob_file_defragment_size=0;"
       "max_dependence_blob_overlap=1024;"

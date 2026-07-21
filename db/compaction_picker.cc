@@ -857,6 +857,11 @@ Compaction* CompactionPicker::PickGarbageCollection(
   if (fragment_size == 0) {
     fragment_size = target_blob_file_size / 8;
   }
+  const double effective_gc_ratio =
+      mutable_cf_options.blob_gc_defer_enabled
+          ? std::max(mutable_cf_options.blob_gc_ratio,
+                     mutable_cf_options.blob_gc_defer_ratio)
+          : mutable_cf_options.blob_gc_ratio;
   // Preferentially select files marked by high priority
   auto candidate_cmp = [](const GarbageFileInfo& l, const GarbageFileInfo& r) {
     assert(l.f != nullptr && !l.f->being_compacted);
@@ -885,7 +890,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
 
   if (dirtiest_blob.f == nullptr ||
       (!dirtiest_blob.f->marked_for_compaction &&
-       dirtiest_blob.score < mutable_cf_options.blob_gc_ratio)) {
+       dirtiest_blob.score < effective_gc_ratio)) {
     return nullptr;
   }
   // Set up inputs for garbage collection.
@@ -941,7 +946,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
     if (f->is_gc_permitted() && !f->being_compacted) {
       GarbageFileInfo gc_blob(f);
       if (gc_blob.estimate_size <= fragment_size ||
-          gc_blob.score >= mutable_cf_options.blob_gc_ratio ||
+          gc_blob.score >= effective_gc_ratio ||
           gc_blob.f->marked_for_compaction) {
         candidate_blob_vec.emplace_back(gc_blob);
       }
