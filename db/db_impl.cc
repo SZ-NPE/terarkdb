@@ -1814,6 +1814,14 @@ bool DBImpl::SetPreserveDeletesSequenceNumber(SequenceNumber seqnum) {
 InternalIterator* DBImpl::NewInternalIterator(
     Arena* arena, RangeDelAggregator* range_del_agg, SequenceNumber sequence,
     ColumnFamilyHandle* column_family, SeparateHelper** separate_helper) {
+  return NewInternalIterator(ReadOptions(), arena, range_del_agg, sequence,
+                             column_family, separate_helper);
+}
+
+InternalIterator* DBImpl::NewInternalIterator(
+    const ReadOptions& read_options, Arena* arena,
+    RangeDelAggregator* range_del_agg, SequenceNumber sequence,
+    ColumnFamilyHandle* column_family, SeparateHelper** separate_helper) {
   ColumnFamilyData* cfd;
   if (column_family == nullptr) {
     cfd = default_cf_handle_->cfd();
@@ -1825,12 +1833,11 @@ InternalIterator* DBImpl::NewInternalIterator(
   mutex_.Lock();
   SuperVersion* super_version = cfd->GetSuperVersion()->Ref();
   mutex_.Unlock();
-  ReadOptions roptions;
   if (separate_helper != nullptr) {
     *separate_helper = super_version->current;
   }
-  return NewInternalIterator(roptions, cfd, super_version, arena, range_del_agg,
-                             sequence);
+  return NewInternalIterator(read_options, cfd, super_version, arena,
+                             range_del_agg, sequence);
 }
 
 void DBImpl::SchedulePurge() {
@@ -2809,7 +2816,7 @@ Iterator* DBImpl::NewIterator(const ReadOptions& read_options,
         env_, read_options, *cfd->ioptions(), sv->mutable_cf_options,
         cfd->user_comparator(), iter, iter, kMaxSequenceNumber, sv->current,
         sv->mutable_cf_options.max_sequential_skip_in_iterations, read_callback,
-        this, cfd);
+        this, cfd, sv->current);
 #endif
   } else {
     // Note: no need to consider the special case of
@@ -2881,7 +2888,8 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(const ReadOptions& read_options,
   InternalIterator* internal_iter =
       NewInternalIterator(read_options, cfd, sv, db_iter->GetArena(),
                           db_iter->GetRangeDelAggregator(), snapshot);
-  db_iter->SetIterUnderDBIter(internal_iter, nullptr, sv->current);
+  db_iter->SetIterUnderDBIter(internal_iter, nullptr, sv->current,
+                              sv->current);
 
   return db_iter;
 }
@@ -2916,7 +2924,7 @@ Status DBImpl::NewIterators(
           env_, read_options, *cfd->ioptions(), sv->mutable_cf_options,
           cfd->user_comparator(), iter, iter, kMaxSequenceNumber, sv->current,
           sv->mutable_cf_options.max_sequential_skip_in_iterations,
-          read_callback, this, cfd));
+          read_callback, this, cfd, sv->current));
     }
 #endif
   } else {

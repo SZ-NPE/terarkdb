@@ -51,7 +51,7 @@ Status CompactedDBImpl::Get(const ReadOptions& options, ColumnFamilyHandle*,
                             const Slice& key, LazyBuffer* value) {
   GetContext get_context(user_comparator_, nullptr, nullptr, nullptr,
                          GetContext::kNotFound, key, value, nullptr, nullptr,
-                         version_, nullptr, nullptr);
+                         version_, nullptr, nullptr, nullptr, nullptr, &options);
   SequenceNumber snapshot;
   if (options.snapshot != nullptr) {
     snapshot = reinterpret_cast<const SnapshotImpl*>(options.snapshot)->number_;
@@ -98,7 +98,8 @@ std::vector<Status> CompactedDBImpl::MultiGet(
       LazyBuffer lazy_val(&value);
       GetContext get_context(user_comparator_, nullptr, nullptr, nullptr,
                              GetContext::kNotFound, keys[idx], &lazy_val,
-                             nullptr, nullptr, version_, nullptr, nullptr);
+                             nullptr, nullptr, version_, nullptr, nullptr,
+                             nullptr, nullptr, &options);
       LookupKey lkey(keys[idx], kMaxSequenceNumber);
       r->Get(options, lkey.internal_key(), &get_context, nullptr);
       if (get_context.State() == GetContext::kFound) {

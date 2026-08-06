@@ -54,7 +54,8 @@ class GetContext {
              const Slice& user_key, LazyBuffer* value, bool* value_found,
              MergeContext* merge_context, const SeparateHelper* separate_helper,
              SequenceNumber* max_covering_tombstone_seq, Env* env,
-             SequenceNumber* seq = nullptr, ReadCallback* callback = nullptr);
+             SequenceNumber* seq = nullptr, ReadCallback* callback = nullptr,
+             const ReadOptions* read_options = nullptr);
 
   void MarkKeyMayExist();
 
@@ -122,6 +123,8 @@ class GetContext {
   // For Merge, don't accept key while seq type less than min_seq_type
   uint64_t min_seq_type_;
   ReadCallback* callback_;
+  // Borrowed only for the synchronous TableReader::Get call.
+  const ReadOptions* read_options_;
   bool sample_;
   bool is_index_;
   bool is_finished_;

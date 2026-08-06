@@ -309,7 +309,9 @@ InternalIterator* TableCache::NewIterator(
         create_new_table_reader = true;
       }
     } else {
-      readahead = options.readahead_size;
+      readahead = options.read_tier == kBlockCacheTier
+                      ? 0
+                      : options.readahead_size;
       create_new_table_reader = readahead > 0;
     }
   }

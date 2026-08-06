@@ -17,6 +17,7 @@
 #include "rocksdb/iterator.h"
 #include "rocksdb/terark_namespace.h"
 #include "rocksdb/utilities/date_tiered_db.h"
+#include "table/iterator_wrapper.h"
 #include "table/merging_iterator.h"
 #include "util/coding.h"
 #include "util/filename.h"
@@ -390,18 +391,27 @@ Iterator* DateTieredDBImpl::NewIterator(const ReadOptions& opts) {
     auto handle = handle_map_.begin()->second;
     SeparateHelper* separate_helper;
     auto internal_iter = db_impl->NewInternalIterator(
-        arena, db_iter->GetRangeDelAggregator(), kMaxSequenceNumber, handle,
-        &separate_helper);
-    db_iter->SetIterUnderDBIter(internal_iter, nullptr, separate_helper);
+        opts, arena, db_iter->GetRangeDelAggregator(), kMaxSequenceNumber,
+        handle, &separate_helper);
+    auto combined = arena->AllocateAligned(sizeof(CombinedInternalIterator));
+    auto combined_iter =
+        new (combined) CombinedInternalIterator(internal_iter, separate_helper,
+                                                opts);
+    combined_iter->RegisterCleanup(
+        [](void* arg1, void* /*arg2*/) {
+          static_cast<InternalIterator*>(arg1)->~InternalIterator();
+        },
+        internal_iter, nullptr);
+    db_iter->SetIterUnderDBIter(combined_iter, nullptr, nullptr);
   } else {
     MergeIteratorBuilder builder(&icomp_, arena);
     for (auto& item : handle_map_) {
       auto handle = item.second;
       SeparateHelper* separate_helper;
       auto internal_iter = db_impl->NewInternalIterator(
-          arena, db_iter->GetRangeDelAggregator(), kMaxSequenceNumber, handle,
-          &separate_helper);
-      builder.AddIterator(internal_iter, separate_helper);
+          opts, arena, db_iter->GetRangeDelAggregator(), kMaxSequenceNumber,
+          handle, &separate_helper);
+      builder.AddIterator(internal_iter, separate_helper, opts);
     }
     auto internal_iter = builder.Finish();
     db_iter->SetIterUnderDBIter(internal_iter, nullptr, nullptr);

@@ -12,7 +12,10 @@
 #include <memory>
 
 #include "port/port.h"
+#include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
+#include "rocksdb/statistics.h"
+#include "rocksdb/table.h"
 #include "rocksdb/terark_namespace.h"
 #include "rocksdb/utilities/date_tiered_db.h"
 #include "util/logging.h"
@@ -122,6 +125,54 @@ class DateTieredTest : public testing::Test {
   }
 
   void Sleep(int64_t sleep_time) { env_->Sleep(sleep_time); }
+
+  void EnableValueSeparation() {
+    options_.statistics = CreateDBStatistics();
+    options_.blob_size = 32;
+    options_.target_blob_file_size = 1 << 20;
+    options_.disable_auto_compactions = true;
+    options_.compression = kNoCompression;
+    BlockBasedTableOptions table_options;
+    table_options.block_cache = NewLRUCache(8 << 20);
+    table_options.block_size = 1024;
+    options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  }
+
+  uint64_t TickerCount(Tickers ticker) const {
+    return options_.statistics->getTickerCount(ticker);
+  }
+
+  void CheckCacheOnlyIterator(const std::string& key,
+                              const std::string& expected_value) {
+    ReadOptions cache_only;
+    cache_only.read_tier = kBlockCacheTier;
+    cache_only.readahead_size = 4096;
+    const uint64_t num_file_opens = TickerCount(NO_FILE_OPENS);
+    const uint64_t cache_adds = TickerCount(BLOCK_CACHE_ADD);
+    std::unique_ptr<Iterator> iter(date_tiered_db_->NewIterator(cache_only));
+    iter->Seek(key);
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(key, iter->key().ToString());
+    ASSERT_FALSE(iter->value().valid());
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsIncomplete());
+    ASSERT_EQ(num_file_opens, TickerCount(NO_FILE_OPENS));
+    ASSERT_EQ(cache_adds, TickerCount(BLOCK_CACHE_ADD));
+
+    std::string value;
+    ASSERT_OK(date_tiered_db_->Get(ReadOptions(), key, &value));
+    ASSERT_EQ(expected_value, value);
+    const uint64_t warm_num_file_opens = TickerCount(NO_FILE_OPENS);
+    const uint64_t warm_cache_adds = TickerCount(BLOCK_CACHE_ADD);
+    iter.reset(date_tiered_db_->NewIterator(cache_only));
+    iter->Seek(key);
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(key, iter->key().ToString());
+    ASSERT_EQ(expected_value, iter->value().ToString());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(warm_num_file_opens, TickerCount(NO_FILE_OPENS));
+    ASSERT_EQ(warm_cache_adds, TickerCount(BLOCK_CACHE_ADD));
+  }
 
   static const int64_t kSampleSize_ = 100;
   std::string dbname_;
@@ -449,6 +500,67 @@ TEST_F(DateTieredTest, IteratorMerge) {
   delete dbiter;
 
   CloseDateTieredDB();
+}
+
+TEST_F(DateTieredTest, BlockCacheTierIteratorDoesNotReadColdValueSst) {
+  EnableValueSeparation();
+  OpenDateTieredDB(10, 10);
+
+  std::string warm_key = "a";
+  std::string cold_key = "b";
+  ASSERT_OK(AppendTimestamp(&warm_key));
+  ASSERT_OK(AppendTimestamp(&cold_key));
+  const std::string warm_value(4096, 'a');
+  const std::string cold_value(4096, 'b');
+  ASSERT_OK(date_tiered_db_->Put(WriteOptions(), warm_key, warm_value));
+  ASSERT_OK(date_tiered_db_->Put(WriteOptions(), cold_key, cold_value));
+
+  CloseDateTieredDB();
+  OpenDateTieredDB(10, 10);
+  std::string value;
+  ASSERT_OK(date_tiered_db_->Get(ReadOptions(), warm_key, &value));
+  ASSERT_EQ(warm_value, value);
+
+  CheckCacheOnlyIterator(cold_key, cold_value);
+}
+
+TEST_F(DateTieredTest, BlockCacheTierMergeIteratorDoesNotReadColdValueSst) {
+  EnableValueSeparation();
+  OpenDateTieredDB(10, 2);
+
+  std::string first_warm_key = "a";
+  std::string first_cold_key = "c";
+  ASSERT_OK(AppendTimestamp(&first_warm_key));
+  ASSERT_OK(AppendTimestamp(&first_cold_key));
+  const std::string first_warm_value(4096, 'a');
+  const std::string first_cold_value(4096, 'c');
+  ASSERT_OK(
+      date_tiered_db_->Put(WriteOptions(), first_warm_key, first_warm_value));
+  ASSERT_OK(
+      date_tiered_db_->Put(WriteOptions(), first_cold_key, first_cold_value));
+
+  Sleep(2);
+  std::string second_warm_key = "b";
+  std::string second_cold_key = "d";
+  ASSERT_OK(AppendTimestamp(&second_warm_key));
+  ASSERT_OK(AppendTimestamp(&second_cold_key));
+  const std::string second_warm_value(4096, 'b');
+  const std::string second_cold_value(4096, 'd');
+  ASSERT_OK(
+      date_tiered_db_->Put(WriteOptions(), second_warm_key, second_warm_value));
+  ASSERT_OK(
+      date_tiered_db_->Put(WriteOptions(), second_cold_key, second_cold_value));
+
+  CloseDateTieredDB();
+  OpenDateTieredDB(10, 2);
+  ASSERT_EQ(3, GetColumnFamilyCount());
+  std::string value;
+  ASSERT_OK(date_tiered_db_->Get(ReadOptions(), first_warm_key, &value));
+  ASSERT_EQ(first_warm_value, value);
+  ASSERT_OK(date_tiered_db_->Get(ReadOptions(), second_warm_key, &value));
+  ASSERT_EQ(second_warm_value, value);
+
+  CheckCacheOnlyIterator(first_cold_key, first_cold_value);
 }
 
 }  //  namespace TERARKDB_NAMESPACE

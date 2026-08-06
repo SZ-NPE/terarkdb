@@ -3480,8 +3480,20 @@ class TickerTypeJni {
         return 0x65;
       case TERARKDB_NAMESPACE::Tickers::READ_BLOB_INVALID:
         return 0x66;
-      case TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX:
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_HIT:
         return 0x67;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_MISS:
+        return 0x68;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_FALLBACK:
+        return 0x69;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_ADVANCE:
+        return 0x6A;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_EVICTION:
+        return 0x6B;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_BYPASS:
+        return 0x6C;
+      case TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX:
+        return 0x6D;
       default:
         // undefined/default
         return 0x0;
@@ -3699,6 +3711,18 @@ class TickerTypeJni {
       case 0x66:
         return TERARKDB_NAMESPACE::Tickers::READ_BLOB_INVALID;
       case 0x67:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_HIT;
+      case 0x68:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_MISS;
+      case 0x69:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_FALLBACK;
+      case 0x6A:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_ADVANCE;
+      case 0x6B:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_EVICTION;
+      case 0x6C:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_BYPASS;
+      case 0x6D:
         return TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX;
 
       default:

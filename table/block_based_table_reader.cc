@@ -2231,9 +2231,12 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::InitDataBlock() {
     // Automatically prefetch additional data when a range scan (iterator) does
     // more than 2 sequential IOs. This is enabled only for user reads and when
     // ReadOptions.readahead_size is 0.
-    if (!for_compaction_ && read_options_.readahead_size == 0) {
+    if (!for_compaction_ && read_options_.read_tier != kBlockCacheTier &&
+        read_options_.readahead_size == 0) {
       num_file_reads_++;
       if (num_file_reads_ > 2) {
+        TEST_SYNC_POINT(
+            "BlockBasedTableIterator::InitDataBlock:AutoReadahead");
         if (!rep->file->use_direct_io() &&
             (data_block_handle.offset() +
                  static_cast<size_t>(data_block_handle.size()) +

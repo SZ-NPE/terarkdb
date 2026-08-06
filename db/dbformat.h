@@ -829,6 +829,12 @@ class SeparateHelper {
 
   virtual LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
                                      const LazyBuffer& value) const = 0;
+
+  virtual LazyBuffer TransToCombinedWithReadOptions(
+      const Slice& user_key, uint64_t sequence, const LazyBuffer& value,
+      const ReadOptions& /*read_options*/) const {
+    return TransToCombined(user_key, sequence, value);
+  }
 };
 
 extern Slice ArenaPinSlice(const Slice& slice, Arena* arena);

@@ -696,6 +696,23 @@ class Version : public SeparateHelper, private LazyBufferState {
               ValueType* type, SequenceNumber* seq, LazyBuffer* value,
               const FileMetaData& blob);
 
+  const FileMetaData* ResolveValueFile(uint64_t file_number) const;
+
+  size_t ValueFileCount() const;
+
+  bool UsesDirectReads() const;
+
+  InternalIterator* NewValueIterator(const ReadOptions& read_options,
+                                     const FileMetaData& file_meta) const;
+
+  int CompareInternalKeys(const Slice& lhs, const Slice& rhs) const;
+
+  Status FetchValueByFileNumber(const Slice& user_key,
+                                SequenceNumber sequence,
+                                uint64_t file_number,
+                                const ReadOptions& read_options,
+                                LazyBuffer* value) const;
+
   // Loads some stats information from files. Call without mutex held. It needs
   // to be called before applying the version to the version set.
   void PrepareApply(const MutableCFOptions& mutable_cf_options);
@@ -839,6 +856,10 @@ class Version : public SeparateHelper, private LazyBufferState {
 
   LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
                              const LazyBuffer& value) const override;
+
+  LazyBuffer TransToCombinedWithReadOptions(
+      const Slice& user_key, uint64_t sequence, const LazyBuffer& value,
+      const ReadOptions& read_options) const override;
 
   // No copying allowed
   Version(const Version&);

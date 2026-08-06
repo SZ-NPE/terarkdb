@@ -406,13 +406,19 @@ void MergeIteratorBuilder::AddIterator(InternalIterator* iter) {
 
 void MergeIteratorBuilder::AddIterator(InternalIterator* iter,
                                        SeparateHelper* separate_helper) {
+  AddIterator(iter, separate_helper, ReadOptions());
+}
+
+void MergeIteratorBuilder::AddIterator(InternalIterator* iter,
+                                       SeparateHelper* separate_helper,
+                                       const ReadOptions& read_options) {
   if (separate_helper == nullptr) {
     AddIterator(iter);
     return;
   }
   auto ptr = arena->AllocateAligned(sizeof(CombinedInternalIterator));
   InternalIterator* separate_iter =
-      new (ptr) CombinedInternalIterator(iter, separate_helper);
+      new (ptr) CombinedInternalIterator(iter, separate_helper, read_options);
   separate_iter->RegisterCleanup(
       [](void* arg1, void* /*arg2*/) {
         reinterpret_cast<InternalIterator*>(arg1)->~InternalIterator();

@@ -1280,40 +1280,8 @@ Status Version::fetch_buffer(LazyBuffer* buffer) const {
                  context->data[1]);
   uint64_t sequence = context->data[2];
   auto pair = *reinterpret_cast<DependenceMap::value_type*>(context->data[3]);
-  if (pair.second->fd.GetNumber() != pair.first) {
-    RecordTick(db_statistics_, READ_BLOB_INVALID);
-  } else {
-    RecordTick(db_statistics_, READ_BLOB_VALID);
-  }
-  bool value_found = false;
-  SequenceNumber context_seq;
-  GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
-                         cfd_->ioptions()->info_log, db_statistics_,
-                         GetContext::kNotFound, user_key, buffer, &value_found,
-                         nullptr, nullptr, nullptr, env_, &context_seq);
-  IterKey iter_key;
-  iter_key.SetInternalKey(user_key, sequence, kValueTypeForSeek);
-  auto s = table_cache_->Get(
-      ReadOptions(), *pair.second, storage_info_.dependence_map(),
-      iter_key.GetInternalKey(), &get_context,
-      mutable_cf_options_.prefix_extractor.get(), nullptr, true);
-  if (!s.ok()) {
-    return s;
-  }
-  if (context_seq != sequence || (get_context.State() != GetContext::kFound &&
-                                  get_context.State() != GetContext::kMerge)) {
-    if (get_context.State() == GetContext::kCorrupt) {
-      return std::move(get_context).CorruptReason();
-    } else {
-      char buf[128];
-      snprintf(buf, sizeof buf,
-               "file number = %" PRIu64 "(%" PRIu64 "), sequence = %" PRIu64,
-               pair.second->fd.GetNumber(), pair.first, sequence);
-      return Status::Corruption("Separate value missing", buf);
-    }
-  }
-  assert(buffer->file_number() == pair.second->fd.GetNumber());
-  return Status::OK();
+  return FetchValueByFileNumber(user_key, sequence, pair.first, ReadOptions(),
+                                buffer);
 }
 
 LazyBuffer Version::TransToCombined(const Slice& user_key, uint64_t sequence,
@@ -1336,6 +1304,114 @@ LazyBuffer Version::TransToCombined(const Slice& user_key, uint64_t sequence,
   }
 }
 
+LazyBuffer Version::TransToCombinedWithReadOptions(
+    const Slice& user_key, uint64_t sequence, const LazyBuffer& value,
+    const ReadOptions& read_options) const {
+  auto status = value.fetch();
+  if (!status.ok()) {
+    return LazyBuffer(std::move(status));
+  }
+
+  const uint64_t file_number =
+      SeparateHelper::DecodeFileNumber(value.slice());
+  LazyBuffer result;
+  status = FetchValueByFileNumber(user_key, sequence, file_number,
+                                  read_options, &result);
+  if (!status.ok()) {
+    result.reset(std::move(status));
+  }
+  return result;
+}
+
+const FileMetaData* Version::ResolveValueFile(uint64_t file_number) const {
+  auto find = storage_info_.dependence_map().find(file_number);
+  return find == storage_info_.dependence_map().end() ? nullptr
+                                                       : find->second;
+}
+
+size_t Version::ValueFileCount() const {
+  return storage_info_.LevelFiles(-1).size();
+}
+
+bool Version::UsesDirectReads() const { return env_options_.use_direct_reads; }
+
+InternalIterator* Version::NewValueIterator(
+    const ReadOptions& read_options, const FileMetaData& file_meta) const {
+  InternalIterator* iter = table_cache_->NewIterator(
+      read_options, env_options_, file_meta, storage_info_.dependence_map(),
+      nullptr /* range_del_agg */, mutable_cf_options_.prefix_extractor.get(),
+      nullptr /* table_reader_ptr */, nullptr /* file_read_hist */,
+      false /* for_compaction */, nullptr /* arena */, false /* skip_filters */,
+      -1 /* level */);
+#ifndef NDEBUG
+  Status injected_status;
+  TEST_SYNC_POINT_CALLBACK("Version::NewValueIterator:Status",
+                           &injected_status);
+  if (!injected_status.ok()) {
+    delete iter;
+    return NewErrorInternalIterator<LazyBuffer>(injected_status);
+  }
+#endif
+  return iter;
+}
+
+int Version::CompareInternalKeys(const Slice& lhs, const Slice& rhs) const {
+  return internal_comparator()->Compare(lhs, rhs);
+}
+
+Status Version::FetchValueByFileNumber(const Slice& user_key,
+                                       SequenceNumber sequence,
+                                       uint64_t file_number,
+                                       const ReadOptions& read_options,
+                                       LazyBuffer* value) const {
+  const FileMetaData* file_meta = ResolveValueFile(file_number);
+  if (file_meta == nullptr) {
+    return Status::Corruption("Separate value dependence missing");
+  }
+  if (file_meta->fd.GetNumber() != file_number) {
+    RecordTick(db_statistics_, READ_BLOB_INVALID);
+  } else {
+    RecordTick(db_statistics_, READ_BLOB_VALID);
+  }
+
+  bool value_found = false;
+  SequenceNumber context_seq = kMaxSequenceNumber;
+  GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
+                         cfd_->ioptions()->info_log, db_statistics_,
+                         GetContext::kNotFound, user_key, value, &value_found,
+                         nullptr, nullptr, nullptr, env_, &context_seq, nullptr,
+                         &read_options);
+  IterKey iter_key;
+  iter_key.SetInternalKey(user_key, sequence, kValueTypeForSeek);
+  auto s = table_cache_->Get(
+      read_options, *file_meta, storage_info_.dependence_map(),
+      iter_key.GetInternalKey(), &get_context,
+      mutable_cf_options_.prefix_extractor.get(), nullptr, true);
+  if (!s.ok()) {
+    return s;
+  }
+  if (read_options.read_tier == kBlockCacheTier &&
+      get_context.State() == GetContext::kFound && !value_found &&
+      context_seq == kMaxSequenceNumber) {
+    return Status::Incomplete(
+        "Separate value is not available in the block cache");
+  }
+  if (context_seq != sequence || (get_context.State() != GetContext::kFound &&
+                                  get_context.State() != GetContext::kMerge)) {
+    if (get_context.State() == GetContext::kCorrupt) {
+      return std::move(get_context).CorruptReason();
+    }
+
+    char buf[128];
+    snprintf(buf, sizeof buf,
+             "file number = %" PRIu64 "(%" PRIu64 "), sequence = %" PRIu64,
+             file_meta->fd.GetNumber(), file_number, sequence);
+    return Status::Corruption("Separate value missing", buf);
+  }
+  assert(value->file_number() == file_meta->fd.GetNumber());
+  return Status::OK();
+}
+
 void Version::Get(const ReadOptions& read_options, const Slice& user_key,
                   const LookupKey& k, LazyBuffer* value, Status* status,
                   MergeContext* merge_context,
@@ -1355,7 +1431,7 @@ void Version::Get(const ReadOptions& read_options, const Slice& user_key,
       user_comparator(), merge_operator_, info_log_, db_statistics_,
       status->ok() ? GetContext::kNotFound : GetContext::kMerge, user_key,
       value, value_found, merge_context, this, max_covering_tombstone_seq,
-      this->env_, seq, callback);
+      this->env_, seq, callback, &read_options);
 
   FilePicker fp(
       storage_info_.files_, user_key, ikey, &storage_info_.level_files_brief_,

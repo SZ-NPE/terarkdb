@@ -39,7 +39,8 @@ GetContext::GetContext(const Comparator* ucmp,
                        bool* value_found, MergeContext* merge_context,
                        const SeparateHelper* separate_helper,
                        SequenceNumber* _max_covering_tombstone_seq, Env* env,
-                       SequenceNumber* seq, ReadCallback* callback)
+                       SequenceNumber* seq, ReadCallback* callback,
+                       const ReadOptions* read_options)
     : ucmp_(ucmp),
       merge_operator_(merge_operator),
       logger_(logger),
@@ -56,6 +57,7 @@ GetContext::GetContext(const Comparator* ucmp,
       seq_(seq),
       min_seq_type_(0),
       callback_(callback),
+      read_options_(read_options),
       is_index_(false),
       is_finished_(false) {
   if (seq_) {
@@ -201,8 +203,13 @@ bool GetContext::SaveValue(const ParsedInternalKey& parsed_key,
           }
           return Finish();
         }
-        value = separate_helper_->TransToCombined(user_key_,
-                                                  parsed_key.sequence, value);
+        if (read_options_ == nullptr) {
+          value = separate_helper_->TransToCombined(
+              user_key_, parsed_key.sequence, value);
+        } else {
+          value = separate_helper_->TransToCombinedWithReadOptions(
+              user_key_, parsed_key.sequence, value, *read_options_);
+        }
         FALLTHROUGH_INTENDED;
       case kTypeValue:
         assert(state_ == kNotFound || state_ == kMerge);
@@ -264,8 +271,13 @@ bool GetContext::SaveValue(const ParsedInternalKey& parsed_key,
           }
           return Finish();
         }
-        value = separate_helper_->TransToCombined(user_key_,
-                                                  parsed_key.sequence, value);
+        if (read_options_ == nullptr) {
+          value = separate_helper_->TransToCombined(
+              user_key_, parsed_key.sequence, value);
+        } else {
+          value = separate_helper_->TransToCombinedWithReadOptions(
+              user_key_, parsed_key.sequence, value, *read_options_);
+        }
         FALLTHROUGH_INTENDED;
       case kTypeMerge:
         assert(state_ == kNotFound || state_ == kMerge);

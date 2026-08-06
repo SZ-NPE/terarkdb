@@ -11,6 +11,7 @@
 
 #include <set>
 
+#include "rocksdb/options.h"
 #include "rocksdb/terark_namespace.h"
 #include "table/internal_iterator.h"
 
@@ -125,7 +126,14 @@ class CombinedInternalIterator : public InternalIterator {
  public:
   CombinedInternalIterator(InternalIterator* iter,
                            SeparateHelper* separate_helper)
-      : iter_(iter), separate_helper_(separate_helper) {}
+      : CombinedInternalIterator(iter, separate_helper, ReadOptions()) {}
+
+  CombinedInternalIterator(InternalIterator* iter,
+                           SeparateHelper* separate_helper,
+                           const ReadOptions& read_options)
+      : iter_(iter),
+        separate_helper_(separate_helper),
+        read_options_(read_options) {}
 
   bool Valid() const override { return iter_->Valid(); }
   Slice key() const override { return iter_->key(); }
@@ -145,6 +153,7 @@ class CombinedInternalIterator : public InternalIterator {
 
   InternalIterator* iter_;
   SeparateHelper* separate_helper_;
+  ReadOptions read_options_;
 };
 
 class LazyInternalIteratorWrapper : public InternalIterator {

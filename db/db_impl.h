@@ -401,6 +401,12 @@ class DBImpl : public DB {
       ColumnFamilyHandle* column_family = nullptr,
       SeparateHelper** separate_helper = nullptr);
 
+  InternalIterator* NewInternalIterator(
+      const ReadOptions& read_options, Arena* arena,
+      RangeDelAggregator* range_del_agg, SequenceNumber sequence,
+      ColumnFamilyHandle* column_family = nullptr,
+      SeparateHelper** separate_helper = nullptr);
+
   LogsWithPrepTracker* logs_with_prep_tracker() {
     return &logs_with_prep_tracker_;
   }
