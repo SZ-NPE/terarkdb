@@ -66,6 +66,226 @@ int sstableKeyCompare(const Comparator* user_cmp, const InternalKey& a,
   return sstableKeyCompare(user_cmp, a, *b);
 }
 
+namespace {
+
+bool RebuildBlobRangeContains(const RebuildBlobRange& range,
+                              const Slice& user_key,
+                              const Comparator* user_comparator) {
+  return user_comparator->Compare(range.smallest_user_key, user_key) <= 0 &&
+         user_comparator->Compare(user_key, range.largest_user_key) <= 0;
+}
+
+bool RebuildBlobBundleContains(const RebuildBlobBundle& bundle,
+                               const Slice& user_key,
+                               const Comparator* user_comparator) {
+  return user_comparator->Compare(bundle.smallest_user_key, user_key) <= 0 &&
+         user_comparator->Compare(user_key, bundle.largest_user_key) <= 0;
+}
+
+}  // namespace
+
+void RebuildBlobPlan::Clear() {
+  bundles_.clear();
+  unbundled_sources_.clear();
+}
+
+void RebuildBlobPlan::AddBundle(
+    std::vector<RebuildBlobCandidate> candidates,
+    const Slice& smallest_user_key, const Slice& largest_user_key,
+    const Comparator* user_comparator) {
+  assert(user_comparator != nullptr);
+  if (candidates.size() < 2) {
+    return;
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [user_comparator](const RebuildBlobCandidate& lhs,
+                              const RebuildBlobCandidate& rhs) {
+              int cmp = user_comparator->Compare(lhs.smallest_user_key,
+                                                 rhs.smallest_user_key);
+              if (cmp != 0) {
+                return cmp < 0;
+              }
+              cmp = user_comparator->Compare(lhs.largest_user_key,
+                                             rhs.largest_user_key);
+              if (cmp != 0) {
+                return cmp < 0;
+              }
+              return lhs.file_number < rhs.file_number;
+            });
+
+  RebuildBlobBundle bundle;
+  bundle.id = static_cast<uint32_t>(bundles_.size());
+  bundle.smallest_user_key = smallest_user_key.ToString();
+  bundle.largest_user_key = largest_user_key.ToString();
+  for (const auto& candidate : candidates) {
+    bundle.estimated_bytes += candidate.estimated_bytes;
+    bundle.ranges.push_back(
+        {candidate.file_number, candidate.smallest_user_key,
+         candidate.largest_user_key});
+  }
+  bundles_.push_back(std::move(bundle));
+}
+
+void RebuildBlobPlan::AddUnbundledSource(RebuildBlobCandidate candidate) {
+  unbundled_sources_.push_back(std::move(candidate));
+}
+
+bool RebuildBlobPlan::ShouldRebuild(
+    uint64_t file_number, const Slice& user_key,
+    const Comparator* user_comparator) const {
+  return GetBundleId(file_number, user_key, user_comparator) !=
+         kNoRebuildBlobBundle;
+}
+
+bool RebuildBlobPlan::OverlapsBundle(
+    const Slice& smallest_user_key, const Slice& largest_user_key,
+    const Comparator* user_comparator) const {
+  for (const auto& bundle : bundles_) {
+    if (user_comparator->Compare(bundle.largest_user_key,
+                                 smallest_user_key) >= 0 &&
+        user_comparator->Compare(largest_user_key,
+                                 bundle.smallest_user_key) >= 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t RebuildBlobPlan::GetBundleId(
+    const Slice& user_key, const Comparator* user_comparator) const {
+  for (const auto& bundle : bundles_) {
+    if (RebuildBlobBundleContains(bundle, user_key, user_comparator)) {
+      return bundle.id;
+    }
+  }
+  return kNoRebuildBlobBundle;
+}
+
+uint32_t RebuildBlobPlan::GetBundleId(
+    uint64_t file_number, const Slice& user_key,
+    const Comparator* user_comparator) const {
+  for (const auto& bundle : bundles_) {
+    if (!RebuildBlobBundleContains(bundle, user_key, user_comparator)) {
+      continue;
+    }
+    for (const auto& range : bundle.ranges) {
+      if (range.file_number == file_number &&
+          RebuildBlobRangeContains(range, user_key, user_comparator)) {
+        return bundle.id;
+      }
+    }
+  }
+  for (const auto& candidate : unbundled_sources_) {
+    if (candidate.file_number == file_number &&
+        user_comparator->Compare(candidate.smallest_user_key, user_key) <= 0 &&
+        user_comparator->Compare(user_key, candidate.largest_user_key) <= 0) {
+      return kUnbundledRebuildBlobBundle;
+    }
+  }
+  return kNoRebuildBlobBundle;
+}
+
+size_t RebuildBlobPlan::source_count() const {
+  size_t result = unbundled_sources_.size();
+  for (const auto& bundle : bundles_) {
+    result += bundle.ranges.size();
+  }
+  return result;
+}
+
+uint64_t RebuildBlobPlan::estimated_bytes() const {
+  uint64_t result = 0;
+  for (const auto& bundle : bundles_) {
+    result += bundle.estimated_bytes;
+  }
+  for (const auto& candidate : unbundled_sources_) {
+    result += candidate.estimated_bytes;
+  }
+  return result;
+}
+
+bool SelectRangeLocalRebuildBundle(
+    const std::vector<RebuildBlobCandidate>& candidates,
+    size_t target_source_count, const Comparator* user_comparator,
+    RebuildBlobPlan* plan, uint64_t max_bundle_bytes) {
+  assert(user_comparator != nullptr);
+  assert(plan != nullptr);
+  if (candidates.size() <= target_source_count || candidates.size() < 2) {
+    return false;
+  }
+  size_t rewrite_source_count =
+      candidates.size() - target_source_count + 1;
+  if (rewrite_source_count < 2) {
+    rewrite_source_count = 2;
+  }
+  if (rewrite_source_count > candidates.size()) {
+    return false;
+  }
+
+  std::vector<RebuildBlobCandidate> sorted_candidates = candidates;
+  std::sort(sorted_candidates.begin(), sorted_candidates.end(),
+            [user_comparator](const RebuildBlobCandidate& lhs,
+                              const RebuildBlobCandidate& rhs) {
+              int cmp = user_comparator->Compare(lhs.smallest_user_key,
+                                                 rhs.smallest_user_key);
+              if (cmp != 0) {
+                return cmp < 0;
+              }
+              cmp = user_comparator->Compare(lhs.largest_user_key,
+                                             rhs.largest_user_key);
+              if (cmp != 0) {
+                return cmp < 0;
+              }
+              return lhs.file_number < rhs.file_number;
+            });
+
+  size_t best_start = 0;
+  uint64_t best_cost = std::numeric_limits<uint64_t>::max();
+  for (size_t start = 0;
+       start + rewrite_source_count <= sorted_candidates.size(); ++start) {
+    uint64_t cost = 0;
+    for (size_t index = start; index < start + rewrite_source_count; ++index) {
+      cost += sorted_candidates[index].estimated_bytes;
+    }
+    if (cost > max_bundle_bytes) {
+      continue;
+    }
+    if (cost < best_cost || (cost == best_cost && start > best_start)) {
+      best_start = start;
+      best_cost = cost;
+    }
+  }
+  if (best_cost == std::numeric_limits<uint64_t>::max()) {
+    return false;
+  }
+  std::string smallest_user_key =
+      sorted_candidates[best_start].smallest_user_key;
+  std::string largest_user_key =
+      sorted_candidates[best_start].largest_user_key;
+  for (size_t index = best_start;
+       index < best_start + rewrite_source_count; ++index) {
+    const auto& candidate = sorted_candidates[index];
+    if (user_comparator->Compare(candidate.smallest_user_key,
+                                 smallest_user_key) < 0) {
+      smallest_user_key = candidate.smallest_user_key;
+    }
+    if (user_comparator->Compare(candidate.largest_user_key,
+                                 largest_user_key) > 0) {
+      largest_user_key = candidate.largest_user_key;
+    }
+  }
+  if (plan->OverlapsBundle(smallest_user_key, largest_user_key,
+                           user_comparator)) {
+    return false;
+  }
+  plan->AddBundle(
+      std::vector<RebuildBlobCandidate>(
+          sorted_candidates.begin() + best_start,
+          sorted_candidates.begin() + best_start + rewrite_source_count),
+      smallest_user_key, largest_user_key, user_comparator);
+  return true;
+}
+
 uint64_t TotalFileSize(const std::vector<FileMetaData*>& files) {
   uint64_t sum = 0;
   for (size_t i = 0; i < files.size() && files[i]; i++) {
@@ -671,11 +891,6 @@ uint64_t Compaction::MaxInputFileCreationTime() const {
   }
   return max_creation_time;
 }
-std::unordered_map<uint64_t, uint64_t>&
-Compaction::current_blob_overlap_scores() const {
-  return input_vstorage_->blob_overlap_scores();
-}
-
 int Compaction::GetInputBaseLevel() const {
   return input_vstorage_->base_level();
 }

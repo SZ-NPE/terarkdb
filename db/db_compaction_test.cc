@@ -4271,9 +4271,10 @@ TEST_F(DBCompactionTest, BlobOverlapThredhold) {
   // overlap range is [3400, 3500) which contains 3 files (13,16,18)
 
   int call_back_cnt = 0;
+  RebuildBlobStats rebuild_stats;
   TERARKDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "Compaction::GetRebuildNeededBlobs::End", [&](void* arg) {
-        chash_set<uint64_t>* rebuild_blob_set = (chash_set<uint64_t>*)arg;
+        auto* rebuild_blob_plan = static_cast<RebuildBlobPlan*>(arg);
         call_back_cnt++;
         auto& dependence_map = dbfull()
                                    ->TEST_GetVersionSet()
@@ -4289,32 +4290,68 @@ TEST_F(DBCompactionTest, BlobOverlapThredhold) {
         };
 
         if (call_back_cnt == 1) {
-          ASSERT_EQ(rebuild_blob_set->size(), 3);
-          std::vector<uint64_t> blobs;
-          for (auto blob : *rebuild_blob_set) {
-            blobs.push_back(blob);
-          }
-          test(blobs[0], 2500, 3499);
-          test(blobs[1], 3200, 3999);
-          test(blobs[2], 3400, 4499);
-
-          // ASSERT(dependence_map)
+          ASSERT_EQ(rebuild_blob_plan->bundle_count(), 1);
+          ASSERT_EQ(rebuild_blob_plan->source_count(), 2);
+          ASSERT_EQ(rebuild_blob_plan->bundles()[0].ranges.size(), 2);
+          const auto& ranges = rebuild_blob_plan->bundles()[0].ranges;
+          test(ranges[0].file_number, 3200, 3999);
+          test(ranges[1].file_number, 3400, 4499);
+          ASSERT_EQ(rebuild_blob_plan->bundles()[0].smallest_user_key,
+                    Key(3200));
+          ASSERT_EQ(rebuild_blob_plan->bundles()[0].largest_user_key,
+                    Key(4499));
         }
         if (call_back_cnt == 2) {
-          ASSERT_EQ(rebuild_blob_set->size(), 0);
+          ASSERT_TRUE(rebuild_blob_plan->empty());
         }
       });
   TERARKDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "CompactionJob::FinishCompactionOutputBlob::Start", [&](void* arg) {
         FileMetaData* meta = (FileMetaData*)arg;
-        ASSERT_EQ(meta->smallest.user_key().ToString(), Key(2500));
+        ASSERT_EQ(meta->smallest.user_key().ToString(), Key(3200));
         ASSERT_EQ(meta->largest.user_key().ToString(), Key(4499));
+      });
+  TERARKDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction:RebuildBlobStats",
+      [&](void* arg) {
+        rebuild_stats = *static_cast<RebuildBlobStats*>(arg);
       });
   TERARKDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
   dbfull()->TEST_WaitForCompact();
   ASSERT_EQ(call_back_cnt, 1);
   ASSERT_EQ(NumTableFilesAtLevel(0), 0);
-  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(-1), 5);
+  ASSERT_EQ(rebuild_stats.candidate_source_count, 3);
+  ASSERT_EQ(rebuild_stats.selected_source_count, 2);
+  ASSERT_EQ(rebuild_stats.bundle_count, 1);
+  ASSERT_GT(rebuild_stats.candidate_rewrite_bytes,
+            rebuild_stats.estimated_rewrite_bytes);
+  ASSERT_GE(rebuild_stats.candidate_rewrite_bytes * 100,
+            rebuild_stats.estimated_rewrite_bytes * 135);
+  ASSERT_EQ(rebuild_stats.rewritten_records, 1300);
+  ASSERT_EQ(rebuild_stats.rewritten_value_bytes, 1300 * bigval.size());
+  ASSERT_GT(rebuild_stats.output_blob_bytes, 0);
+
+  std::vector<std::vector<FileMetaData>> files;
+  dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &files);
+  ASSERT_GT(files[1].size(), 1);
+  size_t repacked_output_count = 0;
+  for (const auto& file : files[1]) {
+    if (BytewiseComparator()->Compare(file.smallest.user_key(), Key(2500)) >=
+        0) {
+      ASSERT_LE(file.prop.dependence.size(), 2);
+      ++repacked_output_count;
+    }
+  }
+  ASSERT_GT(repacked_output_count, 0);
+  for (i = 0; i < 4500; ++i) {
+    ASSERT_EQ(Get(Key(i)), bigval);
+  }
+
+  Reopen(opts);
+  for (i = 0; i < 4500; ++i) {
+    ASSERT_EQ(Get(Key(i)), bigval);
+  }
   // flush 3 normal sst to triger compaction with level-1, so that rebuild
   // overlap blob
   for (i = 500; i < 600; ++i) {
@@ -4332,6 +4369,105 @@ TEST_F(DBCompactionTest, BlobOverlapThredhold) {
   dbfull()->TEST_WaitForCompact();
   ASSERT_EQ(call_back_cnt, 2);
 }
+
+#ifndef NDEBUG
+TEST_F(DBCompactionTest, PreservingValueIndexesAvoidsSeparatedValueReads) {
+  constexpr int kNumKeys = 256;
+
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  const std::string value(256, 'v');
+  for (int key = 0; key < kNumKeys / 2; ++key) {
+    ASSERT_OK(Put(Key(key), value));
+  }
+  ASSERT_OK(Flush());
+  for (int key = kNumKeys / 2; key < kNumKeys; ++key) {
+    ASSERT_OK(Put(Key(key), value));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_EQ(NumTableFilesAtLevel(0), 2);
+  ASSERT_EQ(NumTableFilesAtLevel(-1), 2);
+  ASSERT_OK(options.statistics->Reset());
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(
+      0, nullptr, nullptr, nullptr, kCompactionIgnoreSeparate,
+      true /* disallow_trivial_move */));
+
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(-1), 2);
+  std::vector<std::vector<FileMetaData>> files;
+  dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &files);
+  ASSERT_EQ(files[1].size(), 1);
+  ASSERT_EQ(files[1][0].prop.dependence.size(), 2);
+  uint64_t dependence_entries = 0;
+  for (const auto& dependence : files[1][0].prop.dependence) {
+    dependence_entries += dependence.entry_count;
+  }
+  ASSERT_EQ(dependence_entries, kNumKeys);
+  ASSERT_EQ(TestGetTickerCount(options, READ_BLOB_VALID), 0);
+  ASSERT_EQ(TestGetTickerCount(options, READ_BLOB_INVALID), 0);
+  for (int key = 0; key < kNumKeys; ++key) {
+    ASSERT_EQ(Get(Key(key)), value);
+  }
+}
+
+TEST_F(DBCompactionTest, ForceRebuildBlobRemainsCompatibleWithRangePlan) {
+  constexpr int kNumKeys = 256;
+
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  std::vector<std::string> values;
+  values.reserve(kNumKeys);
+  for (int key = 0; key < kNumKeys; ++key) {
+    values.push_back(std::string(256, static_cast<char>('a' + key % 26)));
+    ASSERT_OK(Put(Key(key), values.back()));
+    if (key == kNumKeys / 2 - 1 || key == kNumKeys - 1) {
+      ASSERT_OK(Flush());
+    }
+  }
+  ASSERT_EQ(NumTableFilesAtLevel(0), 2);
+  ASSERT_EQ(NumTableFilesAtLevel(-1), 2);
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(
+      0, nullptr, nullptr, nullptr, kCompactionForceRebuildBlob,
+      true /* disallow_trivial_move */));
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(-1), 1);
+
+  for (int key = 0; key < kNumKeys; ++key) {
+    ASSERT_EQ(Get(Key(key)), values[key]);
+  }
+  std::unique_ptr<Iterator> iterator(db_->NewIterator(ReadOptions()));
+  int key = 0;
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next(), ++key) {
+    ASSERT_EQ(iterator->key().ToString(), Key(key));
+    ASSERT_EQ(iterator->value().ToString(), values[key]);
+  }
+  ASSERT_OK(iterator->status());
+  ASSERT_EQ(key, kNumKeys);
+  iterator.reset();
+
+  Reopen(options);
+  for (key = 0; key < kNumKeys; ++key) {
+    ASSERT_EQ(Get(Key(key)), values[key]);
+  }
+}
+
+#endif
 
 #endif  // !defined(ROCKSDB_LITE)
 }  // namespace TERARKDB_NAMESPACE

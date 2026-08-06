@@ -63,6 +63,61 @@ void VerifyInitializationOfCompactionJobStats(
 
 }  // namespace
 
+TEST(RebuildBlobPlanTest, SelectsMinimumCostContiguousBundle) {
+  const Comparator* comparator = BytewiseComparator();
+  std::vector<RebuildBlobCandidate> candidates = {
+      {3, "2500", "3499", 700},
+      {5, "3200", "3999", 800},
+      {4, "3400", "4499", 500},
+  };
+
+  RebuildBlobPlan plan;
+  ASSERT_TRUE(SelectRangeLocalRebuildBundle(candidates, 2, comparator, &plan));
+  ASSERT_EQ(plan.bundle_count(), 1);
+  ASSERT_EQ(plan.source_count(), 2);
+  ASSERT_EQ(plan.estimated_bytes(), 1300);
+  ASSERT_EQ(plan.bundles()[0].ranges.size(), 2);
+  ASSERT_EQ(plan.bundles()[0].ranges[0].file_number, 5);
+  ASSERT_EQ(plan.bundles()[0].ranges[1].file_number, 4);
+  ASSERT_EQ(plan.bundles()[0].smallest_user_key, "3200");
+  ASSERT_EQ(plan.bundles()[0].largest_user_key, "4499");
+
+  ASSERT_FALSE(plan.ShouldRebuild(3, "2500", comparator));
+  ASSERT_TRUE(plan.ShouldRebuild(5, "3200", comparator));
+  ASSERT_TRUE(plan.ShouldRebuild(5, "3999", comparator));
+  ASSERT_TRUE(plan.ShouldRebuild(4, "4000", comparator));
+  ASSERT_TRUE(plan.ShouldRebuild(4, "4499", comparator));
+  ASSERT_FALSE(plan.ShouldRebuild(4, "4500", comparator));
+
+  RebuildBlobPlan full_source_plan;
+  ASSERT_TRUE(SelectRangeLocalRebuildBundle(candidates, 1, comparator,
+                                            &full_source_plan));
+  ASSERT_EQ(full_source_plan.source_count(), 3);
+  ASSERT_EQ(full_source_plan.estimated_bytes(), 2000);
+  ASSERT_EQ(full_source_plan.estimated_bytes() - plan.estimated_bytes(), 700);
+
+  RebuildBlobPlan over_budget_plan;
+  ASSERT_FALSE(SelectRangeLocalRebuildBundle(
+      candidates, 2, comparator, &over_budget_plan, 1299));
+  ASSERT_TRUE(over_budget_plan.empty());
+
+  RebuildBlobPlan unbundled_plan;
+  unbundled_plan.AddUnbundledSource({7, "a", "c", 100});
+  ASSERT_EQ(unbundled_plan.bundle_count(), 0);
+  ASSERT_TRUE(unbundled_plan.ShouldRebuild(7, "b", comparator));
+  ASSERT_FALSE(unbundled_plan.ShouldRebuild(7, "d", comparator));
+  ASSERT_FALSE(unbundled_plan.ShouldRebuild(8, "b", comparator));
+
+  std::vector<RebuildBlobCandidate> overlapping_candidates = {
+      {8, "4000", "4999", 100},
+      {9, "4300", "5299", 100},
+      {10, "4400", "5399", 100},
+  };
+  ASSERT_FALSE(SelectRangeLocalRebuildBundle(
+      overlapping_candidates, 2, comparator, &plan));
+  ASSERT_EQ(plan.bundle_count(), 1);
+}
+
 // TODO(icanadi) Make it simpler once we mock out VersionSet
 class CompactionJobTest : public testing::Test {
  public:

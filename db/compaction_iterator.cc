@@ -117,7 +117,8 @@ CompactionIterator::CompactionIterator(
     BlobConfig blob_config, const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
-    const chash_set<uint64_t>* need_rebuild_blobs)
+    const RebuildBlobPlan* rebuild_blob_plan,
+    RebuildBlobStats* rebuild_blob_stats)
     : CompactionIterator(
           input, separate_helper, end, cmp, merge_helper, last_sequence,
           snapshots, earliest_write_conflict_snapshot, snapshot_checker, env,
@@ -125,7 +126,7 @@ CompactionIterator::CompactionIterator(
           std::unique_ptr<CompactionProxy>(
               compaction ? new CompactionProxy(compaction) : nullptr),
           blob_config, compaction_filter, shutting_down,
-          preserve_deletes_seqnum, need_rebuild_blobs) {}
+          preserve_deletes_seqnum, rebuild_blob_plan, rebuild_blob_stats) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, SeparateHelper* separate_helper, const Slice* end,
@@ -139,7 +140,8 @@ CompactionIterator::CompactionIterator(
     const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
-    const chash_set<uint64_t>* need_rebuild_blobs)
+    const RebuildBlobPlan* rebuild_blob_plan,
+    RebuildBlobStats* rebuild_blob_stats)
     : input_(input, separate_helper),
       end_(end),
       cmp_(cmp),
@@ -162,7 +164,8 @@ CompactionIterator::CompactionIterator(
       current_user_key_snapshot_(0),
       merge_out_iter_(merge_helper_),
       current_key_committed_(false),
-      rebuild_blob_set_(need_rebuild_blobs) {
+      rebuild_blob_plan_(rebuild_blob_plan),
+      rebuild_blob_stats_(rebuild_blob_stats) {
   assert(compaction_filter_ == nullptr || compaction_ != nullptr);
   bottommost_level_ =
       compaction_ == nullptr ? false : compaction_->bottommost_level();
@@ -766,7 +769,9 @@ void CompactionIterator::PrepareOutput() {
   };
   assert(!do_rebuild_blob_ || compaction_ != nullptr);
   bool do_rebuild_blob =
-      do_rebuild_blob_ && rebuild_blob_set_->count(value_.file_number()) > 0;
+      do_rebuild_blob_ && rebuild_blob_plan_ != nullptr &&
+      rebuild_blob_plan_->ShouldRebuild(value_.file_number(), ikey_.user_key,
+                                        cmp_);
 
   if (ikey_.type == kTypeValue || ikey_.type == kTypeMerge) {
     if (!do_separate_value_) {
@@ -825,9 +830,18 @@ void CompactionIterator::PrepareOutput() {
       current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
       // Aah, we write value into new blob, so we can zero the sequence
       zero_sequence();
-      auto s = input_.separate_helper()->TransToSeparate(
-          current_key_.GetInternalKey(), value_);
+      auto s = value_.fetch();
+      uint64_t rewritten_value_bytes = 0;
       if (s.ok()) {
+        rewritten_value_bytes = value_.size();
+        s = input_.separate_helper()->TransToSeparate(
+            current_key_.GetInternalKey(), value_);
+      }
+      if (s.ok()) {
+        if (rebuild_blob_stats_ != nullptr) {
+          ++rebuild_blob_stats_->rewritten_records;
+          rebuild_blob_stats_->rewritten_value_bytes += rewritten_value_bytes;
+        }
         // Restore key type
         ikey_.type = backup_type;
         current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);

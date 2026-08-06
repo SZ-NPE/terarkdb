@@ -18,7 +18,6 @@
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/terark_namespace.h"
 #include "table/iterator_wrapper.h"
-#include "util/chash_set.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -78,7 +77,8 @@ class CompactionIterator {
                      const CompactionFilter* compaction_filter = nullptr,
                      const std::atomic<bool>* shutting_down = nullptr,
                      const SequenceNumber preserve_deletes_seqnum = 0,
-                     const chash_set<uint64_t>* b = nullptr);
+                     const RebuildBlobPlan* rebuild_blob_plan = nullptr,
+                     RebuildBlobStats* rebuild_blob_stats = nullptr);
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(InternalIterator* input, SeparateHelper* separate_helper,
@@ -94,7 +94,8 @@ class CompactionIterator {
                      const CompactionFilter* compaction_filter = nullptr,
                      const std::atomic<bool>* shutting_down = nullptr,
                      const SequenceNumber preserve_deletes_seqnum = 0,
-                     const chash_set<uint64_t>* b = nullptr);
+                     const RebuildBlobPlan* rebuild_blob_plan = nullptr,
+                     RebuildBlobStats* rebuild_blob_stats = nullptr);
 
   ~CompactionIterator();
 
@@ -221,13 +222,13 @@ class CompactionIterator {
   bool current_key_committed_;
 
   bool do_separate_value_;  // separate big value
-  bool do_rebuild_blob_;    // rebuild all blobs in need_rebuild_blobs if user
-                            // force rebuild need_rebuild_blobs.empty() == true
+  bool do_rebuild_blob_;
   bool do_combine_value_;   // fetch and combine bigvalue from blobs
 
   size_t filter_sample_interval_ = 64;
   size_t filter_hit_count_ = 0;
-  const chash_set<uint64_t>* rebuild_blob_set_;
+  const RebuildBlobPlan* rebuild_blob_plan_;
+  RebuildBlobStats* rebuild_blob_stats_;
 
  public:
   bool IsShuttingDown() {

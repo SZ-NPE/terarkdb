@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <limits>
 #include <unordered_set>
 
 #include "db/version_edit.h"
@@ -65,6 +66,81 @@ struct SelectedRange : public RangeStorage {
         weight(0) {}
 
   SelectedRange() : weight(0) {}
+};
+
+constexpr uint32_t kNoRebuildBlobBundle =
+    std::numeric_limits<uint32_t>::max();
+constexpr uint32_t kUnbundledRebuildBlobBundle =
+    kNoRebuildBlobBundle - 1;
+
+struct RebuildBlobCandidate {
+  uint64_t file_number = 0;
+  std::string smallest_user_key;
+  std::string largest_user_key;
+  uint64_t estimated_bytes = 0;
+};
+
+struct RebuildBlobRange {
+  uint64_t file_number = 0;
+  std::string smallest_user_key;
+  std::string largest_user_key;
+};
+
+struct RebuildBlobBundle {
+  uint32_t id = kNoRebuildBlobBundle;
+  std::string smallest_user_key;
+  std::string largest_user_key;
+  uint64_t estimated_bytes = 0;
+  std::vector<RebuildBlobRange> ranges;
+};
+
+class RebuildBlobPlan {
+ public:
+  void Clear();
+  void AddBundle(std::vector<RebuildBlobCandidate> candidates,
+                 const Slice& smallest_user_key,
+                 const Slice& largest_user_key,
+                 const Comparator* user_comparator);
+  void AddUnbundledSource(RebuildBlobCandidate candidate);
+
+  bool ShouldRebuild(uint64_t file_number, const Slice& user_key,
+                     const Comparator* user_comparator) const;
+  bool OverlapsBundle(const Slice& smallest_user_key,
+                      const Slice& largest_user_key,
+                      const Comparator* user_comparator) const;
+  uint32_t GetBundleId(const Slice& user_key,
+                       const Comparator* user_comparator) const;
+  uint32_t GetBundleId(uint64_t file_number, const Slice& user_key,
+                       const Comparator* user_comparator) const;
+
+  bool empty() const {
+    return bundles_.empty() && unbundled_sources_.empty();
+  }
+  size_t bundle_count() const { return bundles_.size(); }
+  size_t source_count() const;
+  uint64_t estimated_bytes() const;
+  const std::vector<RebuildBlobBundle>& bundles() const { return bundles_; }
+
+ private:
+  std::vector<RebuildBlobBundle> bundles_;
+  std::vector<RebuildBlobCandidate> unbundled_sources_;
+};
+
+bool SelectRangeLocalRebuildBundle(
+    const std::vector<RebuildBlobCandidate>& candidates,
+    size_t target_source_count, const Comparator* user_comparator,
+    RebuildBlobPlan* plan,
+    uint64_t max_bundle_bytes = std::numeric_limits<uint64_t>::max());
+
+struct RebuildBlobStats {
+  size_t candidate_source_count = 0;
+  size_t selected_source_count = 0;
+  size_t bundle_count = 0;
+  uint64_t candidate_rewrite_bytes = 0;
+  uint64_t estimated_rewrite_bytes = 0;
+  uint64_t rewritten_records = 0;
+  uint64_t rewritten_value_bytes = 0;
+  uint64_t output_blob_bytes = 0;
 };
 
 class ColumnFamilyData;
@@ -436,8 +512,6 @@ class Compaction {
     return transient_stat_;
   }
   std::vector<TableTransientStat>& transient_stat() { return transient_stat_; }
-  std::unordered_map<uint64_t, uint64_t>& current_blob_overlap_scores() const;
-
  private:
   // mark (or clear) all files that are being compacted
   void MarkFilesBeingCompacted(bool mark_as_compacted);
