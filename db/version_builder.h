@@ -36,8 +36,11 @@ class VersionBuilder {
                                   int level);
   bool CheckConsistencyForNumLevels();
   void Apply(VersionEdit* edit);
-  void SaveTo(VersionStorageInfo* vstorage, double maintainer_job_ratio);
-  void LoadTableHandlers(InternalStats* internal_stats,
+  void MaybePruneRecoveryState();
+  Status ValidateLiveDependences();
+  Status SaveTo(VersionStorageInfo* vstorage, double maintainer_job_ratio);
+  void LoadTableHandlers(VersionStorageInfo* vstorage,
+                         InternalStats* internal_stats,
                          bool prefetch_index_and_filter_in_cache,
                          const SliceTransform* prefix_extractor,
                          bool load_essence_sst, int max_threads = 1);

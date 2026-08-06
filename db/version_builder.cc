@@ -30,6 +30,7 @@
 #include "util/c_style_callback.h"
 #include "util/chash_map.h"
 #include "util/chash_set.h"
+#include "util/string_util.h"
 
 #define ROCKS_VERSION_BUILDER_DEBUG 0
 
@@ -288,8 +289,78 @@ class VersionBuilder::Rep {
     return nullptr;
   }
 
+  void AddLiveFile(FileMetaData* f, chash_set<uint64_t>* live_files) {
+    if (!live_files->insert(f->fd.GetNumber()).second) {
+      return;
+    }
+    for (const auto& dependence : f->prop.dependence) {
+      auto* item = TransFileNumber(dependence.file_number);
+      if (item != nullptr) {
+        if (f->prop.is_map_sst() && !item->f->prop.dependence.empty()) {
+          AddLiveFile(item->f, live_files);
+        } else {
+          live_files->insert(item->f->fd.GetNumber());
+        }
+      }
+    }
+  }
+
+  void BuildLiveFiles(chash_set<uint64_t>* live_files) {
+    for (int level = 0; level < num_levels_; ++level) {
+      for (const auto& pair : context_->levels[level]) {
+        AddLiveFile(pair.second, live_files);
+      }
+    }
+  }
+
+  Status ValidateLiveDependences() {
+    Init();
+    chash_set<uint64_t> visiting;
+    chash_set<uint64_t> validated;
+    std::function<Status(FileMetaData*)> validate =
+        [&](FileMetaData* file_meta) -> Status {
+      const uint64_t owner = file_meta->fd.GetNumber();
+      if (validated.count(owner) > 0) {
+        return Status::OK();
+      }
+      if (!visiting.insert(owner).second) {
+        return Status::Corruption(
+            "Cyclic SST dependence", NumberToString(owner));
+      }
+      for (const auto& dependence : file_meta->prop.dependence) {
+        auto* item = TransFileNumber(dependence.file_number);
+        if (item == nullptr) {
+          return Status::Corruption(
+              "Missing SST dependence",
+              "owner = " + NumberToString(owner) +
+                  ", missing = " + NumberToString(dependence.file_number));
+        }
+        if (file_meta->prop.is_map_sst() &&
+            !item->f->prop.dependence.empty()) {
+          Status status = validate(item->f);
+          if (!status.ok()) {
+            return status;
+          }
+        }
+      }
+      visiting.erase(owner);
+      validated.insert(owner);
+      return Status::OK();
+    };
+    for (int level = 0; level < num_levels_; ++level) {
+      for (const auto& pair : context_->levels[level]) {
+        Status status = validate(pair.second);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    }
+    return Status::OK();
+  }
+
   void SetDependence(FileMetaData* f, bool is_map, bool is_estimation,
-                     double ratio, bool finish) {
+                     double ratio, bool finish,
+                     chash_set<uint64_t>* visiting) {
     auto& dependence_map = context_->dependence_map;
     auto& inheritance_counter = context_->inheritance_counter;
     auto dependence_version = context_->dependence_version;
@@ -297,7 +368,10 @@ class VersionBuilder::Rep {
       auto find = inheritance_counter.find(dependence.file_number);
       if (find == inheritance_counter.end()) {
         if (finish) {
-          status_ = Status::Aborted("Missing dependence files");
+          status_ = Status::Corruption(
+              "Missing SST dependence",
+              "owner = " + NumberToString(f->fd.GetNumber()) +
+                  ", missing = " + NumberToString(dependence.file_number));
         }
         continue;
       }
@@ -313,21 +387,40 @@ class VersionBuilder::Rep {
       if (is_map) {
         item->gc_forbidden_version = dependence_version;
         if (!item->f->prop.dependence.empty()) {
-          SetDependence(item->f, item->f->prop.is_map_sst(),
-                        is_estimation || item->f->prop.is_map_sst(),
-                        ratio * dependence.entry_count /
-                            std::max<uint64_t>(1, item->f->prop.num_entries),
-                        finish);
+          const uint64_t file_number = item->f->fd.GetNumber();
+          if (finish || visiting->insert(file_number).second) {
+            SetDependence(item->f, item->f->prop.is_map_sst(),
+                          is_estimation || item->f->prop.is_map_sst(),
+                          ratio * dependence.entry_count /
+                              std::max<uint64_t>(1, item->f->prop.num_entries),
+                          finish, visiting);
+            if (!finish) {
+              visiting->erase(file_number);
+            }
+          }
         }
       }
     }
   }
 
-  void CalculateDependence(bool finish, bool is_open_db,
+  void CalculateDependence(bool finish, bool allow_incremental_pruning,
                            double maintainer_job_ratio) {
-    if (!finish && (!is_open_db || context_->new_deleted_files < 65536)) {
+    size_t max_deleted_files = 65536;
+#ifndef NDEBUG
+    TEST_SYNC_POINT_CALLBACK(
+        "VersionBuilder::CalculateDependence:MaxDeletedFiles",
+        &max_deleted_files);
+#endif
+    if (!finish &&
+        (!allow_incremental_pruning ||
+         context_->new_deleted_files < max_deleted_files)) {
       return;
     }
+#ifndef NDEBUG
+    if (!finish) {
+      TEST_SYNC_POINT("VersionBuilder::MaybePruneRecoveryState:Prune");
+    }
+#endif
     auto& dependence_map = context_->dependence_map;
     auto& inheritance_counter = context_->inheritance_counter;
     auto dependence_version = ++context_->dependence_version;
@@ -341,8 +434,10 @@ class VersionBuilder::Rep {
         item.dependence_version = dependence_version;
         item.gc_forbidden_version = dependence_version;
         if (!item.f->prop.dependence.empty()) {
+          chash_set<uint64_t> visiting;
+          visiting.insert(item.f->fd.GetNumber());
           SetDependence(item.f, item.f->prop.is_map_sst(),
-                        item.f->prop.is_map_sst(), 1, finish);
+                        item.f->prop.is_map_sst(), 1, finish, &visiting);
         }
       }
     }
@@ -674,21 +769,30 @@ class VersionBuilder::Rep {
         }
       }
     }
+  }
 
-    // shrink files
-    CalculateDependence(false, edit->is_open_db(), 0);
+  void MaybePruneRecoveryState() {
+    CalculateDependence(false, true, 0);
   }
 
   // Save the current state in *v.
   // WARNING: this func will call out of mutex
-  void SaveTo(VersionStorageInfo* vstorage, double maintainer_job_ratio) {
+  Status SaveTo(VersionStorageInfo* vstorage, double maintainer_job_ratio) {
     Init();
+    status_ = ValidateLiveDependences();
+    if (!status_.ok()) {
+      return status_;
+    }
     CheckConsistency(vstorage, true);
     CalculateDependence(true, false, maintainer_job_ratio);
+    if (!status_.ok()) {
+      return status_;
+    }
     auto exists = [&](uint64_t file_number) {
       auto find = context_->inheritance_counter.find(file_number);
       assert(find != context_->inheritance_counter.end());
-      return bool(find->second.depended);
+      return find != context_->inheritance_counter.end() &&
+             bool(find->second.depended);
     };
 
     std::vector<double> read_amp(num_levels_);
@@ -736,32 +840,29 @@ class VersionBuilder::Rep {
     vstorage->ComputeBlobOverlapScore();
     vstorage->CalculateEdge();
     vstorage->CalculateBlobInfo();
+    return Status::OK();
   }
 
-  void LoadTableHandlers(InternalStats* internal_stats,
+  void LoadTableHandlers(VersionStorageInfo* vstorage,
+                         InternalStats* internal_stats,
                          bool prefetch_index_and_filter_in_cache,
                          const SliceTransform* prefix_extractor,
                          bool load_essence_sst, int max_threads) {
     assert(table_cache_ != nullptr);
-    Init();
     // <file metadata, level>
     std::vector<std::pair<FileMetaData*, int>> files_meta;
-    auto dependence_version = context_->dependence_version;
     for (int level = 0; level < num_levels_; level++) {
-      for (auto& file_meta_pair : context_->levels[level]) {
-        auto* file_meta = file_meta_pair.second;
+      for (auto* file_meta : vstorage->LevelFiles(level)) {
         if ((load_essence_sst || file_meta->prop.is_map_sst()) &&
             file_meta->table_reader_handle == nullptr) {
           files_meta.emplace_back(file_meta, level);
         }
       }
     }
-    for (auto& pair : context_->dependence_map) {
-      auto& item = pair.second;
-      if (item.dependence_version == dependence_version && item.level == -1 &&
-          (load_essence_sst || item.f->prop.is_map_sst()) &&
-          item.f->table_reader_handle == nullptr) {
-        files_meta.emplace_back(item.f, -1);
+    for (auto* file_meta : vstorage->LevelFiles(-1)) {
+      if ((load_essence_sst || file_meta->prop.is_map_sst()) &&
+          file_meta->table_reader_handle == nullptr) {
+        files_meta.emplace_back(file_meta, -1);
       }
     }
     if (files_meta.empty()) {
@@ -808,10 +909,11 @@ class VersionBuilder::Rep {
     Init();
     assert(table_cache_ != nullptr);
     std::vector<FileMetaData*> files_meta;
-    auto dependence_version = context_->dependence_version;
+    chash_set<uint64_t> live_files;
+    BuildLiveFiles(&live_files);
     for (auto& pair : context_->dependence_map) {
       auto& item = pair.second;
-      if (item.dependence_version == dependence_version &&
+      if (live_files.count(item.f->fd.GetNumber()) > 0 &&
           item.f->need_upgrade) {
         files_meta.emplace_back(item.f);
       }
@@ -879,17 +981,27 @@ bool VersionBuilder::CheckConsistencyForNumLevels() {
 
 void VersionBuilder::Apply(VersionEdit* edit) { rep_->Apply(edit); }
 
-void VersionBuilder::SaveTo(VersionStorageInfo* vstorage,
-                            double maintainer_job_ratio) {
-  rep_->SaveTo(vstorage, maintainer_job_ratio);
+void VersionBuilder::MaybePruneRecoveryState() {
+  rep_->MaybePruneRecoveryState();
 }
 
-void VersionBuilder::LoadTableHandlers(InternalStats* internal_stats,
+Status VersionBuilder::ValidateLiveDependences() {
+  return rep_->ValidateLiveDependences();
+}
+
+Status VersionBuilder::SaveTo(VersionStorageInfo* vstorage,
+                              double maintainer_job_ratio) {
+  return rep_->SaveTo(vstorage, maintainer_job_ratio);
+}
+
+void VersionBuilder::LoadTableHandlers(VersionStorageInfo* vstorage,
+                                       InternalStats* internal_stats,
                                        bool prefetch_index_and_filter_in_cache,
                                        const SliceTransform* prefix_extractor,
                                        bool load_essence_sst, int max_threads) {
-  rep_->LoadTableHandlers(internal_stats, prefetch_index_and_filter_in_cache,
-                          prefix_extractor, load_essence_sst, max_threads);
+  rep_->LoadTableHandlers(vstorage, internal_stats,
+                          prefetch_index_and_filter_in_cache, prefix_extractor,
+                          load_essence_sst, max_threads);
 }
 
 void VersionBuilder::UpgradeFileMetaData(const SliceTransform* prefix_extractor,
@@ -991,7 +1103,12 @@ void VersionBuilderDebugger::Verify(VersionBuilder::Rep* rep,
         vstorage->InternalComparator(),
         vstorage->InternalComparator()->user_comparator(),
         vstorage->num_levels(), kCompactionStyleNone, true);
-    rep_0.SaveTo(&vstorage_1, 0);
+    Status status = rep_0.SaveTo(&vstorage_1, 0);
+    if (!status.ok()) {
+      fprintf(stderr, "VersionBuilder debug verify fail: %s\n",
+              status.ToString().c_str());
+      abort();
+    }
     VersionBuilder::Rep rep_1(rep->env_options_, rep->info_log_,
                               rep->table_cache, &vstorage_1);
     for (size_t j = i; j < pos.size() - 1; ++j) {
@@ -999,7 +1116,12 @@ void VersionBuilderDebugger::Verify(VersionBuilder::Rep* rep,
       get_edit(j, &edit);
       rep_1.Apply(&edit);
     }
-    rep_1.SaveTo(&vstorage_0, 0);
+    status = rep_1.SaveTo(&vstorage_0, 0);
+    if (!status.ok()) {
+      fprintf(stderr, "VersionBuilder debug verify fail: %s\n",
+              status.ToString().c_str());
+      abort();
+    }
     auto err = verify(vstorage, &vstorage_0);
     if (!err.empty()) {
       has_err = true;

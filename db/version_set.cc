@@ -741,12 +741,12 @@ class BaseReferencedVersionBuilder {
     versions->LogAndApplyHelper(version_->cfd(), version_builder_, version_,
                                 edit, mu, false);
   }
-  void DoApplyAndSaveTo(VersionStorageInfo* vstorage,
-                        double maintainer_job_ratio) {
+  Status DoApplyAndSaveTo(VersionStorageInfo* vstorage,
+                          double maintainer_job_ratio) {
     for (auto edit : edit_list_) {
       version_builder_->Apply(edit);
     }
-    version_builder_->SaveTo(vstorage, maintainer_job_ratio);
+    return version_builder_->SaveTo(vstorage, maintainer_job_ratio);
   }
 
  private:
@@ -3214,20 +3214,25 @@ Status VersionSet::ProcessManifestWrites(std::deque<ManifestWriter>& writers,
     EnvOptions opt_env_opts = env_->OptimizeForManifestWrite(env_options_);
     mu->Unlock();
 
-    if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+    if (s.ok() &&
+        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
       StopWatch sw(env_, db_options_->statistics.get(), BUILD_VERSION_TIME);
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         assert(!builder_guards.empty() &&
                builder_guards.size() == versions.size());
-        builder_guards[i]->DoApplyAndSaveTo(
+        s = builder_guards[i]->DoApplyAndSaveTo(
             versions[i]->storage_info(),
             mutable_cf_options_ptrs[i]->maintainer_job_ratio);
+        if (!s.ok()) {
+          break;
+        }
       }
     }
 
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifest");
 
-    if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+    if (s.ok() &&
+        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
       bool load_essence_sst =
           column_family_set_->get_table_cache()->GetCapacity() ==
           TableCache::kInfiniteCapacity;
@@ -3238,7 +3243,7 @@ Status VersionSet::ProcessManifestWrites(std::deque<ManifestWriter>& writers,
                builder_guards.size() == versions.size());
         ColumnFamilyData* cfd = versions[i]->cfd_;
         builder_guards[i]->version_builder()->LoadTableHandlers(
-            cfd->internal_stats(),
+            versions[i]->storage_info(), cfd->internal_stats(),
             mutable_cf_options_ptrs[i]->optimize_filters_for_hits,
             mutable_cf_options_ptrs[i]->prefix_extractor.get(),
             load_essence_sst);
@@ -3247,7 +3252,7 @@ Status VersionSet::ProcessManifestWrites(std::deque<ManifestWriter>& writers,
 
     // This is fine because everything inside of this block is serialized --
     // only one thread can be here at the same time
-    if (new_descriptor_log) {
+    if (s.ok() && new_descriptor_log) {
       // create new manifest file
       ROCKS_LOG_INFO(db_options_->info_log, "Creating manifest %" PRIu64 "\n",
                      pending_manifest_file_number_);
@@ -3269,7 +3274,8 @@ Status VersionSet::ProcessManifestWrites(std::deque<ManifestWriter>& writers,
       }
     }
 
-    if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+    if (s.ok() &&
+        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         versions[i]->PrepareApply(*mutable_cf_options_ptrs[i]);
       }
@@ -3843,8 +3849,11 @@ Status VersionSet::Recover(
         if (num_entries_decoded == replay_buffer.size()) {
           TEST_SYNC_POINT_CALLBACK("VersionSet::Recover:LastInAtomicGroup",
                                    &edit);
+          std::unordered_set<uint32_t> replayed_column_families;
           for (auto& e : replay_buffer) {
-            e.set_open_db(true);
+            if (!e.IsColumnFamilyManipulation()) {
+              replayed_column_families.insert(e.column_family_);
+            }
             s = ApplyOneVersionEdit(
                 e, cf_name_to_options, column_families_not_found, builders,
                 &have_log_number, &log_number, &have_prev_log_number,
@@ -3853,6 +3862,15 @@ Status VersionSet::Recover(
                 &max_column_family);
             if (!s.ok()) {
               break;
+            }
+          }
+          if (s.ok()) {
+            for (uint32_t column_family : replayed_column_families) {
+              auto builder = builders.find(column_family);
+              if (builder != builders.end()) {
+                builder->second->version_builder()
+                    ->MaybePruneRecoveryState();
+              }
             }
           }
           replay_buffer.clear();
@@ -3866,13 +3884,18 @@ Status VersionSet::Recover(
           s = Status::Corruption("corrupted atomic group");
           break;
         }
-        edit.set_open_db(true);
         s = ApplyOneVersionEdit(
             edit, cf_name_to_options, column_families_not_found, builders,
             &have_log_number, &log_number, &have_prev_log_number,
             &previous_log_number, &have_next_file, &next_file,
             &have_last_sequence, &last_sequence, &min_log_number_to_keep,
             &max_column_family);
+        if (s.ok() && !edit.IsColumnFamilyManipulation()) {
+          auto builder = builders.find(edit.column_family_);
+          if (builder != builders.end()) {
+            builder->second->version_builder()->MaybePruneRecoveryState();
+          }
+        }
       }
       if (!s.ok()) {
         break;
@@ -3932,6 +3955,19 @@ Status VersionSet::Recover(
       if (cfd->IsDropped()) {
         continue;
       }
+      assert(builders.count(cfd->GetID()) > 0);
+      s = builders[cfd->GetID()]->version_builder()->ValidateLiveDependences();
+      if (!s.ok()) {
+        break;
+      }
+    }
+  }
+
+  if (s.ok()) {
+    for (auto cfd : *column_family_set_) {
+      if (cfd->IsDropped()) {
+        continue;
+      }
       if (read_only) {
         cfd->table_cache()->SetTablesAreImmortal();
       }
@@ -3946,11 +3982,6 @@ Status VersionSet::Recover(
       // if unlimited table cache, pre-load all table handle. otherwise only
       // pre-load map sst.
       // Need to do it out of the mutex.
-      builder->LoadTableHandlers(
-          cfd->internal_stats(), false /* prefetch_index_and_filter_in_cache */,
-          cfd->GetLatestMutableCFOptions()->prefix_extractor.get(),
-          load_essence_sst, db_options_->max_file_opening_threads);
-
       builder->UpgradeFileMetaData(
           cfd->GetLatestMutableCFOptions()->prefix_extractor.get(),
           db_options_->max_file_opening_threads);
@@ -3958,40 +3989,52 @@ Status VersionSet::Recover(
       Version* v = new Version(cfd, this, env_options_,
                                *cfd->GetLatestMutableCFOptions(),
                                current_version_number_++);
-      builder->SaveTo(v->storage_info(), 0);
+      s = builder->SaveTo(v->storage_info(), 0);
+      if (!s.ok()) {
+        delete v;
+        break;
+      }
+      builder->LoadTableHandlers(
+          v->storage_info(), cfd->internal_stats(),
+          false /* prefetch_index_and_filter_in_cache */,
+          cfd->GetLatestMutableCFOptions()->prefix_extractor.get(),
+          load_essence_sst, db_options_->max_file_opening_threads);
 
       // Install recovered version
       v->PrepareApply(*cfd->GetLatestMutableCFOptions());
       AppendVersion(cfd, v);
     }
 
-    manifest_file_size_ = current_manifest_file_size;
-    manifest_edit_count_ = current_manifest_edit_count;
-    next_file_number_.store(next_file + 1);
-    last_allocated_sequence_ = last_sequence;
-    last_published_sequence_ = last_sequence;
-    last_sequence_ = last_sequence;
-    prev_log_number_ = previous_log_number;
+    if (s.ok()) {
+      manifest_file_size_ = current_manifest_file_size;
+      manifest_edit_count_ = current_manifest_edit_count;
+      next_file_number_.store(next_file + 1);
+      last_allocated_sequence_ = last_sequence;
+      last_published_sequence_ = last_sequence;
+      last_sequence_ = last_sequence;
+      prev_log_number_ = previous_log_number;
 
-    ROCKS_LOG_INFO(
-        db_options_->info_log,
-        "Recovered from manifest file:%s succeeded,"
-        "manifest_file_number is %" PRIu64 ", next_file_number is %" PRIu64
-        ", last_sequence is %" PRIu64 ", log_number is %" PRIu64
-        ", prev_log_number is %" PRIu64
-        ", max_column_family is %u, min_log_number_to_keep is %" PRIu64 "\n",
-        manifest_filename.c_str(), manifest_file_number_,
-        next_file_number_.load(), last_sequence_.load(), log_number,
-        prev_log_number_, column_family_set_->GetMaxColumnFamily(),
-        min_log_number_to_keep_2pc());
+      ROCKS_LOG_INFO(
+          db_options_->info_log,
+          "Recovered from manifest file:%s succeeded,"
+          "manifest_file_number is %" PRIu64 ", next_file_number is %" PRIu64
+          ", last_sequence is %" PRIu64 ", log_number is %" PRIu64
+          ", prev_log_number is %" PRIu64
+          ", max_column_family is %u, min_log_number_to_keep is %" PRIu64 "\n",
+          manifest_filename.c_str(), manifest_file_number_,
+          next_file_number_.load(), last_sequence_.load(), log_number,
+          prev_log_number_, column_family_set_->GetMaxColumnFamily(),
+          min_log_number_to_keep_2pc());
 
-    for (auto cfd : *column_family_set_) {
-      if (cfd->IsDropped()) {
-        continue;
+      for (auto cfd : *column_family_set_) {
+        if (cfd->IsDropped()) {
+          continue;
+        }
+        ROCKS_LOG_INFO(
+            db_options_->info_log,
+            "Column family [%s] (ID %u), log number is %" PRIu64 "\n",
+            cfd->GetName().c_str(), cfd->GetID(), cfd->GetLogNumber());
       }
-      ROCKS_LOG_INFO(db_options_->info_log,
-                     "Column family [%s] (ID %u), log number is %" PRIu64 "\n",
-                     cfd->GetName().c_str(), cfd->GetID(), cfd->GetLogNumber());
     }
   }
 
@@ -4328,7 +4371,11 @@ Status VersionSet::DumpManifest(Options& options, std::string& dscname,
       Version* v = new Version(cfd, this, env_options_,
                                *cfd->GetLatestMutableCFOptions(),
                                current_version_number_++);
-      builder->SaveTo(v->storage_info(), 0);
+      s = builder->SaveTo(v->storage_info(), 0);
+      if (!s.ok()) {
+        delete v;
+        break;
+      }
       v->PrepareApply(*cfd->GetLatestMutableCFOptions());
 
       printf("--------------- Column family \"%s\"  (ID %u) --------------\n",
@@ -4344,23 +4391,24 @@ Status VersionSet::DumpManifest(Options& options, std::string& dscname,
       delete v;
     }
 
-    // Free builders
-    for (auto& builder : builders) {
-      delete builder.second;
+    if (s.ok()) {
+      next_file_number_.store(next_file + 1);
+      last_allocated_sequence_ = last_sequence;
+      last_published_sequence_ = last_sequence;
+      last_sequence_ = last_sequence;
+      prev_log_number_ = previous_log_number;
+
+      printf("next_file_number %" PRIu64 " last_sequence %" PRIu64
+             " prev_log_number %" PRIu64
+             " max_column_family %u min_log_number_to_keep %" PRIu64 "\n",
+             next_file_number_.load(), last_sequence, previous_log_number,
+             column_family_set_->GetMaxColumnFamily(),
+             min_log_number_to_keep_2pc());
     }
+  }
 
-    next_file_number_.store(next_file + 1);
-    last_allocated_sequence_ = last_sequence;
-    last_published_sequence_ = last_sequence;
-    last_sequence_ = last_sequence;
-    prev_log_number_ = previous_log_number;
-
-    printf("next_file_number %" PRIu64 " last_sequence %" PRIu64
-           " prev_log_number %" PRIu64
-           " max_column_family %u min_log_number_to_keep %" PRIu64 "\n",
-           next_file_number_.load(), last_sequence, previous_log_number,
-           column_family_set_->GetMaxColumnFamily(),
-           min_log_number_to_keep_2pc());
+  for (auto& builder : builders) {
+    delete builder.second;
   }
 
   return s;

@@ -728,6 +728,19 @@ class VersionSetTest : public VersionSetTestBase, public testing::Test {
   VersionSetTest() : VersionSetTestBase() {}
 };
 
+class ScopedSyncPointCallbacks {
+ public:
+  ScopedSyncPointCallbacks() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  ~ScopedSyncPointCallbacks() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+};
+
 TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   NewDB();
   const int kGroupSize = 5;
@@ -762,6 +775,120 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   mutex_.Unlock();
   EXPECT_OK(s);
   EXPECT_EQ(kGroupSize - 1, count);
+}
+
+TEST_F(VersionSetTest, RecoverSkipsDeletedMapSstPreload) {
+  db_options_.statistics = CreateDBStatistics();
+
+  std::vector<ColumnFamilyDescriptor> column_families;
+  SequenceNumber last_seqno;
+  std::unique_ptr<log::Writer> log_writer;
+  PrepareManifest(&column_families, &last_seqno, &log_writer);
+
+  constexpr uint64_t kDeletedFileNumber = 10;
+  TablePropertyCache prop;
+  prop.purpose = kMapSst;
+
+  VersionEdit add_file;
+  add_file.AddFile(0, kDeletedFileNumber, 0, 4, InternalKey("a", 1, kTypeValue),
+                   InternalKey("z", 1, kTypeValue), 1, 1, 0, prop);
+  add_file.SetLogNumber(0);
+  add_file.SetNextFile(kDeletedFileNumber + 1);
+  add_file.SetLastSequence(last_seqno++);
+
+  VersionEdit delete_file;
+  delete_file.DeleteFile(0, kDeletedFileNumber);
+  delete_file.SetLogNumber(0);
+  delete_file.SetNextFile(kDeletedFileNumber + 1);
+  delete_file.SetLastSequence(last_seqno++);
+
+  for (const auto* edit : {&add_file, &delete_file}) {
+    std::string record;
+    ASSERT_TRUE(edit->EncodeTo(&record));
+    ASSERT_OK(log_writer->AddRecord(record));
+  }
+  log_writer.reset();
+  ASSERT_OK(SetCurrentFile(env_, dbname_, 1, nullptr));
+
+  ASSERT_OK(versions_->Recover(column_families, false));
+  EXPECT_EQ(0, db_options_.statistics->getTickerCount(NO_FILE_ERRORS));
+  EXPECT_EQ(0, versions_->GetColumnFamilySet()
+                   ->GetDefault()
+                   ->current()
+                   ->storage_info()
+                   ->dependence_map()
+                   .count(kDeletedFileNumber));
+}
+
+TEST_F(VersionSetTest, RecoverRejectsMissingLiveMapSstDependence) {
+  db_options_.statistics = CreateDBStatistics();
+
+  std::vector<ColumnFamilyDescriptor> column_families;
+  SequenceNumber last_seqno;
+  std::unique_ptr<log::Writer> log_writer;
+  PrepareManifest(&column_families, &last_seqno, &log_writer);
+
+  constexpr uint64_t kMapFileNumber = 10;
+  constexpr uint64_t kMissingFileNumber = 11;
+  TablePropertyCache prop;
+  prop.purpose = kMapSst;
+  prop.num_entries = 1;
+  prop.dependence.emplace_back(Dependence{kMissingFileNumber, 1});
+
+  VersionEdit add_file;
+  add_file.AddFile(0, kMapFileNumber, 0, 4, InternalKey("a", 1, kTypeValue),
+                   InternalKey("z", 1, kTypeValue), 1, 1, 0, prop);
+  add_file.SetLogNumber(0);
+  add_file.SetNextFile(kMissingFileNumber + 1);
+  add_file.SetLastSequence(last_seqno++);
+
+  std::string record;
+  ASSERT_TRUE(add_file.EncodeTo(&record));
+  ASSERT_OK(log_writer->AddRecord(record));
+  log_writer.reset();
+  ASSERT_OK(SetCurrentFile(env_, dbname_, 1, nullptr));
+
+  Status status = versions_->Recover(column_families, false);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(std::string::npos,
+            status.ToString().find("Missing SST dependence"));
+  ASSERT_NE(std::string::npos, status.ToString().find("owner = 10"));
+  ASSERT_NE(std::string::npos, status.ToString().find("missing = 11"));
+  EXPECT_EQ(0, db_options_.statistics->getTickerCount(NO_FILE_ERRORS));
+}
+
+TEST_F(VersionSetTest, LogAndApplyRejectsMissingLiveDependence) {
+  NewDB();
+
+  ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(nullptr, cfd);
+  Version* current = cfd->current();
+  const uint64_t manifest_size = versions_->manifest_file_size();
+  const size_t level0_files = current->storage_info()->LevelFiles(0).size();
+
+  constexpr uint64_t kMapFileNumber = 10;
+  constexpr uint64_t kMissingFileNumber = 11;
+  TablePropertyCache prop;
+  prop.purpose = kMapSst;
+  prop.num_entries = 1;
+  prop.dependence.emplace_back(Dependence{kMissingFileNumber, 1});
+
+  VersionEdit version_edit;
+  version_edit.AddFile(0, kMapFileNumber, 0, 4,
+                       InternalKey("a", 1, kTypeValue),
+                       InternalKey("z", 1, kTypeValue), 1, 1, 0, prop);
+
+  mutex_.Lock();
+  Status status = versions_->LogAndApply(
+      cfd, *cfd->GetLatestMutableCFOptions(), &version_edit, &mutex_);
+  mutex_.Unlock();
+
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(std::string::npos,
+            status.ToString().find("Missing SST dependence"));
+  EXPECT_EQ(manifest_size, versions_->manifest_file_size());
+  EXPECT_EQ(current, cfd->current());
+  EXPECT_EQ(level0_files, current->storage_info()->LevelFiles(0).size());
 }
 
 TEST_F(VersionSetTest, HandleValidAtomicGroup) {
@@ -820,6 +947,220 @@ TEST_F(VersionSetTest, HandleValidAtomicGroup) {
             versions_->GetColumnFamilySet()->NumberOfColumnFamilies());
   EXPECT_TRUE(first_in_atomic_group);
   EXPECT_TRUE(last_in_atomic_group);
+}
+
+TEST_F(VersionSetTest, AtomicGroupDefersDependencePruning) {
+  std::vector<ColumnFamilyDescriptor> column_families;
+  SequenceNumber last_seqno;
+  std::unique_ptr<log::Writer> log_writer;
+  PrepareManifest(&column_families, &last_seqno, &log_writer);
+
+  constexpr uint64_t kOldRootFileNumber = 10;
+  constexpr uint64_t kNewRootFileNumber = 11;
+  constexpr uint64_t kSourceFileNumber = 20;
+  TablePropertyCache root_prop;
+  root_prop.num_entries = 1;
+  root_prop.dependence.emplace_back(Dependence{kSourceFileNumber, 1});
+  TablePropertyCache source_prop;
+  source_prop.purpose = kEssenceSst;
+  source_prop.num_entries = 1;
+
+  VersionEdit add_initial_files;
+  add_initial_files.AddFile(
+      0, kOldRootFileNumber, 0, 4, InternalKey("a", 1, kTypeValue),
+      InternalKey("z", 1, kTypeValue), 1, 1, 0, root_prop);
+  add_initial_files.AddFile(
+      -1, kSourceFileNumber, 0, 4, InternalKey("a", 1, kTypeValue),
+      InternalKey("z", 1, kTypeValue), 1, 1, 0, source_prop);
+  add_initial_files.SetLogNumber(0);
+  add_initial_files.SetNextFile(kSourceFileNumber + 1);
+  add_initial_files.SetLastSequence(last_seqno++);
+
+  VersionEdit delete_old_root;
+  delete_old_root.DeleteFile(0, kOldRootFileNumber);
+  delete_old_root.MarkAtomicGroup(1);
+  delete_old_root.SetLogNumber(0);
+  delete_old_root.SetNextFile(kSourceFileNumber + 1);
+  delete_old_root.SetLastSequence(last_seqno++);
+
+  VersionEdit add_new_root;
+  add_new_root.AddFile(
+      0, kNewRootFileNumber, 0, 4, InternalKey("a", 2, kTypeValue),
+      InternalKey("z", 2, kTypeValue), 2, 2, 0, root_prop);
+  add_new_root.MarkAtomicGroup(0);
+  add_new_root.SetLogNumber(0);
+  add_new_root.SetNextFile(kSourceFileNumber + 1);
+  add_new_root.SetLastSequence(last_seqno++);
+
+  for (const auto* edit :
+       {&add_initial_files, &delete_old_root, &add_new_root}) {
+    std::string record;
+    ASSERT_TRUE(edit->EncodeTo(&record));
+    ASSERT_OK(log_writer->AddRecord(record));
+  }
+  log_writer.reset();
+  ASSERT_OK(SetCurrentFile(env_, dbname_, 1, nullptr));
+
+  size_t max_deleted_files_hook_calls = 0;
+  size_t prune_hook_calls = 0;
+  bool atomic_group_decoded = false;
+  Status status;
+  {
+    ScopedSyncPointCallbacks sync_point_callbacks;
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionSet::Recover:LastInAtomicGroup",
+        [&](void* /* arg */) { atomic_group_decoded = true; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionBuilder::CalculateDependence:MaxDeletedFiles", [&](void* arg) {
+          ++max_deleted_files_hook_calls;
+          *static_cast<size_t*>(arg) = 1;
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionBuilder::MaybePruneRecoveryState:Prune",
+        [&](void* /* arg */) {
+          EXPECT_TRUE(atomic_group_decoded);
+          EXPECT_GT(max_deleted_files_hook_calls, 0U);
+          ++prune_hook_calls;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    status = versions_->Recover(column_families, false);
+  }
+
+  ASSERT_OK(status);
+  EXPECT_TRUE(atomic_group_decoded);
+  EXPECT_GT(max_deleted_files_hook_calls, 0U);
+  EXPECT_EQ(1U, prune_hook_calls);
+
+  auto* current = versions_->GetColumnFamilySet()->GetDefault()->current();
+  ASSERT_EQ(0U, current->storage_info()
+                    ->dependence_map()
+                    .count(kOldRootFileNumber));
+  ASSERT_EQ(1U, current->storage_info()
+                    ->dependence_map()
+                    .count(kNewRootFileNumber));
+  ASSERT_EQ(1U, current->storage_info()
+                    ->dependence_map()
+                    .count(kSourceFileNumber));
+}
+
+TEST_F(VersionSetTest, AtomicGroupPrunesNonFinalColumnFamily) {
+  std::vector<ColumnFamilyDescriptor> column_families;
+  SequenceNumber last_seqno;
+  std::unique_ptr<log::Writer> log_writer;
+  PrepareManifest(&column_families, &last_seqno, &log_writer);
+
+  constexpr uint32_t kRootColumnFamily = 1;
+  constexpr uint32_t kFinalColumnFamily = 2;
+  constexpr uint64_t kOldRootFileNumber = 10;
+  constexpr uint64_t kNewRootFileNumber = 11;
+  constexpr uint64_t kSourceFileNumber = 20;
+  constexpr uint64_t kFinalColumnFamilyFileNumber = 30;
+  constexpr uint64_t kNextFileNumber = kFinalColumnFamilyFileNumber + 1;
+  TablePropertyCache root_prop;
+  root_prop.num_entries = 1;
+  root_prop.dependence.emplace_back(Dependence{kSourceFileNumber, 1});
+  TablePropertyCache source_prop;
+  source_prop.purpose = kEssenceSst;
+  source_prop.num_entries = 1;
+
+  VersionEdit add_initial_files;
+  add_initial_files.SetColumnFamily(kRootColumnFamily);
+  add_initial_files.AddFile(
+      0, kOldRootFileNumber, 0, 4, InternalKey("a", 1, kTypeValue),
+      InternalKey("z", 1, kTypeValue), 1, 1, 0, root_prop);
+  add_initial_files.AddFile(
+      -1, kSourceFileNumber, 0, 4, InternalKey("a", 1, kTypeValue),
+      InternalKey("z", 1, kTypeValue), 1, 1, 0, source_prop);
+  add_initial_files.SetLogNumber(0);
+  add_initial_files.SetNextFile(kNextFileNumber);
+  add_initial_files.SetLastSequence(last_seqno++);
+
+  VersionEdit delete_old_root;
+  delete_old_root.SetColumnFamily(kRootColumnFamily);
+  delete_old_root.DeleteFile(0, kOldRootFileNumber);
+  delete_old_root.MarkAtomicGroup(2);
+  delete_old_root.SetLogNumber(0);
+  delete_old_root.SetNextFile(kNextFileNumber);
+  delete_old_root.SetLastSequence(last_seqno++);
+
+  VersionEdit add_new_root;
+  add_new_root.SetColumnFamily(kRootColumnFamily);
+  add_new_root.AddFile(
+      0, kNewRootFileNumber, 0, 4, InternalKey("a", 2, kTypeValue),
+      InternalKey("z", 2, kTypeValue), 2, 2, 0, root_prop);
+  add_new_root.MarkAtomicGroup(1);
+  add_new_root.SetLogNumber(0);
+  add_new_root.SetNextFile(kNextFileNumber);
+  add_new_root.SetLastSequence(last_seqno++);
+
+  VersionEdit add_final_column_family_file;
+  add_final_column_family_file.SetColumnFamily(kFinalColumnFamily);
+  add_final_column_family_file.AddFile(
+      0, kFinalColumnFamilyFileNumber, 0, 4,
+      InternalKey("a", 3, kTypeValue), InternalKey("z", 3, kTypeValue), 3, 3,
+      0, TablePropertyCache());
+  add_final_column_family_file.MarkAtomicGroup(0);
+  add_final_column_family_file.SetLogNumber(0);
+  add_final_column_family_file.SetNextFile(kNextFileNumber);
+  add_final_column_family_file.SetLastSequence(last_seqno++);
+
+  for (const auto* edit : {&add_initial_files, &delete_old_root, &add_new_root,
+                           &add_final_column_family_file}) {
+    std::string record;
+    ASSERT_TRUE(edit->EncodeTo(&record));
+    ASSERT_OK(log_writer->AddRecord(record));
+  }
+  log_writer.reset();
+  ASSERT_OK(SetCurrentFile(env_, dbname_, 1, nullptr));
+
+  size_t max_deleted_files_hook_calls = 0;
+  size_t prune_hook_calls = 0;
+  bool atomic_group_decoded = false;
+  Status status;
+  {
+    ScopedSyncPointCallbacks sync_point_callbacks;
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionSet::Recover:LastInAtomicGroup",
+        [&](void* /* arg */) { atomic_group_decoded = true; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionBuilder::CalculateDependence:MaxDeletedFiles", [&](void* arg) {
+          ++max_deleted_files_hook_calls;
+          *static_cast<size_t*>(arg) = 1;
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionBuilder::MaybePruneRecoveryState:Prune",
+        [&](void* /* arg */) {
+          EXPECT_TRUE(atomic_group_decoded);
+          EXPECT_GT(max_deleted_files_hook_calls, 0U);
+          ++prune_hook_calls;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    status = versions_->Recover(column_families, false);
+  }
+
+  ASSERT_OK(status);
+  EXPECT_TRUE(atomic_group_decoded);
+  EXPECT_GT(max_deleted_files_hook_calls, 0U);
+  EXPECT_EQ(1U, prune_hook_calls);
+
+  auto* root_cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(kColumnFamilyName1);
+  ASSERT_NE(nullptr, root_cfd);
+  const auto& root_dependence_map =
+      root_cfd->current()->storage_info()->dependence_map();
+  EXPECT_EQ(0U, root_dependence_map.count(kOldRootFileNumber));
+  EXPECT_EQ(1U, root_dependence_map.count(kNewRootFileNumber));
+  EXPECT_EQ(1U, root_dependence_map.count(kSourceFileNumber));
+
+  auto* final_cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(kColumnFamilyName2);
+  ASSERT_NE(nullptr, final_cfd);
+  EXPECT_EQ(1U, final_cfd->current()
+                    ->storage_info()
+                    ->dependence_map()
+                    .count(kFinalColumnFamilyFileNumber));
 }
 
 TEST_F(VersionSetTest, HandleIncompleteTrailingAtomicGroup) {

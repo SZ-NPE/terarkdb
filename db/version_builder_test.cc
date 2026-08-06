@@ -155,7 +155,7 @@ TEST_F(VersionBuilderTest, ApplyAndSaveTo) {
   VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
-  version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage, 0));
 
   ASSERT_EQ(400U, new_vstorage.NumLevelBytes(2));
   ASSERT_EQ(300U, new_vstorage.NumLevelBytes(3));
@@ -193,7 +193,7 @@ TEST_F(VersionBuilderTest, ApplyAndSaveToDynamic) {
   VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
-  version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage, 0));
 
   ASSERT_EQ(0U, new_vstorage.NumLevelBytes(0));
   ASSERT_EQ(100U, new_vstorage.NumLevelBytes(3));
@@ -243,7 +243,7 @@ TEST_F(VersionBuilderTest, ApplyAndSaveToDynamic2) {
   VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
-  version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage, 0));
 
   ASSERT_EQ(0U, new_vstorage.NumLevelBytes(0));
   ASSERT_EQ(200U, new_vstorage.NumLevelBytes(4));
@@ -320,7 +320,7 @@ TEST_F(VersionBuilderTest, ApplyAndSaveToDynamic3) {
 
   VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
                                   kCompactionStyleLevel, false);
-  version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage, 0));
 
   ASSERT_EQ(0U, new_vstorage.NumLevelBytes(1));
   ASSERT_EQ(150U, new_vstorage.NumLevelBytes(2));
@@ -351,7 +351,7 @@ TEST_F(VersionBuilderTest, ApplyMultipleAndSaveTo) {
   VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
                                   kCompactionStyleLevel, false);
   version_builder.Apply(&version_edit);
-  version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage, 0));
 
   ASSERT_EQ(500U, new_vstorage.NumLevelBytes(2));
   ASSERT_TRUE(VerifyDependFiles(&new_vstorage, {666, 676, 636, 616, 606}));
@@ -389,7 +389,7 @@ TEST_F(VersionBuilderTest, ApplyDeleteAndSaveTo) {
                        GetInternalKey("850"), 200, 200, false, {});
   version_builder.Apply(&version_edit2);
 
-  version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage, 0));
 
   ASSERT_EQ(300U, new_vstorage.NumLevelBytes(2));
   ASSERT_TRUE(VerifyDependFiles(&new_vstorage, {666, 676, 606}));
@@ -417,6 +417,107 @@ TEST_F(VersionBuilderTest, EstimatedActiveKeys) {
   // 1x for each deletion entry will actually remove one data entry.
   ASSERT_EQ(vstorage_.GetEstimatedActiveKeys(),
             (kEntriesPerFile - kDeletionsPerFile) * kNumFiles);
+}
+
+TEST_F(VersionBuilderTest, InheritanceAliasesResolveToCanonicalValueFile) {
+  constexpr uint64_t kFirstAlias = 11;
+  constexpr uint64_t kSecondAlias = 22;
+  constexpr uint64_t kCanonicalFileNumber = 33;
+  constexpr uint64_t kMapFileNumber = 44;
+  Add(-1, kCanonicalFileNumber, "a", "z", 100, 0, 100, 100, 1, 0, 0, 0,
+      GetPropCache(kEssenceSst, {}, {kFirstAlias, kSecondAlias}));
+  Add(0, kMapFileNumber, "a", "z", 100, 0, 100, 100, 1, 0, 0, 0,
+      GetPropCache(kMapSst, {kFirstAlias}));
+  UpdateVersionStorageInfo();
+
+  auto verify_aliases = [&](const VersionStorageInfo& storage,
+                            bool second_alias_expected) {
+    const auto& dependence_map = storage.dependence_map();
+    auto canonical = dependence_map.find(kCanonicalFileNumber);
+    auto first_alias = dependence_map.find(kFirstAlias);
+    auto second_alias = dependence_map.find(kSecondAlias);
+    ASSERT_NE(dependence_map.end(), canonical);
+    ASSERT_NE(dependence_map.end(), first_alias);
+    ASSERT_EQ(canonical->second, first_alias->second);
+    if (second_alias_expected) {
+      ASSERT_NE(dependence_map.end(), second_alias);
+      ASSERT_EQ(canonical->second, second_alias->second);
+    } else {
+      ASSERT_EQ(dependence_map.end(), second_alias);
+    }
+    ASSERT_EQ(kCanonicalFileNumber, canonical->second->fd.GetNumber());
+  };
+  verify_aliases(vstorage_, true);
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage, 0));
+  verify_aliases(new_vstorage, false);
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, RejectsMissingLiveDependence) {
+  UpdateVersionStorageInfo();
+
+  constexpr uint64_t kMapFileNumber = 10;
+  constexpr uint64_t kSourceFileNumber = 20;
+  constexpr uint64_t kMissingFileNumber = 30;
+  TablePropertyCache map_prop = GetPropCache(kMapSst, {kSourceFileNumber});
+  map_prop.num_entries = 1;
+  TablePropertyCache source_prop =
+      GetPropCache(kEssenceSst, {kMissingFileNumber});
+  source_prop.num_entries = 1;
+
+  VersionEdit version_edit;
+  version_edit.AddFile(0, kMapFileNumber, 0, 100U, GetInternalKey("a"),
+                       GetInternalKey("z"), 1, 1, false, map_prop);
+  version_edit.AddFile(-1, kSourceFileNumber, 0, 100U, GetInternalKey("a"),
+                       GetInternalKey("z"), 1, 1, false, source_prop);
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+
+  Status status = version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(std::string::npos,
+            status.ToString().find("Missing SST dependence"));
+  ASSERT_NE(std::string::npos, status.ToString().find("owner = 20"));
+  ASSERT_NE(std::string::npos, status.ToString().find("missing = 30"));
+}
+
+TEST_F(VersionBuilderTest, RejectsCyclicLiveDependence) {
+  UpdateVersionStorageInfo();
+
+  constexpr uint64_t kFirstMapFileNumber = 10;
+  constexpr uint64_t kSecondMapFileNumber = 20;
+  TablePropertyCache first_prop =
+      GetPropCache(kMapSst, {kSecondMapFileNumber});
+  first_prop.num_entries = 1;
+  TablePropertyCache second_prop =
+      GetPropCache(kMapSst, {kFirstMapFileNumber});
+  second_prop.num_entries = 1;
+
+  VersionEdit version_edit;
+  version_edit.AddFile(0, kFirstMapFileNumber, 0, 100U, GetInternalKey("a"),
+                       GetInternalKey("m"), 1, 1, false, first_prop);
+  version_edit.AddFile(0, kSecondMapFileNumber, 0, 100U, GetInternalKey("n"),
+                       GetInternalKey("z"), 1, 1, false, second_prop);
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+
+  Status status = version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(std::string::npos,
+            status.ToString().find("Cyclic SST dependence"));
 }
 
 TEST_F(VersionBuilderTest, HugeLSM) {
@@ -489,7 +590,7 @@ TEST_F(VersionBuilderTest, HugeLSM) {
 
   version_builder.Apply(&version_edit);
 
-  version_builder.SaveTo(&new_vstorage, 0);
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage, 0));
 
   UnrefFilesInVersion(&new_vstorage);
 }
