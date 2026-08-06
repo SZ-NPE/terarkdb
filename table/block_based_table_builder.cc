@@ -18,6 +18,8 @@
 #include <utility>
 
 #include "db/dbformat.h"
+#include "db/gc_liveness_bloom.h"
+#include "db/separated_value_reference.h"
 #include "db/version_edit.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
@@ -263,6 +265,8 @@ struct BlockBasedTableBuilder::Rep {
   CompressionContext compression_ctx;
   std::unique_ptr<UncompressionContext> verify_ctx;
   TableProperties props;
+  SeparatedValueReferenceMetadata separated_value_references;
+  GarbageCollectionLivenessBloomBuilder gc_liveness_bloom;
 
   bool closed = false;  // Either Finish() or Abandon() has been called.
   const bool use_delta_encoding_for_index_values;
@@ -430,6 +434,7 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
   r->last_key.assign(key.data(), key.size());
   r->data_block.Add(key, value);
   r->props.num_entries++;
+  ++r->separated_value_references.record_count;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
   ValueType value_type = ExtractValueType(key);
@@ -437,6 +442,29 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
     r->props.num_deletions++;
   } else if (value_type == kTypeMerge) {
     r->props.num_merge_operands++;
+  } else if (value_type == kTypeValueIndex ||
+             value_type == kTypeMergeIndex) {
+    if (value.size() < sizeof(uint64_t)) {
+      r->separated_value_references.complete = false;
+    } else {
+      SeparateHelper::ValueReference reference;
+      if (!SeparateHelper::DecodeValueReference(value, &reference)) {
+        return Status::Corruption(
+            "BlockBasedTableBuilder::Add: invalid separated value reference",
+            key.ToString(true));
+      }
+      r->separated_value_references.AddReference(ExtractUserKey(key),
+                                                 reference.file_number);
+      if (r->moptions.gc_liveness_bloom) {
+        ParsedInternalKey parsed_key;
+        if (!ParseInternalKey(key, &parsed_key)) {
+          return Status::Corruption(
+              "BlockBasedTableBuilder::Add: invalid InternalKey",
+              key.ToString(true));
+        }
+        r->gc_liveness_bloom.Add(reference.file_number, parsed_key);
+      }
+    }
   }
 
   r->index_builder->OnKeyAdded(key);
@@ -459,6 +487,7 @@ Status BlockBasedTableBuilder::AddTombstone(const Slice& key,
   assert(ExtractValueType(key) == kTypeRangeDeletion);
   r->range_del_block.Add(key, value);
   ++r->props.num_range_deletions;
+  ++r->separated_value_references.range_deletion_count;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
   NotifyCollectTableCollectorsOnAdd(key, value, r->offset,
@@ -834,6 +863,12 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
     rep_->props.oldest_key_time = rep_->oldest_key_time;
 
     // Add basic properties
+    if (rep_->separated_value_references.complete) {
+      property_block_builder.Add(
+          kSeparatedValueReferenceProperty,
+          EncodeSeparatedValueReferenceMetadata(
+              rep_->separated_value_references));
+    }
     property_block_builder.AddTableProperty(rep_->props);
 
     // Add use collected properties
@@ -871,6 +906,20 @@ void BlockBasedTableBuilder::WriteRangeDelBlock(
     WriteRawBlock(rep_->range_del_block.Finish(), kNoCompression,
                   &range_del_block_handle);
     meta_index_builder->Add(kRangeDelBlock, range_del_block_handle);
+  }
+}
+
+void BlockBasedTableBuilder::WriteGarbageCollectionLivenessBloomBlock(
+    MetaIndexBuilder* meta_index_builder) {
+  if (!ok() || !rep_->separated_value_references.complete ||
+      rep_->gc_liveness_bloom.empty()) {
+    return;
+  }
+  BlockHandle block_handle;
+  const std::string encoded = rep_->gc_liveness_bloom.Finish();
+  WriteRawBlock(encoded, kNoCompression, &block_handle);
+  if (ok()) {
+    meta_index_builder->Add(kGarbageCollectionLivenessBloomBlock, block_handle);
   }
 }
 
@@ -918,6 +967,7 @@ Status BlockBasedTableBuilder::Finish(
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
+  WriteGarbageCollectionLivenessBloomBlock(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);
   if (ok()) {
     // flush the meta index block
@@ -979,6 +1029,11 @@ bool BlockBasedTableBuilder::NeedCompact() const {
 
 TableProperties BlockBasedTableBuilder::GetTableProperties() const {
   TableProperties ret = rep_->props;
+  if (rep_->separated_value_references.complete) {
+    ret.user_collected_properties[kSeparatedValueReferenceProperty] =
+        EncodeSeparatedValueReferenceMetadata(
+            rep_->separated_value_references);
+  }
   for (const auto& collector : rep_->table_properties_collectors) {
     for (const auto& prop : collector->GetReadableProperties()) {
       ret.readable_properties.insert(prop);

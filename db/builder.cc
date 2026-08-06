@@ -166,16 +166,20 @@ Status BuildTable(
       FileMetaData* current_output = nullptr;
       TableProperties* current_prop = nullptr;
       std::unique_ptr<ValueExtractor> value_meta_extractor;
+      bool track_value_size = false;
       Status (*trans_to_separate_callback)(void* args, const Slice& key,
                                            LazyBuffer& value) = nullptr;
       void* trans_to_separate_callback_args = nullptr;
 
+      bool TrackValueSize() const override { return track_value_size; }
+
       Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                              const Slice& meta, bool is_merge,
-                             bool is_index) override {
+                             bool is_index, uint64_t value_size,
+                             bool has_value_size) override {
         return SeparateHelper::TransToSeparate(
             internal_key, value, value.file_number(), meta, is_merge, is_index,
-            value_meta_extractor.get());
+            value_meta_extractor.get(), value_size, has_value_size);
       }
 
       Status TransToSeparate(const Slice& internal_key,
@@ -288,19 +292,23 @@ Status BuildTable(
       }
       if (status.ok()) {
         status = blob_builder->Add(key, value);
-      }
-      if (status.ok()) {
-        blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
-        status = SeparateHelper::TransToSeparate(
-            key, value, blob_meta->fd.GetNumber(), Slice(),
-            GetInternalKeyType(key) == kTypeMerge, false,
-            separate_helper.value_meta_extractor.get());
+        if (status.ok()) {
+          const uint64_t logical_value_size =
+              separate_helper.track_value_size ? value.size() : 0;
+          blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
+          status = SeparateHelper::TransToSeparate(
+              key, value, blob_meta->fd.GetNumber(), Slice(),
+              GetInternalKeyType(key) == kTypeMerge, false,
+              separate_helper.value_meta_extractor.get(), logical_value_size,
+              separate_helper.track_value_size);
+        }
       }
       return status;
     };
 
     separate_helper.output = meta_vec;
     separate_helper.prop = table_properties_vec;
+    separate_helper.track_value_size = mutable_cf_options.precise_gc;
     BlobConfig blob_config = mutable_cf_options.get_blob_config();
     if (ioptions.table_factory->IsBuilderNeedSecondPass()) {
       blob_config.blob_size = size_t(-1);
@@ -387,9 +395,9 @@ Status BuildTable(
                                            tombstone.seq_, internal_comparator);
     }
 
-    // Finish and check for builder errors
-    tp = builder->GetTableProperties();
-    bool empty = builder->NumEntries() == 0 && tp.num_range_deletions == 0;
+    // Finish and check for builder errors.
+    const bool empty = builder->NumEntries() == 0 &&
+                       builder->GetTableProperties().num_range_deletions == 0;
     if (s.ok()) {
       s = c_iter.status();
     }
@@ -408,12 +416,20 @@ Status BuildTable(
         assert(sst_meta()->prop.dependence.empty() ||
                blob.fd.GetNumber() >
                    sst_meta()->prop.dependence.back().file_number);
-        sst_meta()->prop.dependence.emplace_back(
-            Dependence{blob.fd.GetNumber(), blob.prop.num_entries});
+        sst_meta()->prop.dependence.emplace_back(Dependence{
+            blob.fd.GetNumber(), blob.prop.num_entries,
+            mutable_cf_options.precise_gc
+                ? (blob.prop.raw_value_size != 0 ? blob.prop.raw_value_size
+                                                 : blob.fd.GetFileSize())
+                : 0});
       }
       auto shrinked_snapshots = sst_meta()->ShrinkSnapshot(snapshots);
       s = builder->Finish(&sst_meta()->prop, &shrinked_snapshots);
 
+      // Finish() writes the separated-value metadata block. Read properties
+      // only after it completes so the manifest completeness flag matches
+      // the metadata persisted in the SST.
+      tp = builder->GetTableProperties();
       ProcessFileMetaData("FlushOutput", sst_meta(), &tp, &ioptions,
                           &mutable_cf_options);
     }

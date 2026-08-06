@@ -324,6 +324,27 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // blob_gc_defer_ratio) when blob_gc_defer_enabled is true.
   double blob_gc_defer_ratio = 1.0;
 
+  // Use byte-precise garbage ratio when metadata is available.
+  bool precise_gc = false;
+
+  // Select a GC batch by reclaimed bytes, live migration bytes, and shared
+  // key-SST validation cost instead of key-range adjacency alone.
+  bool gc_cost_aware_selection = false;
+
+  // Validate GC candidates by merge-joining sorted vSST entries with the
+  // complete set of relevant key-SST references. Unsupported cases fall back
+  // to point lookups.
+  bool gc_streaming_validation = false;
+
+  // Build per-kSST liveness Bloom certificates and use Bloom-negative
+  // results to skip separated-value GC point lookups.
+  bool gc_liveness_bloom = false;
+
+  // Delete a blob file without rewriting it when the current Version proves
+  // that no key or map SST can reach it. The normal VersionEdit install path
+  // remains responsible for the deletion.
+  bool gc_purge_only = false;
+
   // Blob file size
   // Default : same as bottommost level sst file size
   uint64_t target_blob_file_size = 0;

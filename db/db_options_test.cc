@@ -121,6 +121,52 @@ TEST_F(DBOptionsTest, GetLatestCFOptions) {
             GetMutableCFOptionsMap(dbfull()->GetOptions(handles_[1])));
 }
 
+TEST_F(DBOptionsTest, SetGarbageCollectionOptions) {
+  Options options;
+  options.create_if_missing = true;
+  options.env = env_;
+  Reopen(options);
+
+  ColumnFamilyOptions current_options = dbfull()->GetOptions();
+  EXPECT_FALSE(current_options.precise_gc);
+  EXPECT_FALSE(current_options.gc_cost_aware_selection);
+  EXPECT_FALSE(current_options.gc_streaming_validation);
+  EXPECT_FALSE(current_options.gc_liveness_bloom);
+  EXPECT_FALSE(current_options.gc_purge_only);
+
+  const std::unordered_map<std::string, std::string> enabled_options = {
+      {"precise_gc", "true"},
+      {"gc_cost_aware_selection", "true"},
+      {"gc_streaming_validation", "true"},
+      {"gc_liveness_bloom", "true"},
+      {"gc_purge_only", "true"},
+  };
+  ASSERT_OK(dbfull()->SetOptions(enabled_options));
+
+  current_options = dbfull()->GetOptions();
+  EXPECT_TRUE(current_options.precise_gc);
+  EXPECT_TRUE(current_options.gc_cost_aware_selection);
+  EXPECT_TRUE(current_options.gc_streaming_validation);
+  EXPECT_TRUE(current_options.gc_liveness_bloom);
+  EXPECT_TRUE(current_options.gc_purge_only);
+
+  const std::unordered_map<std::string, std::string> disabled_options = {
+      {"precise_gc", "false"},
+      {"gc_cost_aware_selection", "false"},
+      {"gc_streaming_validation", "false"},
+      {"gc_liveness_bloom", "false"},
+      {"gc_purge_only", "false"},
+  };
+  ASSERT_OK(dbfull()->SetOptions(disabled_options));
+
+  current_options = dbfull()->GetOptions();
+  EXPECT_FALSE(current_options.precise_gc);
+  EXPECT_FALSE(current_options.gc_cost_aware_selection);
+  EXPECT_FALSE(current_options.gc_streaming_validation);
+  EXPECT_FALSE(current_options.gc_liveness_bloom);
+  EXPECT_FALSE(current_options.gc_purge_only);
+}
+
 TEST_F(DBOptionsTest, SetBytesPerSync) {
   const size_t kValueSize = 1024 * 1024;  // 1MB
   Options options;

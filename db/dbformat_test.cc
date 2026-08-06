@@ -50,6 +50,66 @@ static void TestKey(const std::string& key, uint64_t seq, ValueType vt) {
 
 class FormatTest : public testing::Test {};
 
+TEST_F(FormatTest, ValueReferenceDecode) {
+  uint64_t legacy_file_number = 123;
+  std::string legacy_reference(
+      SeparateHelper::EncodeFileNumber(legacy_file_number).data(),
+      sizeof(legacy_file_number));
+  SeparateHelper::ValueReference reference;
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(legacy_reference,
+                                                   &reference));
+  ASSERT_EQ(123U, reference.file_number);
+  ASSERT_FALSE(reference.has_value_size);
+  ASSERT_EQ(0U, reference.value_size);
+  ASSERT_TRUE(reference.value_meta.empty());
+
+  uint64_t encoded_file_number = 456 | SeparateHelper::kValueSizeFlag;
+  std::string sized_reference(
+      SeparateHelper::EncodeFileNumber(encoded_file_number).data(),
+      sizeof(encoded_file_number));
+  PutVarint64(&sized_reference, 16384);
+  sized_reference.append("meta");
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(sized_reference,
+                                                   &reference));
+  ASSERT_EQ(456U, reference.file_number);
+  ASSERT_TRUE(reference.has_value_size);
+  ASSERT_EQ(16384U, reference.value_size);
+  ASSERT_EQ("meta", reference.value_meta.ToString());
+  ASSERT_EQ("meta",
+            SeparateHelper::DecodeValueMeta(sized_reference).ToString());
+
+  std::string truncated(
+      SeparateHelper::EncodeFileNumber(encoded_file_number).data(),
+      sizeof(encoded_file_number));
+  truncated.push_back(static_cast<char>(0x80));
+  ASSERT_FALSE(SeparateHelper::DecodeValueReference(truncated, &reference));
+  ASSERT_FALSE(SeparateHelper::DecodeValueReference(Slice("short"),
+                                                    &reference));
+  uint64_t invalid_file_number = uint64_t{1} << 62;
+  std::string invalid_reference(
+      SeparateHelper::EncodeFileNumber(invalid_file_number).data(),
+      sizeof(invalid_file_number));
+  ASSERT_FALSE(SeparateHelper::DecodeValueReference(invalid_reference,
+                                                    &reference));
+
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(legacy_reference,
+                                                   &reference));
+  SeparateHelper::ReferenceStats stats;
+  stats.Add(reference);
+  ASSERT_EQ(1U, stats.entry_count);
+  ASSERT_FALSE(stats.complete);
+  ASSERT_EQ(0U, stats.byte_count);
+
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(sized_reference,
+                                                   &reference));
+  SeparateHelper::ReferenceStats sized_stats;
+  sized_stats.Add(reference);
+  sized_stats.Add(reference);
+  ASSERT_EQ(2U, sized_stats.entry_count);
+  ASSERT_TRUE(sized_stats.complete);
+  ASSERT_EQ(32768U, sized_stats.byte_count);
+}
+
 TEST_F(FormatTest, InternalKey_EncodeDecode) {
   const char* keys[] = {"", "k", "hello", "longggggggggggggggggggggg"};
   const uint64_t seq[] = {1,

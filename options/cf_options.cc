@@ -204,6 +204,16 @@ void MutableCFOptions::Dump(Logger* log) const {
                  blob_gc_defer_enabled);
   ROCKS_LOG_INFO(log, "                      blob_gc_defer_ratio: %f",
                  blob_gc_defer_ratio);
+  ROCKS_LOG_INFO(log, "                               precise_gc: %d",
+                 precise_gc);
+  ROCKS_LOG_INFO(log, "                   gc_cost_aware_selection: %d",
+                 gc_cost_aware_selection);
+  ROCKS_LOG_INFO(log, "                 gc_streaming_validation: %d",
+                 gc_streaming_validation);
+  ROCKS_LOG_INFO(log, "                       gc_liveness_bloom: %d",
+                 gc_liveness_bloom);
+  ROCKS_LOG_INFO(log, "                              gc_purge_only: %d",
+                 gc_purge_only);
   ROCKS_LOG_INFO(log, "                    target_blob_file_size: %" PRIu64,
                  target_blob_file_size);
   ROCKS_LOG_INFO(log, "                blob_file_defragment_size: %" PRIu64,
@@ -301,6 +311,11 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       blob_gc_ratio(options.blob_gc_ratio),
       blob_gc_defer_enabled(options.blob_gc_defer_enabled),
       blob_gc_defer_ratio(options.blob_gc_defer_ratio),
+      precise_gc(options.precise_gc),
+      gc_cost_aware_selection(options.gc_cost_aware_selection),
+      gc_streaming_validation(options.gc_streaming_validation),
+      gc_liveness_bloom(options.gc_liveness_bloom),
+      gc_purge_only(options.gc_purge_only),
       target_blob_file_size(options.target_blob_file_size),
       blob_file_defragment_size(options.blob_file_defragment_size),
       max_dependence_blob_overlap(options.max_dependence_blob_overlap),

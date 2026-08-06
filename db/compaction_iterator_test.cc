@@ -172,7 +172,8 @@ class FakeCompaction : public CompactionIterator::CompactionProxy {
     return is_bottommost_level || key_not_exists_beyond_output_level;
   }
   virtual SeparationType separation_type() const {
-    return kCompactionIgnoreSeparate;
+    return separate_values ? kCompactionTransToSeparate
+                           : kCompactionIgnoreSeparate;
   }
   virtual bool need_rebuild(uint64_t fn) { return false; }
   virtual bool bottommost_level() const override { return is_bottommost_level; }
@@ -187,6 +188,32 @@ class FakeCompaction : public CompactionIterator::CompactionProxy {
   bool key_not_exists_beyond_output_level = false;
 
   bool is_bottommost_level = false;
+  bool separate_values = false;
+};
+
+class TestSeparateHelper : public SeparateHelper, public LazyBufferState {
+ public:
+  void destroy(LazyBuffer* /*buffer*/) const override {}
+
+  bool TrackValueSize() const override { return track_value_size; }
+
+  Status fetch_buffer(LazyBuffer* /*buffer*/) const override {
+    ++fetch_count;
+    return Status::Corruption("unexpected separated value fetch");
+  }
+
+  LazyBuffer TransToCombined(const Slice& /*user_key*/, uint64_t /*sequence*/,
+                             const LazyBuffer& value) const override {
+    if (return_lazy_value) {
+      return LazyBuffer(this, LazyBufferContext{{0, 0, 0, 0}},
+                        Slice::Invalid(), value.file_number());
+    }
+    return LazyBuffer(value.slice(), true, value.file_number());
+  }
+
+  mutable uint64_t fetch_count = 0;
+  bool return_lazy_value = false;
+  bool track_value_size = true;
 };
 
 // A simplifed snapshot checker which assumes each snapshot has a global
@@ -229,7 +256,9 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
       SequenceNumber last_committed_sequence = kMaxSequenceNumber,
       MergeOperator* merge_op = nullptr, CompactionFilter* filter = nullptr,
       bool bottommost_level = false,
-      SequenceNumber earliest_write_conflict_snapshot = kMaxSequenceNumber) {
+      SequenceNumber earliest_write_conflict_snapshot = kMaxSequenceNumber,
+      SeparateHelper* separate_helper = nullptr,
+      BlobConfig blob_config = BlobConfig{size_t(-1), 0.0}) {
     std::unique_ptr<InternalIteratorBase<Slice>> unfragmented_range_del_iter(
         new test::VectorIteratorBase<Slice>(range_del_ks, range_del_vs));
     auto tombstone_list = std::make_shared<FragmentedRangeTombstoneList>(
@@ -241,9 +270,10 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
     range_del_agg_->AddTombstones(std::move(range_del_iter));
 
     std::unique_ptr<CompactionIterator::CompactionProxy> compaction;
-    if (filter || bottommost_level) {
+    if (filter || bottommost_level || separate_helper != nullptr) {
       compaction_proxy_ = new FakeCompaction();
       compaction_proxy_->is_bottommost_level = bottommost_level;
+      compaction_proxy_->separate_values = separate_helper != nullptr;
       compaction.reset(compaction_proxy_);
     }
     bool use_snapshot_checker = UseSnapshotChecker() || GetParam();
@@ -259,11 +289,12 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
     iter_.reset(new LoggingForwardVectorIterator(ks, vs));
     iter_->SeekToFirst();
     c_iter_.reset(new CompactionIterator(
-        iter_.get(), nullptr, nullptr, cmp_, merge_helper_.get(), last_sequence,
+        iter_.get(), separate_helper, nullptr, cmp_, merge_helper_.get(),
+        last_sequence,
         &snapshots_, earliest_write_conflict_snapshot, snapshot_checker_.get(),
         Env::Default(), false /* report_detailed_time */, false,
         range_del_agg_.get(), std::move(compaction),
-        BlobConfig{size_t(-1), 0.0}, filter, &shutting_down_));
+        blob_config, filter, &shutting_down_));
   }
 
   void AddSnapshot(SequenceNumber snapshot,
@@ -310,6 +341,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
   std::unique_ptr<CompactionIterator> c_iter_;
   std::unique_ptr<CompactionRangeDelAggregator> range_del_agg_;
   std::unique_ptr<SnapshotChecker> snapshot_checker_;
+  TestSeparateHelper separate_helper_;
   std::atomic<bool> shutting_down_{false};
   FakeCompaction* compaction_proxy_;
 };
@@ -322,6 +354,119 @@ TEST_P(CompactionIteratorTest, EmptyResult) {
                 {"", "val"}, {}, {}, 5);
   c_iter_->SeekToFirst();
   ASSERT_FALSE(c_iter_->Valid());
+}
+
+TEST_P(CompactionIteratorTest, EncodesLogicalValueSizeInReference) {
+  const std::string value(37, 'v');
+  InitIterators({test::KeyStr("a", 5, kTypeValue)}, {value}, {}, {}, 5,
+                kMaxSequenceNumber, nullptr, nullptr, false,
+                kMaxSequenceNumber, &separate_helper_,
+                BlobConfig{1, 1.0});
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(kTypeValueIndex, c_iter_->ikey().type);
+  SeparateHelper::ValueReference reference;
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(c_iter_->value().slice(),
+                                                   &reference));
+  ASSERT_EQ(1U, reference.file_number);
+  ASSERT_TRUE(reference.has_value_size);
+  ASSERT_EQ(value.size(), reference.value_size);
+  ASSERT_TRUE(reference.value_meta.empty());
+}
+
+TEST_P(CompactionIteratorTest, OmitsLogicalValueSizeWhenTrackingDisabled) {
+  const std::string value(37, 'v');
+  separate_helper_.track_value_size = false;
+  InitIterators({test::KeyStr("a", 5, kTypeValue)}, {value}, {}, {}, 5,
+                kMaxSequenceNumber, nullptr, nullptr, false,
+                kMaxSequenceNumber, &separate_helper_,
+                BlobConfig{1, 1.0});
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(kTypeValueIndex, c_iter_->ikey().type);
+  SeparateHelper::ValueReference reference;
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(c_iter_->value().slice(),
+                                                   &reference));
+  ASSERT_EQ(1U, reference.file_number);
+  ASSERT_FALSE(reference.has_value_size);
+  ASSERT_EQ(sizeof(uint64_t), c_iter_->value().size());
+}
+
+TEST_P(CompactionIteratorTest, PreservesLegacyReferenceWithoutValueSize) {
+  std::string value(sizeof(uint64_t), '\0');
+  uint64_t file_number = 1;
+  memcpy(&value[0], &file_number, sizeof(file_number));
+  InitIterators({test::KeyStr("a", 5, kTypeValueIndex)}, {value}, {}, {}, 5,
+                kMaxSequenceNumber, nullptr, nullptr, false,
+                kMaxSequenceNumber, &separate_helper_,
+                BlobConfig{1, 1.0});
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_EQ(kTypeValueIndex, c_iter_->ikey().type);
+  SeparateHelper::ValueReference reference;
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(c_iter_->value().slice(),
+                                                   &reference));
+  ASSERT_EQ(file_number, reference.file_number);
+  ASSERT_FALSE(reference.has_value_size);
+  ASSERT_EQ(0U, reference.value_size);
+  ASSERT_TRUE(reference.value_meta.empty());
+}
+
+TEST_P(CompactionIteratorTest, ReusesSizedReferenceWithoutFetchingValue) {
+  uint64_t encoded_file_number =
+      1 | SeparateHelper::kValueSizeFlag;
+  std::string value(
+      SeparateHelper::EncodeFileNumber(encoded_file_number).data(),
+      sizeof(encoded_file_number));
+  PutVarint64(&value, 4096);
+  separate_helper_.return_lazy_value = true;
+  separate_helper_.fetch_count = 0;
+  InitIterators({test::KeyStr("a", 5, kTypeValueIndex)}, {value}, {}, {}, 5,
+                kMaxSequenceNumber, nullptr, nullptr, false,
+                kMaxSequenceNumber, &separate_helper_,
+                BlobConfig{1, 1.0});
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_OK(c_iter_->status());
+  ASSERT_EQ(0U, separate_helper_.fetch_count);
+  SeparateHelper::ValueReference reference;
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(c_iter_->value().slice(),
+                                                   &reference));
+  ASSERT_EQ(1U, reference.file_number);
+  ASSERT_TRUE(reference.has_value_size);
+  ASSERT_EQ(4096U, reference.value_size);
+}
+
+TEST_P(CompactionIteratorTest,
+       DowngradesSizedReferenceWhenTrackingDisabled) {
+  uint64_t encoded_file_number =
+      1 | SeparateHelper::kValueSizeFlag;
+  std::string value(
+      SeparateHelper::EncodeFileNumber(encoded_file_number).data(),
+      sizeof(encoded_file_number));
+  PutVarint64(&value, 4096);
+  separate_helper_.return_lazy_value = true;
+  separate_helper_.track_value_size = false;
+  separate_helper_.fetch_count = 0;
+  InitIterators({test::KeyStr("a", 5, kTypeValueIndex)}, {value}, {}, {}, 5,
+                kMaxSequenceNumber, nullptr, nullptr, false,
+                kMaxSequenceNumber, &separate_helper_,
+                BlobConfig{1, 1.0});
+
+  c_iter_->SeekToFirst();
+  ASSERT_TRUE(c_iter_->Valid());
+  ASSERT_OK(c_iter_->status());
+  ASSERT_EQ(0U, separate_helper_.fetch_count);
+  SeparateHelper::ValueReference reference;
+  ASSERT_TRUE(SeparateHelper::DecodeValueReference(c_iter_->value().slice(),
+                                                   &reference));
+  ASSERT_EQ(1U, reference.file_number);
+  ASSERT_FALSE(reference.has_value_size);
+  ASSERT_EQ(sizeof(uint64_t), c_iter_->value().size());
 }
 
 // If there is a corruption after a single deletion, the corrupted key should

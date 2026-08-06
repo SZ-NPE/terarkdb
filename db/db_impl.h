@@ -1595,9 +1595,6 @@ class DBImpl : public DB {
   // stores the number of compactions are currently running
   int num_running_compactions_;
 
-  // stores the number of garbage collections are currently running
-  int num_running_garbage_collections_;
-
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_;
 

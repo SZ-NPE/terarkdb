@@ -11,6 +11,7 @@
 
 #include "db/compaction.h"
 #include "db/compaction_picker_universal.h"
+#include "db/gc_batch_selector.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/string_util.h"
 #include "util/sync_point.h"
@@ -141,6 +142,257 @@ TEST_F(CompactionPickerTest, Empty) {
   std::unique_ptr<Compaction> compaction(level_compaction_picker.PickCompaction(
       cf_name_, mutable_cf_options_, vstorage_.get(), {}, &log_buffer_));
   ASSERT_TRUE(compaction.get() == nullptr);
+}
+
+TEST(GarbageCollectionBatchSelectorTest, SharesReferenceScanCost) {
+  std::vector<GarbageCollectionBatchCandidate> candidates(3);
+  candidates[0].file_number = 100;
+  candidates[0].reclaimable_bytes = 600;
+  candidates[0].live_bytes = 100;
+  candidates[0].batch_eligible = true;
+  candidates[0].primary_eligible = true;
+  candidates[0].reference_costs = {{10, 400}};
+
+  candidates[1].file_number = 101;
+  candidates[1].reclaimable_bytes = 500;
+  candidates[1].live_bytes = 100;
+  candidates[1].batch_eligible = true;
+  candidates[1].primary_eligible = true;
+  candidates[1].reference_costs = {{10, 400}};
+
+  candidates[2].file_number = 102;
+  candidates[2].reclaimable_bytes = 900;
+  candidates[2].live_bytes = 100;
+  candidates[2].batch_eligible = true;
+  candidates[2].primary_eligible = true;
+  candidates[2].reference_costs = {{20, 900}};
+
+  const auto selection =
+      SelectGarbageCollectionBatch(candidates, 2, 1000);
+  ASSERT_EQ((std::vector<size_t>{0, 1}), selection.candidate_indexes);
+  ASSERT_EQ(1100U, selection.reclaimable_bytes);
+  ASSERT_EQ(200U, selection.live_bytes);
+  ASSERT_EQ(400U, selection.reference_scan_bytes);
+}
+
+TEST(GarbageCollectionBatchSelectorTest, BoundsStreamingEntryAmplification) {
+  ASSERT_TRUE(IsGarbageCollectionStreamingEfficient(100, 800));
+  ASSERT_FALSE(IsGarbageCollectionStreamingEfficient(100, 900));
+}
+
+TEST(GarbageCollectionBatchSelectorTest, HonorsEligibilityAndMigrationBudget) {
+  std::vector<GarbageCollectionBatchCandidate> candidates(3);
+  candidates[0] = {100, 1000, 300, true, true, false, {{10, 100}}};
+  candidates[1] = {101, 900, 300, true, true, false, {{10, 100}}};
+  candidates[2] = {102, 800, 100, true, false, false, {{10, 100}}};
+
+  const auto selection =
+      SelectGarbageCollectionBatch(candidates, 3, 500);
+  ASSERT_EQ((std::vector<size_t>{0, 2}), selection.candidate_indexes);
+  ASSERT_EQ(400U, selection.live_bytes);
+}
+
+TEST(GarbageCollectionBatchSelectorTest, RejectsNonSharedBatchCandidate) {
+  std::vector<GarbageCollectionBatchCandidate> candidates(2);
+  candidates[0] = {100, 1000, 100, true, true, false, {{10, 100}}};
+  candidates[1] = {101, 900, 100, true, true, false, {{20, 100}}};
+
+  const auto selection =
+      SelectGarbageCollectionBatch(candidates, 2, 1000);
+  ASSERT_EQ((std::vector<size_t>{0}), selection.candidate_indexes);
+}
+
+TEST(GarbageCollectionBatchSelectorTest, PreservesAggregateUtility) {
+  std::vector<GarbageCollectionBatchCandidate> candidates(2);
+  candidates[0] = {100, 1000, 100, true, true, false, {{10, 100}}};
+  candidates[1] = {101, 1, 900, true, true, false, {{10, 100}}};
+
+  const auto selection =
+      SelectGarbageCollectionBatch(candidates, 2, 2000);
+  ASSERT_EQ((std::vector<size_t>{0}), selection.candidate_indexes);
+}
+
+TEST(GarbageCollectionBatchSelectorTest, RejectsOverBudgetPrimaryCandidate) {
+  std::vector<GarbageCollectionBatchCandidate> candidates(1);
+  candidates[0] = {100, 1000, 600, true, true, false, {}};
+
+  const auto selection =
+      SelectGarbageCollectionBatch(candidates, 1, 500);
+  ASSERT_TRUE(selection.candidate_indexes.empty());
+}
+
+TEST(GarbageCollectionBatchSelectorTest, PrioritizesForcedCandidate) {
+  std::vector<GarbageCollectionBatchCandidate> candidates(2);
+  candidates[0] = {100, 1000, 10, true, true, false, {}};
+  candidates[1] = {101, 1, 1000, true, true, true, {}};
+
+  const auto selection =
+      SelectGarbageCollectionBatch(candidates, 1, 2000);
+  ASSERT_EQ((std::vector<size_t>{1}), selection.candidate_indexes);
+}
+
+void ConfigureDivergentGarbageScores(CompactionPickerTest* test) {
+  test->NewVersionStorage(6, kCompactionStyleLevel);
+  test->mutable_cf_options_.blob_gc_defer_enabled = false;
+  test->mutable_cf_options_.blob_gc_ratio = 0.2;
+  test->mutable_cf_options_.target_blob_file_size = 1000;
+
+  test->Add(-1, 100U, "100", "199", 1000U);
+  test->Add(-1, 101U, "200", "299", 1000U);
+  auto* entry_heavy = test->file_map_[100U].first;
+  auto* byte_heavy = test->file_map_[101U].first;
+  for (auto* file : {entry_heavy, byte_heavy}) {
+    file->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    file->prop.num_entries = 100;
+    file->prop.raw_value_size = 10000;
+  }
+  entry_heavy->num_antiquation = 80;
+  entry_heavy->num_antiquation_bytes = 1000;
+  byte_heavy->num_antiquation = 20;
+  byte_heavy->num_antiquation_bytes = 9000;
+  test->UpdateVersionStorageInfo();
+}
+
+TEST_F(CompactionPickerTest, EntryGcSelectsVictimByEntryCount) {
+  ConfigureDivergentGarbageScores(this);
+  mutable_cf_options_.precise_gc = false;
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickGarbageCollection(
+          cf_name_, mutable_cf_options_, vstorage_.get(), &log_buffer_));
+  ASSERT_NE(nullptr, compaction);
+  ASSERT_EQ(100U, compaction->input(0, 0)->fd.GetNumber());
+}
+
+TEST_F(CompactionPickerTest, PreciseGcSelectsVictimByValueBytes) {
+  ConfigureDivergentGarbageScores(this);
+  mutable_cf_options_.precise_gc = true;
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickGarbageCollection(
+          cf_name_, mutable_cf_options_, vstorage_.get(), &log_buffer_));
+  ASSERT_NE(nullptr, compaction);
+  ASSERT_EQ(101U, compaction->input(0, 0)->fd.GetNumber());
+}
+
+TEST_F(CompactionPickerTest, CostAwareGarbageCollectionSharesReferenceScan) {
+  NewVersionStorage(6, kCompactionStyleLevel);
+  mutable_cf_options_.blob_gc_defer_enabled = false;
+  mutable_cf_options_.blob_gc_ratio = 0.5;
+  mutable_cf_options_.target_blob_file_size = 1000;
+  mutable_cf_options_.precise_gc = true;
+  mutable_cf_options_.gc_cost_aware_selection = true;
+  mutable_cf_options_.gc_streaming_validation = true;
+
+  Add(-1, 100U, "100", "199", 1000U);
+  Add(-1, 101U, "200", "299", 1000U);
+  Add(-1, 102U, "300", "399", 1000U);
+  for (uint32_t file_number : {100U, 101U, 102U}) {
+    auto* file = file_map_[file_number].first;
+    file->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    file->prop.num_entries = 10;
+    file->prop.raw_value_size = 1000;
+  }
+  file_map_[100U].first->num_antiquation = 9;
+  file_map_[100U].first->num_antiquation_bytes = 900;
+  file_map_[101U].first->num_antiquation = 8;
+  file_map_[101U].first->num_antiquation_bytes = 800;
+  file_map_[102U].first->num_antiquation = 4;
+  file_map_[102U].first->num_antiquation_bytes = 400;
+
+  Add(1, 10U, "100", "299", 400U);
+  file_map_[10U].first->prop.dependence = {
+      Dependence{100U, 1U, 100U}, Dependence{101U, 1U, 100U}};
+  Add(1, 20U, "300", "399", 5000U);
+  file_map_[20U].first->prop.dependence = {
+      Dependence{102U, 1U, 100U}};
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickGarbageCollection(
+          cf_name_, mutable_cf_options_, vstorage_.get(), &log_buffer_));
+  ASSERT_NE(nullptr, compaction);
+  ASSERT_EQ(2U, compaction->num_input_files(0));
+  ASSERT_EQ(100U, compaction->input(0, 0)->fd.GetNumber());
+  ASSERT_EQ(101U, compaction->input(0, 1)->fd.GetNumber());
+}
+
+TEST_F(CompactionPickerTest, PurgeOnlySplitsMixedGarbageCollectionBatch) {
+  NewVersionStorage(6, kCompactionStyleLevel);
+  mutable_cf_options_.blob_gc_defer_enabled = false;
+  mutable_cf_options_.blob_gc_ratio = 0.5;
+  mutable_cf_options_.target_blob_file_size = 1000;
+  mutable_cf_options_.precise_gc = true;
+  mutable_cf_options_.gc_cost_aware_selection = true;
+  mutable_cf_options_.gc_purge_only = true;
+
+  Add(-1, 100U, "100", "199", 1000U);
+  Add(-1, 101U, "200", "299", 1000U);
+  for (uint32_t file_number : {100U, 101U}) {
+    auto* file = file_map_[file_number].first;
+    file->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    file->prop.num_entries = 10;
+    file->prop.raw_value_size = 1000;
+    file->prop.flags |= TablePropertyCache::kCompleteDependence;
+    file->num_antiquation = 9;
+    file->num_antiquation_bytes = 900;
+  }
+
+  Add(1, 10U, "200", "299", 400U);
+  file_map_[10U].first->prop.flags |= TablePropertyCache::kCompleteDependence;
+  file_map_[10U].first->prop.dependence = {
+      Dependence{101U, 1U, 100U}};
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickGarbageCollection(
+          cf_name_, mutable_cf_options_, vstorage_.get(), &log_buffer_));
+  ASSERT_NE(nullptr, compaction);
+  ASSERT_TRUE(compaction->purge_only());
+  ASSERT_EQ(1U, compaction->num_input_files(0));
+  ASSERT_EQ(100U, compaction->input(0, 0)->fd.GetNumber());
+  ASSERT_TRUE(file_map_[101U].first->is_gc_permitted());
+}
+
+TEST_F(CompactionPickerTest, PurgeOnlyIgnoresDisjointIncompleteMetadata) {
+  NewVersionStorage(6, kCompactionStyleLevel);
+  mutable_cf_options_.blob_gc_defer_enabled = false;
+  mutable_cf_options_.blob_gc_ratio = 0.99;
+  mutable_cf_options_.precise_gc = true;
+  mutable_cf_options_.gc_cost_aware_selection = true;
+  mutable_cf_options_.gc_purge_only = true;
+
+  Add(-1, 100U, "100", "199", 1000U);
+  auto* blob = file_map_[100U].first;
+  blob->gc_status = FileMetaData::kGarbageCollectionPermitted;
+  blob->prop.num_entries = 10;
+  blob->prop.raw_value_size = 1000;
+  blob->prop.flags |= TablePropertyCache::kCompleteDependence;
+  blob->num_antiquation = 10;
+  blob->num_antiquation_bytes = 1000;
+  Add(1, 10U, "300", "399", 400U);
+  UpdateVersionStorageInfo();
+
+  ASSERT_TRUE(vstorage_->CanPurgeBlobFile(blob));
+  std::unique_ptr<Compaction> compaction(
+      level_compaction_picker.PickGarbageCollection(
+          cf_name_, mutable_cf_options_, vstorage_.get(), &log_buffer_));
+  ASSERT_NE(nullptr, compaction);
+  ASSERT_TRUE(compaction->purge_only());
+  ASSERT_EQ(100U, compaction->input(0, 0)->fd.GetNumber());
+}
+
+TEST_F(CompactionPickerTest, PurgeOnlyRejectsOverlappingIncompleteMetadata) {
+  NewVersionStorage(6, kCompactionStyleLevel);
+  mutable_cf_options_.gc_purge_only = true;
+
+  Add(-1, 100U, "100", "199", 1000U);
+  auto* blob = file_map_[100U].first;
+  blob->gc_status = FileMetaData::kGarbageCollectionPermitted;
+  blob->prop.flags |= TablePropertyCache::kCompleteDependence;
+  Add(1, 10U, "150", "250", 400U);
+  UpdateVersionStorageInfo();
+
+  ASSERT_FALSE(vstorage_->CanPurgeBlobFile(blob));
+  ASSERT_FALSE(vstorage_->HasPurgeableBlobFile());
 }
 
 TEST_F(CompactionPickerTest, Single) {

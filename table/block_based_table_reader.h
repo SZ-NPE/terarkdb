@@ -12,11 +12,13 @@
 #include <stdint.h>
 
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "db/gc_liveness_bloom.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "options/cf_options.h"
 #include "rocksdb/options.h"
@@ -150,6 +152,10 @@ class BlockBasedTable : public TableReader {
   size_t ApproximateMemoryUsage() const override;
 
   uint64_t FileNumber() const override;
+
+  Status MayContainGarbageCollectionReference(
+      const std::vector<uint64_t>& logical_file_numbers,
+      const ParsedInternalKey& key, bool* may_contain) const override;
 
   // convert SST file to a human readable form
   Status DumpTable(WritableFile* out_file,
@@ -526,6 +532,11 @@ struct BlockBasedTable::Rep {
   // and every key have it's own seqno.
   SequenceNumber global_seqno;
   uint64_t file_number;
+  BlockHandle gc_liveness_bloom_handle;
+  mutable std::once_flag gc_liveness_bloom_once;
+  mutable Status gc_liveness_bloom_status;
+  mutable std::unique_ptr<GarbageCollectionLivenessBloomIndex>
+      gc_liveness_bloom;
 
   // the level when the table is opened, could potentially change when trivial
   // move is involved

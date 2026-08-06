@@ -4333,6 +4333,63 @@ TEST_F(DBCompactionTest, BlobOverlapThredhold) {
   ASSERT_EQ(call_back_cnt, 2);
 }
 
+TEST_F(DBCompactionTest, ValueReferenceSizeSurvivesCompaction) {
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.blob_size = 1;
+  options.precise_gc = true;
+  options.disable_auto_compactions = true;
+  options.max_background_garbage_collections = 0;
+  DestroyAndReopen(options);
+
+  const std::vector<std::pair<std::string, std::string>> first_batch = {
+      {"a", std::string(1024, 'a')},
+      {"b", std::string(4096, 'b')},
+  };
+  const std::vector<std::pair<std::string, std::string>> second_batch = {
+      {"c", std::string(8192, 'c')},
+      {"d", std::string(16384, 'd')},
+  };
+  uint64_t expected_value_bytes = 0;
+  for (const auto& item : first_batch) {
+    ASSERT_OK(Put(item.first, item.second));
+    expected_value_bytes += item.second.size();
+  }
+  Flush();
+  for (const auto& item : second_batch) {
+    ASSERT_OK(Put(item.first, item.second));
+    expected_value_bytes += item.second.size();
+  }
+  Flush();
+
+  ASSERT_EQ(2, NumTableFilesAtLevel(0));
+  ASSERT_OK(dbfull()->TEST_CompactRange(
+      0, nullptr, nullptr, nullptr, kCompactionTransToSeparate, true));
+
+  auto* storage = dbfull()
+                      ->TEST_GetVersionSet()
+                      ->GetColumnFamilySet()
+                      ->GetColumnFamily("default")
+                      ->current()
+                      ->storage_info();
+  ASSERT_EQ(1U, storage->LevelFiles(1).size());
+  const auto& dependence = storage->LevelFiles(1).front()->prop.dependence;
+  ASSERT_FALSE(dependence.empty());
+  uint64_t actual_entries = 0;
+  uint64_t actual_value_bytes = 0;
+  for (const auto& item : dependence) {
+    actual_entries += item.entry_count;
+    actual_value_bytes += item.byte_count;
+  }
+  ASSERT_EQ(4U, actual_entries);
+  ASSERT_EQ(expected_value_bytes, actual_value_bytes);
+
+  ASSERT_EQ(std::string(1024, 'a'), Get("a"));
+  ASSERT_EQ(std::string(4096, 'b'), Get("b"));
+  ASSERT_EQ(std::string(8192, 'c'), Get("c"));
+  ASSERT_EQ(std::string(16384, 'd'), Get("d"));
+}
+
 #endif  // !defined(ROCKSDB_LITE)
 }  // namespace TERARKDB_NAMESPACE
 

@@ -9,6 +9,7 @@
 
 #pragma once
 #include <memory>
+#include <vector>
 
 #include "db/range_tombstone_fragmenter.h"
 #include "rocksdb/cache.h"
@@ -75,6 +76,13 @@ class TableReader {
   virtual size_t ApproximateMemoryUsage() const = 0;
 
   virtual uint64_t FileNumber() const = 0;
+
+  virtual Status MayContainGarbageCollectionReference(
+      const std::vector<uint64_t>& /* logical_file_numbers */,
+      const ParsedInternalKey& /* key */, bool* /* may_contain */) const {
+    return Status::NotSupported(
+        "GC liveness Bloom is not supported by this table format");
+  }
 
   // Calls get_context->SaveValue() repeatedly, starting with
   // the entry found after a call to Seek(key), until it returns false.

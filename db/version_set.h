@@ -23,6 +23,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -37,6 +38,7 @@
 #include "db/log_reader.h"
 #include "db/range_del_aggregator.h"
 #include "db/read_callback.h"
+#include "db/separated_value_reference.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
@@ -65,6 +67,12 @@ class MergeContext;
 class ColumnFamilySet;
 class TableCache;
 class MergeIteratorBuilder;
+
+struct GarbageCollectionReferenceFile {
+  FileMetaData* file = nullptr;
+  int level = -1;
+  bool direct = false;
+};
 
 // Return the smallest index i such that file_level.files[i]->largest >= key.
 // Return file_level.num_files if there is no such file.
@@ -154,6 +162,7 @@ class VersionStorageInfo {
 
   // Generate level_files_brief_ from files_
   void GenerateLevelFilesBrief();
+  void BuildGarbageCollectionReferenceIndex() const;
   // Sort all files for this version based on their file size and
   // record results in files_by_compaction_pri_. The largest files are listed
   // first.
@@ -177,6 +186,11 @@ class VersionStorageInfo {
   SequenceNumber oldest_snapshot_seqnum() const {
     return oldest_snapshot_seqnum_;
   }
+
+  // Returns true only when the current Version has no certified direct or
+  // map-mediated dependence on the blob file.
+  bool CanPurgeBlobFile(const FileMetaData* blob_file) const;
+  bool HasPurgeableBlobFile() const;
 
   int MaxInputLevel() const;
   int MaxOutputLevel(bool allow_ingest_behind) const;
@@ -341,6 +355,15 @@ class VersionStorageInfo {
 
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
   const DependenceMap& dependence_map() const { return dependence_map_; }
+
+  std::vector<GarbageCollectionReferenceFile>
+  GetGarbageCollectionReferenceFiles(const FileMetaData* blob_file) const;
+
+  std::vector<GarbageCollectionReferenceFile>
+  GetGarbageCollectionValidationFiles(const FileMetaData* blob_file) const;
+
+  bool HasCompleteGarbageCollectionReferences(
+      const FileMetaData* blob_file) const;
 
   const TERARKDB_NAMESPACE::LevelFilesBrief& LevelFilesBrief(int level) const {
     assert(level < static_cast<int>(level_files_brief_.size()));
@@ -543,6 +566,11 @@ class VersionStorageInfo {
 
   // Dependence files both in files[-1] and dependence_map
   DependenceMap dependence_map_;
+  mutable std::once_flag garbage_collection_reference_index_once_;
+  mutable std::unordered_set<uint64_t>
+      referenced_garbage_collection_blob_files_;
+  mutable std::vector<GarbageCollectionReferenceFile>
+      incomplete_garbage_collection_reference_files_;
 
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.
@@ -664,6 +692,11 @@ class Version : public SeparateHelper, private LazyBufferState {
   void AddIteratorsForLevel(const ReadOptions&, const EnvOptions& soptions,
                             MergeIteratorBuilder* merger_iter_builder,
                             int level, RangeDelAggregator* range_del_agg);
+
+  void AddGarbageCollectionIterators(
+      const ReadOptions&, const EnvOptions& soptions,
+      const std::vector<std::vector<FileMetaData*>>& files_by_level,
+      MergeIteratorBuilder* merger_iter_builder);
 
   Status OverlapWithLevelIterator(const ReadOptions&, const EnvOptions&,
                                   const Slice& smallest_user_key,

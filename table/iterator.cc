@@ -124,9 +124,17 @@ LazyBuffer CombinedInternalIterator::value() const {
 }
 
 LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
-                                           std::string* meta) const {
+                                           std::string* meta,
+                                           uint64_t* value_size,
+                                           bool* has_value_size) const {
   if (meta != nullptr) {
     meta->clear();
+  }
+  if (value_size != nullptr) {
+    *value_size = 0;
+  }
+  if (has_value_size != nullptr) {
+    *has_value_size = false;
   }
   if (separate_helper_ == nullptr) {
     return iter_->value();
@@ -142,8 +150,16 @@ LazyBuffer CombinedInternalIterator::value(const Slice& user_key,
   LazyBuffer v =
       separate_helper_->TransToCombined(user_key, pikey.sequence, value_index);
   if (meta != nullptr && value_index.valid()) {
-    auto meta_slice = SeparateHelper::DecodeValueMeta(value_index.slice());
-    meta->assign(meta_slice.data(), meta_slice.size());
+    SeparateHelper::ValueReference reference;
+    if (SeparateHelper::DecodeValueReference(value_index.slice(), &reference)) {
+      meta->assign(reference.value_meta.data(), reference.value_meta.size());
+      if (value_size != nullptr) {
+        *value_size = reference.value_size;
+      }
+      if (has_value_size != nullptr) {
+        *has_value_size = reference.has_value_size;
+      }
+    }
   }
   return v;
 }

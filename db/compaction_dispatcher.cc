@@ -18,6 +18,7 @@
 #include <inttypes.h>
 
 #include <chrono>
+#include <unordered_map>
 
 #ifdef WITH_TERARK_ZIP
 #include <terark/num_to_str.hpp>
@@ -238,7 +239,8 @@ AJSON(CompactionWorkerContext, user_comparator, merge_operator,
       merge_operator_data, value_meta_extractor_factory,
       value_meta_extractor_factory_options, compaction_filter,
       compaction_filter_factory, compaction_filter_context,
-      compaction_filter_data, blob_config, separation_type, table_factory,
+      compaction_filter_data, blob_config, track_value_size, separation_type,
+      table_factory,
       table_factory_options, bloom_locality, cf_paths, prefix_extractor,
       prefix_extractor_options, has_start, has_end, start, end, last_sequence,
       earliest_write_conflict_snapshot, preserve_deletes_seqnum, file_metadata,
@@ -271,12 +273,15 @@ class WorkerSeparateHelper : public SeparateHelper, public LazyBufferState {
   }
 
   using SeparateHelper::TransToSeparate;
+  bool TrackValueSize() const override { return track_value_size_; }
+
   Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                          const Slice& meta, bool is_merge,
-                         bool is_index) override {
+                         bool is_index, uint64_t value_size,
+                         bool has_value_size) override {
     return SeparateHelper::TransToSeparate(
         internal_key, value, value.file_number(), meta, is_merge, is_index,
-        value_meta_extractor_.get());
+        value_meta_extractor_.get(), value_size, has_value_size);
   }
 
   LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
@@ -302,16 +307,19 @@ class WorkerSeparateHelper : public SeparateHelper, public LazyBufferState {
   WorkerSeparateHelper(
       DependenceMap* dependence_map,
       std::unique_ptr<ValueExtractor> value_meta_extractor,
+      bool track_value_size,
       void* inplace_decode_arg,
       Status (*inplace_decode_callback)(void* arg, LazyBuffer* buffer,
                                         LazyBufferContext* rep))
       : dependence_map_(dependence_map),
         value_meta_extractor_(std::move(value_meta_extractor)),
+        track_value_size_(track_value_size),
         inplace_decode_arg_(inplace_decode_arg),
         inplace_decode_callback_(inplace_decode_callback) {}
 
   DependenceMap* dependence_map_;
   std::unique_ptr<ValueExtractor> value_meta_extractor_;
+  bool track_value_size_;
   void* inplace_decode_arg_;
   Status (*inplace_decode_callback_)(void* arg, LazyBuffer* buffer,
                                      LazyBufferContext* rep);
@@ -677,7 +685,8 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
 
   WorkerSeparateHelper separate_helper(
       &contxt_dependence_map, create_value_meta_extractor(),
-      &separate_inplace_decode, c_style_callback(separate_inplace_decode));
+      context.track_value_size, &separate_inplace_decode,
+      c_style_callback(separate_inplace_decode));
 
   CompactionRangeDelAggregator range_del_agg(icmp, context.existing_snapshots);
 
@@ -845,7 +854,7 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
   std::unique_ptr<WritableFileWriter> writer;
   std::unique_ptr<TableBuilder> builder;
   FileMetaData meta;
-  std::unordered_map<uint64_t, uint64_t> dependence;
+  std::unordered_map<uint64_t, SeparateHelper::ReferenceStats> dependence;
   auto finish_output_file = [&](Status s, const Slice* next_key) -> Status {
     if (s.ok() && !range_del_agg.IsEmpty()) {
       Slice lower_bound_guard, upper_bound_guard;
@@ -935,7 +944,10 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
           builder->NeedCompact() ? FileMetaData::kMarkedFromTableBuilder : 0;
       meta.prop.num_entries = builder->NumEntries();
       for (auto& pair : dependence) {
-        meta.prop.dependence.emplace_back(Dependence{pair.first, pair.second});
+        const uint64_t byte_count =
+            pair.second.complete ? pair.second.byte_count : 0;
+        meta.prop.dependence.emplace_back(
+            Dependence{pair.first, pair.second.entry_count, byte_count});
       }
       terark::sort_a(meta.prop.dependence, TERARK_CMP(file_number, <));
       auto shrinked_snapshots = meta.ShrinkSnapshot(context.existing_snapshots);
@@ -996,9 +1008,16 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
     if (c_iter->ikey().type == kTypeValueIndex ||
         c_iter->ikey().type == kTypeMergeIndex) {
       assert(value.file_number() != uint64_t(-1));
-      auto ib = dependence.emplace(value.file_number(), 1);
-      if (!ib.second) {
-        ++ib.first->second;
+      auto& reference_stats = dependence[value.file_number()];
+      if (context.track_value_size) {
+        SeparateHelper::ValueReference reference;
+        if (!SeparateHelper::DecodeValueReference(value.slice(), &reference)) {
+          status = Status::Corruption("Invalid separated value reference");
+          break;
+        }
+        reference_stats.Add(reference);
+      } else {
+        reference_stats.Add(SeparateHelper::ValueReference{});
       }
     }
 

@@ -101,6 +101,11 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"optimize_filters_for_hits", "true"},
       {"blob_gc_defer_enabled", "true"},
       {"blob_gc_defer_ratio", "0.65"},
+      {"precise_gc", "true"},
+      {"gc_cost_aware_selection", "true"},
+      {"gc_streaming_validation", "true"},
+      {"gc_liveness_bloom", "true"},
+      {"gc_purge_only", "true"},
   };
 
   std::unordered_map<std::string, std::string> db_options_map = {
@@ -217,6 +222,11 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.optimize_filters_for_hits, true);
   ASSERT_EQ(new_cf_opt.blob_gc_defer_enabled, true);
   ASSERT_EQ(new_cf_opt.blob_gc_defer_ratio, 0.65);
+  ASSERT_EQ(new_cf_opt.precise_gc, true);
+  ASSERT_EQ(new_cf_opt.gc_cost_aware_selection, true);
+  ASSERT_EQ(new_cf_opt.gc_streaming_validation, true);
+  ASSERT_EQ(new_cf_opt.gc_liveness_bloom, true);
+  ASSERT_EQ(new_cf_opt.gc_purge_only, true);
   ASSERT_EQ(std::string(new_cf_opt.prefix_extractor->Name()),
             "rocksdb.FixedPrefix.31");
 

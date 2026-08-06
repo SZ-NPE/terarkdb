@@ -118,11 +118,28 @@ TablePropertyCache GetPropCache(
     uint8_t purpose, std::initializer_list<uint64_t> dependence = {},
     std::initializer_list<uint64_t> inheritance = {}) {
   std::vector<Dependence> dep;
-  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1});
+  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, 0});
   TablePropertyCache ret;
   ret.purpose = purpose;
   ret.dependence = dep;
   ret.inheritance = inheritance;
+  return ret;
+}
+
+// precise_gc: build a TablePropertyCache with explicit per-dependence
+// (file_number, entry_count, byte_count) tuples so tests can drive the new
+// byte-based path through VersionBuilder.
+TablePropertyCache GetPropCacheWithBytes(
+    uint8_t purpose,
+    std::initializer_list<std::tuple<uint64_t, uint64_t, uint64_t>> dep_list) {
+  std::vector<Dependence> dep;
+  for (auto& t : dep_list) {
+    dep.emplace_back(
+        Dependence{std::get<0>(t), std::get<1>(t), std::get<2>(t)});
+  }
+  TablePropertyCache ret;
+  ret.purpose = purpose;
+  ret.dependence = dep;
   return ret;
 }
 
@@ -397,6 +414,35 @@ TEST_F(VersionBuilderTest, ApplyDeleteAndSaveTo) {
   UnrefFilesInVersion(&new_vstorage);
 }
 
+TEST_F(VersionBuilderTest, ApplyHiddenDeleteAndSaveTo) {
+  Add(-1, 700U, "100", "199", 100U, 0, 100U, 100U, 10U);
+  Add(1, 800U, "100", "199", 100U, 0, 100U, 100U, 10U, 0, 0, 0,
+      GetPropCache(0, {700U}));
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  version_edit.DeleteFile(-1, 700U);
+  version_edit.AddFile(-1, 701U, 0, 100U, GetInternalKey("200"),
+                       GetInternalKey("299"), 100U, 100U, false,
+                       GetPropCache(0, {}, {700U}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto old_alias = new_vstorage.dependence_map().find(700U);
+  ASSERT_NE(old_alias, new_vstorage.dependence_map().end());
+  ASSERT_EQ(701U, old_alias->second->fd.GetNumber());
+  ASSERT_EQ(new_vstorage.dependence_map().count(701U), 1U);
+  ASSERT_EQ(1U, new_vstorage.LevelFiles(-1).size());
+  ASSERT_TRUE(VerifyDependFiles(&new_vstorage, {700U, 701U, 800U}));
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
 TEST_F(VersionBuilderTest, EstimatedActiveKeys) {
   // const uint32_t kTotalSamples = 20;
   const uint32_t kNumLevels = 5;
@@ -492,6 +538,231 @@ TEST_F(VersionBuilderTest, HugeLSM) {
   version_builder.SaveTo(&new_vstorage, 0);
 
   UnrefFilesInVersion(&new_vstorage);
+}
+
+// precise_gc: when a referencing SST carries an explicit per-dependence
+// byte_count, VersionBuilder should propagate it to the blob file's
+// num_antiquation_bytes field instead of falling back to the averaged
+// estimate. This test also verifies that the entry-based
+// num_antiquation still works in parallel with the byte-based accounting.
+TEST_F(VersionBuilderTest, PreciseGcByteCountFromDependence) {
+  // Blob B (file_number=100) at level -1:
+  //   num_entries=100, raw_value_size=8000, file_size=10000.
+  // Referencing SST S (file_number=200) at level 2 declares that it points
+  // at 70 entries / 6000 bytes from B.
+  // Expected after SaveTo:
+  //   B.num_antiquation       = 100 - 70   = 30
+  //   B.num_antiquation_bytes = 8000 - 6000 = 2000
+  TablePropertyCache blob_prop;
+  blob_prop.raw_value_size = 8000;
+  Add(-1, 100U, "100", "199", 10000U /*file_size*/, 0 /*path_id*/,
+      100 /*smallest_seq*/, 100 /*largest_seq*/, 100 /*num_entries*/,
+      0 /*num_deletions*/, 100 /*smallest_seqno*/, 100 /*largest_seqno*/,
+      blob_prop);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  version_edit.AddFile(
+      2 /*level*/, 200U /*file_number*/, 0 /*path_id*/, 500U /*file_size*/,
+      GetInternalKey("100"), GetInternalKey("199"), 200, 200, false,
+      GetPropCacheWithBytes(0, {std::make_tuple(100U, 70U, 6000U)}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto& dep_map = new_vstorage.dependence_map();
+  auto it = dep_map.find(100U);
+  ASSERT_TRUE(it != dep_map.end());
+  FileMetaData* b = it->second;
+  ASSERT_EQ(30U, b->num_antiquation);
+  ASSERT_EQ(2000U, b->num_antiquation_bytes);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+// precise_gc: when byte_count is 0 in every referencing Dependence (legacy
+// manifests / MapSst / remote-compaction paths), VersionBuilder must fall
+// back to the averaged estimate (entry_count * raw_value_size / num_entries)
+// so that num_antiquation_bytes is still a meaningful approximation.
+TEST_F(VersionBuilderTest, PreciseGcByteCountFallbackWhenZero) {
+  // Blob B: 100 entries, 4000 raw value bytes and 10000 physical bytes.
+  // Average logical value size = 40 bytes.
+  // S references 70 entries with byte_count=0 -> fallback estimate:
+  //   bytes_depended ~= 70 * 4000 / 100 = 2800
+  //   num_antiquation_bytes ~= 4000 - 2800 = 1200
+  TablePropertyCache blob_prop;
+  blob_prop.raw_value_size = 4000;
+  Add(-1, 101U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100,
+      blob_prop);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  version_edit.AddFile(
+      2, 201U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200, 200,
+      false, GetPropCacheWithBytes(0, {std::make_tuple(101U, 70U, 0U)}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto& dep_map = new_vstorage.dependence_map();
+  auto it = dep_map.find(101U);
+  ASSERT_TRUE(it != dep_map.end());
+  FileMetaData* b = it->second;
+  ASSERT_EQ(30U, b->num_antiquation);
+  ASSERT_EQ(1200U, b->num_antiquation_bytes);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, PreciseGcAggregatesBytesAcrossOutputs) {
+  TablePropertyCache blob_prop;
+  blob_prop.raw_value_size = 8000;
+  Add(-1, 104U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100,
+      blob_prop);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  version_edit.AddFile(
+      2, 204U, 0, 500U, GetInternalKey("100"), GetInternalKey("149"), 200, 200,
+      false, GetPropCacheWithBytes(0, {std::make_tuple(104U, 40U, 3000U)}));
+  version_edit.AddFile(
+      2, 205U, 0, 500U, GetInternalKey("150"), GetInternalKey("199"), 201, 201,
+      false, GetPropCacheWithBytes(0, {std::make_tuple(104U, 60U, 5000U)}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto it = new_vstorage.dependence_map().find(104U);
+  ASSERT_TRUE(it != new_vstorage.dependence_map().end());
+  ASSERT_EQ(0U, it->second->num_antiquation_bytes);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, PreciseGcInvalidByteCountFallsBackToEstimate) {
+  TablePropertyCache blob_prop;
+  blob_prop.raw_value_size = 4000;
+  Add(-1, 102U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100,
+      blob_prop);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  version_edit.AddFile(
+      2, 202U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200, 200,
+      false, GetPropCacheWithBytes(0, {std::make_tuple(102U, 70U, 5000U)}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto it = new_vstorage.dependence_map().find(102U);
+  ASSERT_TRUE(it != new_vstorage.dependence_map().end());
+  ASSERT_EQ(1200U, it->second->num_antiquation_bytes);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, PreciseGcAllowsFullyDeadBlob) {
+  TablePropertyCache blob_prop;
+  blob_prop.raw_value_size = 4000;
+  Add(-1, 103U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100,
+      blob_prop);
+  TablePropertyCache map_prop;
+  map_prop.purpose = kMapSst;
+  map_prop.dependence.emplace_back(Dependence{103U, 0U, 0U});
+  Add(2, 203U, "100", "199", 500U, 0, 200, 200, 0, 0, 200, 200,
+      map_prop);
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto it = new_vstorage.dependence_map().find(103U);
+  ASSERT_TRUE(it != new_vstorage.dependence_map().end());
+  ASSERT_EQ(4000U, it->second->num_antiquation_bytes);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, CanPurgeBlobFileRequiresNoReferenceCertificate) {
+  TablePropertyCache blob_prop;
+  blob_prop.flags |= TablePropertyCache::kCompleteDependence;
+  Add(-1, 301U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100,
+      blob_prop);
+  FileMetaData* blob = vstorage_.LevelFiles(-1).back();
+
+  ASSERT_TRUE(blob->Unref());
+  ASSERT_FALSE(vstorage_.CanPurgeBlobFile(blob));
+  blob->Ref();
+  ASSERT_TRUE(vstorage_.CanPurgeBlobFile(blob));
+  blob->Ref();
+  ASSERT_TRUE(vstorage_.CanPurgeBlobFile(blob));
+  blob->Ref();
+  ASSERT_FALSE(vstorage_.CanPurgeBlobFile(blob));
+  ASSERT_FALSE(blob->Unref());
+  ASSERT_FALSE(blob->Unref());
+
+  TablePropertyCache key_prop;
+  key_prop.flags |= TablePropertyCache::kCompleteDependence;
+  key_prop.dependence.emplace_back(Dependence{301U, 100U, 0});
+  Add(1, 401U, "100", "199", 500U, 0, 100, 100, 100, 0, 100, 100,
+      key_prop);
+  ASSERT_FALSE(vstorage_.CanPurgeBlobFile(blob));
+}
+
+TEST_F(VersionBuilderTest, CanPurgeBlobFileRejectsIndirectReference) {
+  TablePropertyCache blob_prop;
+  blob_prop.flags |= TablePropertyCache::kCompleteDependence;
+  Add(-1, 302U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100,
+      blob_prop);
+  FileMetaData* blob = vstorage_.LevelFiles(-1).back();
+
+  TablePropertyCache map_prop;
+  map_prop.purpose = kMapSst;
+  map_prop.flags |= TablePropertyCache::kCompleteDependence;
+  map_prop.dependence.emplace_back(Dependence{302U, 100U, 0});
+  Add(1, 402U, "100", "199", 500U, 0, 100, 100, 1, 0, 100, 100,
+      map_prop);
+
+  TablePropertyCache key_prop;
+  key_prop.flags |= TablePropertyCache::kCompleteDependence;
+  key_prop.dependence.emplace_back(Dependence{402U, 1U, 0});
+  Add(2, 403U, "100", "199", 500U, 0, 100, 100, 1, 0, 100, 100,
+      key_prop);
+
+  ASSERT_FALSE(vstorage_.CanPurgeBlobFile(blob));
+}
+
+TEST_F(VersionBuilderTest, CanPurgeBlobFileRejectsUnknownMetadataAndSnapshots) {
+  Add(-1, 304U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100);
+  FileMetaData* blob = vstorage_.LevelFiles(-1).back();
+
+  TablePropertyCache incomplete_key_prop;
+  incomplete_key_prop.dependence.emplace_back(Dependence{304U, 100U, 0});
+  Add(1, 404U, "100", "199", 500U, 0, 100, 100, 100, 0, 100, 100,
+      incomplete_key_prop);
+  ASSERT_FALSE(vstorage_.CanPurgeBlobFile(blob));
+
+  blob->prop.flags |= TablePropertyCache::kHasSnapshots;
+  ASSERT_FALSE(vstorage_.CanPurgeBlobFile(blob));
 }
 
 }  // namespace TERARKDB_NAMESPACE

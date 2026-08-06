@@ -17,10 +17,12 @@
 
 #include <limits>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "db/column_family.h"
+#include "db/gc_batch_selector.h"
 #include "db/map_builder.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/c_style_callback.h"
@@ -75,13 +77,148 @@ struct GarbageFileInfo {
   FileMetaData* f;
   double score;
   uint64_t estimate_size;
-  GarbageFileInfo(FileMetaData* _f) : f(_f), score(0.0), estimate_size(0) {
+
+  // precise_gc: compute per-file garbage score.
+  //   precise==true  -> byte-based: antiquation_bytes / raw value bytes
+  //   precise==false -> entry-based: num_antiquation / num_entries
+  static double ComputeScore(const FileMetaData* f, bool precise) {
+    if (f == nullptr) return 0.0;
+    if (precise && f->HasLogicalValueBytes()) {
+      return std::min(1.0, f->num_antiquation_bytes /
+                               std::max<double>(1, f->GcValueBytes()));
+    }
+    return std::min(1.0, f->num_antiquation /
+                             std::max<double>(1, f->prop.num_entries));
+  }
+
+  GarbageFileInfo(FileMetaData* _f, bool precise_gc = false)
+      : f(_f), score(ComputeScore(_f, precise_gc)), estimate_size(0) {
     if (f == nullptr) return;
-    score = std::min(
-        1.0, f->num_antiquation / std::max<double>(1, f->prop.num_entries));
     estimate_size = static_cast<uint64_t>(f->fd.file_size * (1 - score));
   }
 };
+
+struct GarbageCollectionPickerSelection {
+  std::vector<FileMetaData*> files;
+  uint64_t estimated_live_bytes = 0;
+  uint64_t reference_scan_bytes = 0;
+  double primary_score = 0;
+};
+
+GarbageCollectionPickerSelection PickCostAwareGarbageCollectionBatch(
+    VersionStorageInfo* vstorage,
+    const MutableCFOptions& mutable_cf_options, double effective_gc_ratio,
+    uint64_t fragment_size, uint64_t max_live_bytes) {
+  GarbageCollectionPickerSelection picker_selection;
+  std::vector<GarbageCollectionBatchCandidate> candidates;
+  std::vector<GarbageFileInfo> candidate_info;
+  for (auto* file : vstorage->LevelFiles(-1)) {
+    if (file->is_gc_forbidden()) {
+      break;
+    }
+    if (!file->is_gc_permitted() || file->being_compacted) {
+      continue;
+    }
+    GarbageFileInfo info(file, mutable_cf_options.precise_gc);
+    const auto validation_files =
+        vstorage->GetGarbageCollectionValidationFiles(file);
+    uint64_t reference_entries = 0;
+    for (const auto& validation_file : validation_files) {
+      reference_entries = SaturatingGarbageCollectionCostAdd(
+          reference_entries, validation_file.file->prop.num_entries);
+    }
+    if (mutable_cf_options.gc_streaming_validation &&
+        !IsGarbageCollectionStreamingEfficient(
+            file->prop.num_entries, reference_entries)) {
+      continue;
+    }
+    const uint64_t reclaimable_bytes =
+        file->fd.GetFileSize() - info.estimate_size;
+    const bool forced = file->marked_for_compaction != 0;
+    GarbageCollectionBatchCandidate candidate;
+    candidate.file_number = file->fd.GetNumber();
+    candidate.reclaimable_bytes = reclaimable_bytes;
+    candidate.live_bytes = info.estimate_size;
+    candidate.primary_eligible = forced || info.score >= effective_gc_ratio;
+    candidate.batch_eligible =
+        candidate.primary_eligible ||
+        (mutable_cf_options.gc_streaming_validation &&
+         info.estimate_size <= fragment_size);
+    candidate.forced = forced;
+    candidate.reference_costs.reserve(validation_files.size());
+    for (const auto& validation_file : validation_files) {
+      candidate.reference_costs.push_back(
+          {validation_file.file->fd.GetNumber(),
+           validation_file.file->fd.GetFileSize()});
+    }
+    candidates.emplace_back(std::move(candidate));
+    candidate_info.emplace_back(info);
+  }
+
+  const auto selection =
+      SelectGarbageCollectionBatch(candidates, 6, max_live_bytes);
+  if (selection.candidate_indexes.empty()) {
+    return picker_selection;
+  }
+  picker_selection.estimated_live_bytes = selection.live_bytes;
+  picker_selection.reference_scan_bytes = selection.reference_scan_bytes;
+  picker_selection.primary_score =
+      candidate_info[selection.candidate_indexes.front()].score;
+  for (size_t candidate_index : selection.candidate_indexes) {
+    auto* file = candidate_info[candidate_index].f;
+    picker_selection.files.push_back(file);
+  }
+  return picker_selection;
+}
+
+bool PreferPurgeOnlyGarbageCollection(
+    VersionStorageInfo* vstorage, bool purge_only_enabled,
+    std::vector<FileMetaData*>* files) {
+  if (!purge_only_enabled || vstorage == nullptr || files == nullptr ||
+      files->empty()) {
+    return false;
+  }
+  std::vector<FileMetaData*> purgeable_files;
+  std::vector<FileMetaData*> rewrite_files;
+  for (auto* file : *files) {
+    if (vstorage->CanPurgeBlobFile(file)) {
+      purgeable_files.push_back(file);
+    } else {
+      rewrite_files.push_back(file);
+    }
+  }
+  if (purgeable_files.empty()) {
+    return false;
+  }
+  for (auto* file : rewrite_files) {
+    if (file->is_gc_candidate()) {
+      file->set_gc_permitted();
+    }
+  }
+  *files = std::move(purgeable_files);
+  return true;
+}
+
+uint64_t CountGarbageCollectionEntries(
+    const std::vector<FileMetaData*>& files) {
+  uint64_t garbage_entries = 0;
+  for (const auto* file : files) {
+    garbage_entries = SaturatingGarbageCollectionCostAdd(
+        garbage_entries, file->num_antiquation);
+  }
+  return garbage_entries;
+}
+
+uint64_t CountGarbageCollectionBytes(
+    const std::vector<FileMetaData*>& files) {
+  uint64_t garbage_bytes = 0;
+  for (const auto* file : files) {
+    garbage_bytes = SaturatingGarbageCollectionCostAdd(
+        garbage_bytes, std::min(file->num_antiquation_bytes,
+                                file->fd.GetFileSize()));
+  }
+  return garbage_bytes;
+}
 struct FileUseInfo {
   uint64_t size;
   uint64_t used;
@@ -425,6 +562,15 @@ bool CompactionPicker::FixInputRange(std::vector<SelectedRange>& input_range,
 void CompactionPicker::ReleaseCompactionFiles(Compaction* c, Status status) {
   UnregisterCompaction(c);
   if (!status.ok()) {
+    if (c->compaction_type() == kGarbageCollection) {
+      for (const auto& input_level : *c->inputs()) {
+        for (auto* file : input_level.files) {
+          if (file->is_gc_candidate()) {
+            file->set_gc_permitted();
+          }
+        }
+      }
+    }
     c->ResetNextCompactionIndex();
   }
 }
@@ -844,7 +990,7 @@ void CompactionPicker::GetGrandparents(
 // 2. fragment should be take away by the way
 // 3. it marked for compaction
 Compaction* CompactionPicker::PickGarbageCollection(
-    const std::string& /*cf_name*/, const MutableCFOptions& mutable_cf_options,
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
     VersionStorageInfo* vstorage, LogBuffer* /*log_buffer*/) {
   // Setting fragment_size as one eighth target_blob_file_size prevents
   // selecting massive files to single compaction which would pin down the
@@ -862,6 +1008,103 @@ Compaction* CompactionPicker::PickGarbageCollection(
           ? std::max(mutable_cf_options.blob_gc_ratio,
                      mutable_cf_options.blob_gc_defer_ratio)
           : mutable_cf_options.blob_gc_ratio;
+  if (mutable_cf_options.gc_purge_only) {
+    std::vector<FileMetaData*> purgeable_files;
+    for (auto* file : vstorage->LevelFiles(-1)) {
+      if (file->is_gc_forbidden()) {
+        break;
+      }
+      if (!file->is_gc_permitted() || file->being_compacted ||
+          !vstorage->CanPurgeBlobFile(file)) {
+        continue;
+      }
+      file->set_gc_candidate();
+      purgeable_files.push_back(file);
+      if (purgeable_files.size() == 8) {
+        break;
+      }
+    }
+    if (!purgeable_files.empty()) {
+      std::vector<CompactionInputFiles> inputs(1);
+      inputs.front().level = -1;
+      inputs.front().files = std::move(purgeable_files);
+
+      CompactionParams params(vstorage, ioptions_, mutable_cf_options);
+      params.inputs = std::move(inputs);
+      params.output_level = -1;
+      params.num_antiquation =
+          CountGarbageCollectionEntries(params.inputs.front().files);
+      params.max_compaction_bytes = LLONG_MAX;
+      params.output_path_id = GetPathId(ioptions_, mutable_cf_options, 1);
+      params.compression = kNoCompression;
+      params.max_subcompactions = 1;
+      params.score = vstorage->total_garbage_ratio();
+      params.compaction_type = kGarbageCollection;
+      params.purge_only = true;
+      params.compaction_reason = ConvertInputsCompactionReason(
+          params.inputs, CompactionReason::kGarbageCollection);
+      Compaction* compaction =
+          RegisterCompaction(new Compaction(std::move(params)));
+      ROCKS_LOG_INFO(ioptions_.info_log,
+                     "[%s] GC_PURGE_PICK selected=%zu", cf_name.c_str(),
+                     compaction->inputs()->front().files.size());
+      vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options);
+      return compaction;
+    }
+  }
+  if (mutable_cf_options.gc_cost_aware_selection &&
+      mutable_cf_options.gc_streaming_validation) {
+    const uint64_t max_live_bytes =
+        std::max<uint64_t>(fragment_size, target_blob_file_size / 2);
+    auto selection = PickCostAwareGarbageCollectionBatch(
+        vstorage, mutable_cf_options, effective_gc_ratio, fragment_size,
+        max_live_bytes);
+    if (!selection.files.empty()) {
+      std::vector<CompactionInputFiles> inputs(1);
+      inputs.front().level = -1;
+      inputs.front().files = selection.files;
+      for (auto* file : inputs.front().files) {
+        file->set_gc_candidate();
+      }
+      const bool purge_only = PreferPurgeOnlyGarbageCollection(
+          vstorage, mutable_cf_options.gc_purge_only,
+          &inputs.front().files);
+
+      int bottommost_level = vstorage->num_levels() - 1;
+      CompactionParams params(vstorage, ioptions_, mutable_cf_options);
+      params.inputs = std::move(inputs);
+      params.output_level = -1;
+      params.num_antiquation =
+          CountGarbageCollectionEntries(params.inputs.front().files);
+      params.max_compaction_bytes = LLONG_MAX;
+      params.output_path_id = GetPathId(ioptions_, mutable_cf_options, 1);
+      params.compression = GetCompressionType(
+          ioptions_, vstorage, mutable_cf_options, bottommost_level, 1, true);
+      params.compression_opts =
+          GetCompressionOptions(ioptions_, vstorage, bottommost_level, true);
+      params.max_subcompactions = 1;
+      params.score = vstorage->total_garbage_ratio();
+      params.compaction_type = kGarbageCollection;
+      params.purge_only = purge_only;
+      params.compaction_reason = ConvertInputsCompactionReason(
+          params.inputs, CompactionReason::kGarbageCollection);
+
+      const size_t selected_file_count = params.inputs.front().files.size();
+      Compaction* compaction =
+          RegisterCompaction(new Compaction(std::move(params)));
+      ROCKS_LOG_INFO(
+          ioptions_.info_log,
+          "[%s] GC_COST_PICK selected=%zu reclaimable_bytes=%" PRIu64
+          " live_bytes=%" PRIu64 " reference_scan_bytes=%" PRIu64
+          " primary_ratio=%.4f purge_only=%d",
+          cf_name.c_str(), selected_file_count,
+          CountGarbageCollectionBytes(compaction->inputs()->front().files),
+          selection.estimated_live_bytes, selection.reference_scan_bytes,
+          selection.primary_score, purge_only ? 1 : 0);
+      vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options);
+      return compaction;
+    }
+  }
   // Preferentially select files marked by high priority
   auto candidate_cmp = [](const GarbageFileInfo& l, const GarbageFileInfo& r) {
     assert(l.f != nullptr && !l.f->being_compacted);
@@ -874,14 +1117,14 @@ Compaction* CompactionPicker::PickGarbageCollection(
   auto& hidden_files = vstorage->LevelFiles(-1);
   uint64_t idx = 0;
   // Find largest score blob
-  GarbageFileInfo dirtiest_blob{nullptr};
+  GarbageFileInfo dirtiest_blob{nullptr, mutable_cf_options.precise_gc};
   for (; idx < hidden_files.size() && !hidden_files[idx]->is_gc_forbidden();
        ++idx) {
     FileMetaData* f = hidden_files[idx];
     if (!f->is_gc_permitted() || f->being_compacted) {
       continue;
     }
-    GarbageFileInfo info{f};
+    GarbageFileInfo info{f, mutable_cf_options.precise_gc};
     // candidate_cmp is less comparator
     if (dirtiest_blob.f == nullptr || candidate_cmp(dirtiest_blob, info)) {
       dirtiest_blob = info;
@@ -944,7 +1187,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   }
   auto push_candidate = [&](FileMetaData* f) {
     if (f->is_gc_permitted() && !f->being_compacted) {
-      GarbageFileInfo gc_blob(f);
+      GarbageFileInfo gc_blob(f, mutable_cf_options.precise_gc);
       if (gc_blob.estimate_size <= fragment_size ||
           gc_blob.score >= effective_gc_ratio ||
           gc_blob.f->marked_for_compaction) {
@@ -990,6 +1233,13 @@ Compaction* CompactionPicker::PickGarbageCollection(
   params.max_subcompactions = 1;
   params.score = vstorage->total_garbage_ratio();
   params.compaction_type = kGarbageCollection;
+  params.purge_only = PreferPurgeOnlyGarbageCollection(
+      vstorage, mutable_cf_options.gc_purge_only,
+      &params.inputs.front().files);
+  params.num_antiquation =
+      CountGarbageCollectionEntries(params.inputs.front().files);
+  const size_t selected_file_count = params.inputs.front().files.size();
+  const bool purge_only = params.purge_only;
   params.compaction_reason = ConvertInputsCompactionReason(
       params.inputs, CompactionReason::kGarbageCollection);
 

@@ -884,6 +884,23 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     }
   }
 
+  meta_iter->Seek(kGarbageCollectionLivenessBloomBlock);
+  Status gc_liveness_bloom_status = meta_iter->status();
+  if (gc_liveness_bloom_status.ok() && meta_iter->Valid() &&
+      meta_iter->key() == kGarbageCollectionLivenessBloomBlock) {
+    Slice encoded_handle = meta_iter->value();
+    gc_liveness_bloom_status =
+        rep->gc_liveness_bloom_handle.DecodeFrom(&encoded_handle);
+  } else if (gc_liveness_bloom_status.ok()) {
+    gc_liveness_bloom_status = Status::NotFound();
+  }
+  if (!gc_liveness_bloom_status.ok() &&
+      !gc_liveness_bloom_status.IsNotFound()) {
+    ROCKS_LOG_WARN(rep->ioptions.info_log,
+                   "Error locating GC liveness Bloom block: %s",
+                   gc_liveness_bloom_status.ToString().c_str());
+  }
+
   // Read the properties
   bool found_properties_block = true;
   s = SeekToPropertiesBlock(meta_iter.get(), &found_properties_block);
@@ -1194,6 +1211,59 @@ size_t BlockBasedTable::ApproximateMemoryUsage() const {
 }
 
 uint64_t BlockBasedTable::FileNumber() const { return rep_->file_number; }
+
+Status BlockBasedTable::MayContainGarbageCollectionReference(
+    const std::vector<uint64_t>& logical_file_numbers,
+    const ParsedInternalKey& key, bool* may_contain) const {
+  if (may_contain == nullptr) {
+    return Status::InvalidArgument("GC liveness Bloom result is null");
+  }
+  if (rep_->gc_liveness_bloom_handle.IsNull()) {
+    return Status::NotFound("GC liveness Bloom block is missing");
+  }
+  if (rep_->global_seqno != kDisableGlobalSequenceNumber) {
+    return Status::NotSupported(
+        "GC liveness Bloom does not support global sequence numbers");
+  }
+
+  std::call_once(rep_->gc_liveness_bloom_once, [&]() {
+    BlockContents contents;
+    ReadOptions read_options;
+    read_options.verify_checksums = true;
+    BlockFetcher block_fetcher(
+        rep_->file.get(), nullptr /* prefetch_buffer */, rep_->footer,
+        read_options, rep_->gc_liveness_bloom_handle, &contents,
+        rep_->ioptions, false /* do_uncompress */, false /* maybe_compressed */,
+        Slice() /* compression_dict */, rep_->persistent_cache_options,
+        GetMemoryAllocator(rep_->table_options));
+    rep_->gc_liveness_bloom_status = block_fetcher.ReadBlockContents();
+    if (rep_->gc_liveness_bloom_status.ok()) {
+      auto bloom = new GarbageCollectionLivenessBloomIndex();
+      rep_->gc_liveness_bloom_status = bloom->Decode(contents.data);
+      const auto table_properties = GetTableProperties();
+      if (rep_->gc_liveness_bloom_status.ok() &&
+          (table_properties == nullptr ||
+           !bloom->MatchesDependence(table_properties->dependence))) {
+        rep_->gc_liveness_bloom_status =
+            Status::Corruption("GC liveness Bloom metadata mismatch");
+      }
+      if (rep_->gc_liveness_bloom_status.ok()) {
+        rep_->gc_liveness_bloom.reset(bloom);
+      } else {
+        delete bloom;
+      }
+    }
+  });
+  if (!rep_->gc_liveness_bloom_status.ok()) {
+    return rep_->gc_liveness_bloom_status;
+  }
+  if (rep_->gc_liveness_bloom == nullptr) {
+    return Status::Corruption("GC liveness Bloom was not initialized");
+  }
+  *may_contain =
+      rep_->gc_liveness_bloom->MayContain(logical_file_numbers, key);
+  return Status::OK();
+}
 
 // Load the meta-block from the file. On success, return the loaded meta block
 // and its iterator.

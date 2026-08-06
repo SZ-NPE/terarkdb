@@ -174,6 +174,13 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.blob_gc_defer_enabled =
       mutable_cf_options.blob_gc_defer_enabled;
   cf_opts.blob_gc_defer_ratio = mutable_cf_options.blob_gc_defer_ratio;
+  cf_opts.precise_gc = mutable_cf_options.precise_gc;
+  cf_opts.gc_cost_aware_selection =
+      mutable_cf_options.gc_cost_aware_selection;
+  cf_opts.gc_streaming_validation =
+      mutable_cf_options.gc_streaming_validation;
+  cf_opts.gc_liveness_bloom = mutable_cf_options.gc_liveness_bloom;
+  cf_opts.gc_purge_only = mutable_cf_options.gc_purge_only;
   cf_opts.target_blob_file_size = mutable_cf_options.target_blob_file_size;
   cf_opts.blob_file_defragment_size =
       mutable_cf_options.blob_file_defragment_size;
@@ -1946,6 +1953,26 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::blob_gc_defer_ratio),
           OptionType::kDouble, OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, blob_gc_defer_ratio)}},
+        {"precise_gc",
+         {offset_of(&ColumnFamilyOptions::precise_gc), OptionType::kBoolean,
+          OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, precise_gc)}},
+        {"gc_cost_aware_selection",
+         {offset_of(&ColumnFamilyOptions::gc_cost_aware_selection),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, gc_cost_aware_selection)}},
+        {"gc_streaming_validation",
+         {offset_of(&ColumnFamilyOptions::gc_streaming_validation),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, gc_streaming_validation)}},
+        {"gc_liveness_bloom",
+         {offset_of(&ColumnFamilyOptions::gc_liveness_bloom),
+          OptionType::kBoolean, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, gc_liveness_bloom)}},
+        {"gc_purge_only",
+         {offset_of(&ColumnFamilyOptions::gc_purge_only), OptionType::kBoolean,
+          OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, gc_purge_only)}},
         {"target_blob_file_size",
          {offset_of(&ColumnFamilyOptions::target_blob_file_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal, true,

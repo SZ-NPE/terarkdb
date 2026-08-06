@@ -235,6 +235,8 @@ void CompactionIterator::Next() {
       key_ = merge_out_iter_.key();
       value_ = LazyBufferReference(merge_out_iter_.value());
       value_meta_.clear();
+      input_value_size_ = 0;
+      input_has_value_size_ = false;
       bool valid_key __attribute__((__unused__));
       valid_key = ParseInternalKey(key_, &ikey_);
       // MergeUntil stops when it encounters a corrupt key and does not
@@ -390,7 +392,8 @@ void CompactionIterator::NextFromInput() {
       // First occurrence of this user key
       // Copy key for output
       key_ = current_key_.SetInternalKey(key_, &ikey_);
-      value_ = input_.value(current_key_.GetUserKey(), &value_meta_);
+      value_ = input_.value(current_key_.GetUserKey(), &value_meta_,
+                            &input_value_size_, &input_has_value_size_);
       current_user_key_ = ikey_.user_key;
       has_current_user_key_ = true;
       has_outputted_key_ = false;
@@ -413,7 +416,8 @@ void CompactionIterator::NextFromInput() {
       // if we have versions on both sides of a snapshot
       current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
       key_ = current_key_.GetInternalKey();
-      value_ = input_.value(current_key_.GetUserKey(), &value_meta_);
+      value_ = input_.value(current_key_.GetUserKey(), &value_meta_,
+                            &input_value_size_, &input_has_value_size_);
       ikey_.user_key = current_key_.GetUserKey();
 
       // Note that newer version of a key is ordered before older versions. If a
@@ -806,11 +810,15 @@ void CompactionIterator::PrepareOutput() {
       // Not supported is ok, keep value combined.
     } else {
       // Use input sst as blob, don't zero the sequence
+      const bool track_value_size = input_.separate_helper()->TrackValueSize();
+      const uint64_t logical_value_size =
+          track_value_size ? value_.size() : 0;
       ikey_.type = ikey_.type == kTypeValue ? kTypeValueIndex : kTypeMergeIndex;
       current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
       s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_, value_meta_,
-          ikey_.type == kTypeMergeIndex, false);
+          ikey_.type == kTypeMergeIndex, false, logical_value_size,
+          track_value_size);
       if (!s.ok()) {
         valid_ = false;
         status_ = std::move(s);
@@ -818,6 +826,7 @@ void CompactionIterator::PrepareOutput() {
     }
   } else if (ikey_.type == kTypeValueIndex || ikey_.type == kTypeMergeIndex) {
     assert(value_.file_number() != uint64_t(-1));
+    Status s;
     if (do_rebuild_blob) {
       // Prepare key type for write blob
       ValueType backup_type = ikey_.type;
@@ -825,7 +834,7 @@ void CompactionIterator::PrepareOutput() {
       current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
       // Aah, we write value into new blob, so we can zero the sequence
       zero_sequence();
-      auto s = input_.separate_helper()->TransToSeparate(
+      s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_);
       if (s.ok()) {
         // Restore key type
@@ -841,9 +850,13 @@ void CompactionIterator::PrepareOutput() {
       current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
       zero_sequence();
     } else {
-      auto s = input_.separate_helper()->TransToSeparate(
+      const bool track_value_size =
+          input_.separate_helper()->TrackValueSize();
+      s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_, value_meta_,
-          ikey_.type == kTypeMergeIndex, true);
+          ikey_.type == kTypeMergeIndex, true,
+          track_value_size ? input_value_size_ : 0,
+          track_value_size && input_has_value_size_);
       if (!s.ok()) {
         valid_ = false;
         status_ = std::move(s);

@@ -973,9 +973,16 @@ bool ColumnFamilyData::NeedsCompaction() const {
 
 bool ColumnFamilyData::NeedsGarbageCollection() const {
   auto vstorage = current_->storage_info();
+  const double effective_gc_ratio =
+      mutable_cf_options_.blob_gc_defer_enabled
+          ? std::max(mutable_cf_options_.blob_gc_ratio,
+                     mutable_cf_options_.blob_gc_defer_ratio)
+          : mutable_cf_options_.blob_gc_ratio;
   return !vstorage->IsPickGarbageCollectionFail() &&
          (vstorage->blob_marked_for_compaction() ||
-          vstorage->total_garbage_ratio() >= mutable_cf_options_.blob_gc_ratio);
+          (mutable_cf_options_.gc_purge_only &&
+           vstorage->HasPurgeableBlobFile()) ||
+          vstorage->total_garbage_ratio() >= effective_gc_ratio);
 }
 
 Compaction* ColumnFamilyData::PickCompaction(

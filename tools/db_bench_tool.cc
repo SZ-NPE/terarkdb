@@ -997,6 +997,22 @@ DEFINE_bool(blob_gc_defer_enabled, false,
 DEFINE_double(blob_gc_defer_ratio, 0.65,
               "Deferred automatic Blob SST GC ratio floor");
 
+DEFINE_bool(precise_gc, false,
+            "Enable byte-precise garbage ratio calculation for blob GC");
+
+DEFINE_bool(gc_cost_aware_selection, false,
+            "Select blob GC batches using reclaim, migration, and shared "
+            "reference-scan costs");
+
+DEFINE_bool(gc_streaming_validation, false,
+            "Validate blob GC with a bounded-memory stream join");
+
+DEFINE_bool(gc_liveness_bloom, false,
+            "Skip blob GC point lookups using per-kSST liveness Bloom filters");
+
+DEFINE_bool(gc_purge_only, false,
+            "Delete fully unreachable blob files without rewriting them");
+
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
 DEFINE_uint64(blob_file_defragment_size, 0, "Blob file defragment threshold");
@@ -3601,6 +3617,11 @@ class Benchmark {
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.blob_gc_defer_enabled = FLAGS_blob_gc_defer_enabled;
     options.blob_gc_defer_ratio = FLAGS_blob_gc_defer_ratio;
+    options.precise_gc = FLAGS_precise_gc;
+    options.gc_cost_aware_selection = FLAGS_gc_cost_aware_selection;
+    options.gc_streaming_validation = FLAGS_gc_streaming_validation;
+    options.gc_liveness_bloom = FLAGS_gc_liveness_bloom;
+    options.gc_purge_only = FLAGS_gc_purge_only;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;

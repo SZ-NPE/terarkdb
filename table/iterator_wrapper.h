@@ -130,7 +130,9 @@ class CombinedInternalIterator : public InternalIterator {
   bool Valid() const override { return iter_->Valid(); }
   Slice key() const override { return iter_->key(); }
   LazyBuffer value() const override;
-  LazyBuffer value(const Slice& user_key, std::string* meta) const;
+  LazyBuffer value(const Slice& user_key, std::string* meta,
+                   uint64_t* value_size = nullptr,
+                   bool* has_value_size = nullptr) const;
   Status status() const override { return iter_->status(); }
   void Next() override { iter_->Next(); }
   void Prev() override { iter_->Prev(); }

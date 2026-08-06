@@ -36,6 +36,8 @@
 #include <memory>
 #include <set>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -45,6 +47,8 @@
 #include "db/dbformat.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "db/gc_batch_selector.h"
+#include "db/gc_streaming_validator.h"
 #include "db/map_builder.h"
 #include "db/memtable.h"
 #include "db/merge_context.h"
@@ -66,6 +70,8 @@
 #include "table/block_based_table_factory.h"
 #include "table/get_context.h"
 #include "table/merging_iterator.h"
+#include "table/table_reader.h"
+#include "table/scoped_arena_iterator.h"
 #include "table/table_builder.h"
 #include "util/async_task.h"
 #include "util/c_style_callback.h"
@@ -1055,6 +1061,7 @@ Status CompactionJob::Run() {
     context.compaction_filter_factory = factory->Name();
   }
   context.blob_config = c->mutable_cf_options()->get_blob_config();
+  context.track_value_size = c->mutable_cf_options()->precise_gc;
   context.separation_type = c->separation_type();
   context.table_factory = iopt->table_factory->Name();
   s = iopt->table_factory->GetOptionString(&context.table_factory_options,
@@ -1196,6 +1203,8 @@ Status CompactionJob::Run() {
           output.meta.prop.dependence = tp->dependence;
           output.meta.prop.inheritance =
               InheritanceTreeToSet(tp->inheritance_tree);
+          ProcessFileMetaData("RemoteCompactionOutput", &output.meta, tp,
+                              iopt, c->mutable_cf_options());
           if (iopt->ttl_extractor_factory != nullptr) {
             GetCompactionTimePoint(
                 tp->user_collected_properties,
@@ -1482,7 +1491,6 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
 }
 
 void CompactionJob::ProcessCompaction(SubcompactionState* sub_compact) {
-  // SetThreadSched(kSchedIdle);
   switch (sub_compact->compaction->compaction_type()) {
     case kKeyValueCompaction:
       ProcessKeyValueCompaction(sub_compact);
@@ -1491,13 +1499,26 @@ void CompactionJob::ProcessCompaction(SubcompactionState* sub_compact) {
       assert(false);
       break;
     case kGarbageCollection:
-      ProcessGarbageCollection(sub_compact);
+      if (sub_compact->compaction->purge_only()) {
+        ROCKS_LOG_INFO(
+            db_options_.info_log,
+            "[%s] [JOB %d] GC purge-only certificate accepted for %zu files",
+            sub_compact->compaction->column_family_data()->GetName().c_str(),
+            job_id_, sub_compact->compaction->inputs()->front().files.size());
+        sub_compact->status = Status::OK();
+      } else {
+        const bool batch_scheduling_enabled =
+            SetThreadSched(kSchedBatch) == 0;
+        ProcessGarbageCollection(sub_compact);
+        if (batch_scheduling_enabled) {
+          SetThreadSched(kSchedOther);
+        }
+      }
       break;
     default:
       assert(false);
       break;
   }
-  // SetThreadSched(kSchedOther);
 }
 
 void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
@@ -1583,16 +1604,20 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   struct BuilderSeparateHelper : public SeparateHelper {
     SeparateHelper* separate_helper = nullptr;
     std::unique_ptr<ValueExtractor> value_meta_extractor;
+    bool track_value_size = false;
     Status (*trans_to_separate_callback)(void* args, const Slice& key,
                                          LazyBuffer& value) = nullptr;
     void* trans_to_separate_callback_args = nullptr;
 
+    bool TrackValueSize() const override { return track_value_size; }
+
     Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                            const Slice& meta, bool is_merge,
-                           bool is_index) override {
+                           bool is_index, uint64_t value_size,
+                           bool has_value_size) override {
       return SeparateHelper::TransToSeparate(
           internal_key, value, value.file_number(), meta, is_merge, is_index,
-          value_meta_extractor.get());
+          value_meta_extractor.get(), value_size, has_value_size);
     }
 
     Status TransToSeparate(const Slice& key, LazyBuffer& value) override {
@@ -1636,18 +1661,22 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     }
     if (s.ok()) {
       s = blob_builder->Add(key, value);
-    }
-    if (s.ok()) {
-      blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
-      s = SeparateHelper::TransToSeparate(
-          key, value, blob_meta->fd.GetNumber(), Slice(),
-          GetInternalKeyType(key) == kTypeMerge, false,
-          separate_helper.value_meta_extractor.get());
+      if (s.ok()) {
+        const uint64_t logical_value_size =
+            separate_helper.track_value_size ? value.size() : 0;
+        blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
+        s = SeparateHelper::TransToSeparate(
+            key, value, blob_meta->fd.GetNumber(), Slice(),
+            GetInternalKeyType(key) == kTypeMerge, false,
+            separate_helper.value_meta_extractor.get(), logical_value_size,
+            separate_helper.track_value_size);
+      }
     }
     return s;
   };
 
   separate_helper.separate_helper = sub_compact->compaction->input_version();
+  separate_helper.track_value_size = mutable_cf_options->precise_gc;
   if (!sub_compact->compaction->immutable_cf_options()
            ->table_factory->IsBuilderNeedSecondPass()) {
     separate_helper.trans_to_separate_callback =
@@ -1765,7 +1794,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (!sub_compact->compaction->partial_compaction()) {
     dict_sample_data.reserve(kSampleBytes);
   }
-  std::unordered_map<uint64_t, uint64_t> dependence;
+  std::unordered_map<uint64_t, SeparateHelper::ReferenceStats> dependence;
 
   size_t yield_count = 0;
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid()) {
@@ -1776,9 +1805,16 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     if (c_iter->ikey().type == kTypeValueIndex ||
         c_iter->ikey().type == kTypeMergeIndex) {
       assert(value.file_number() != uint64_t(-1));
-      auto ib = dependence.emplace(value.file_number(), 1);
-      if (!ib.second) {
-        ++ib.first->second;
+      auto& reference_stats = dependence[value.file_number()];
+      if (mutable_cf_options->precise_gc) {
+        SeparateHelper::ValueReference reference;
+        if (!SeparateHelper::DecodeValueReference(value.slice(), &reference)) {
+          status = Status::Corruption("Invalid separated value reference");
+          break;
+        }
+        reference_stats.Add(reference);
+      } else {
+        reference_stats.Add(SeparateHelper::ValueReference{});
       }
     }
 
@@ -1988,7 +2024,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (sub_compact->builder != nullptr) {
     CompactionIterationStats range_del_out_stats;
     Status s = FinishCompactionOutputFile(status, sub_compact, &range_del_agg,
-                                          &range_del_out_stats, dependence);
+                                          &range_del_out_stats, dependence,
+                                          nullptr);
     dependence.clear();
     if (status.ok()) {
       status = s;
@@ -2048,15 +2085,18 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
 
-  // I/O measurement variables
   PerfLevel prev_perf_level = PerfLevel::kEnableTime;
+  uint64_t prev_read_bytes = 0, prev_write_bytes = 0;
   uint64_t prev_write_nanos = 0;
   uint64_t prev_fsync_nanos = 0;
   uint64_t prev_range_sync_nanos = 0;
   uint64_t prev_prepare_write_nanos = 0;
+  const uint64_t gc_begin_ts = env_->NowMicros();
   if (measure_io_stats_) {
     prev_perf_level = GetPerfLevel();
     SetPerfLevel(PerfLevel::kEnableTime);
+    prev_read_bytes = IOSTATS(bytes_read);
+    prev_write_bytes = IOSTATS(bytes_written);
     prev_write_nanos = IOSTATS(write_nanos);
     prev_fsync_nanos = IOSTATS(fsync_nanos);
     prev_range_sync_nanos = IOSTATS(range_sync_nanos);
@@ -2101,16 +2141,257 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   IterKey iter_key;
   ParsedInternalKey ikey;
   struct {
-    uint64_t input = 0;
-    uint64_t garbage_type = 0;
-    uint64_t get_not_found = 0;
-    uint64_t file_number_mismatch = 0;
+    uint64_t input = 0, garbage_type = 0, get_not_found = 0;
+    uint64_t file_number_mismatch = 0, lookup_micros = 0;
+    uint64_t point_lookups = 0;
+    uint64_t sampled_lookups = 0;
+    uint64_t bloom_negatives = 0;
+    uint64_t bloom_positives = 0;
+    uint64_t bloom_fallbacks = 0;
+    uint64_t validity_cache_hits = 0;
+    uint64_t streaming_validations = 0;
+    uint64_t streaming_fallbacks = 0;
+    uint64_t live = 0, dead = 0, live_runs = 0, dead_runs = 0;
+    uint64_t max_live_run = 0, curr_run = 0;
+    bool has_run = false, run_live = false;
   } counter;
   std::vector<std::pair<uint64_t, FileMetaData*>> blob_meta_cache;
+
+  struct LivenessBloomPlan {
+    struct Reference {
+      TableReader* reader = nullptr;
+      std::vector<uint64_t> logical_file_numbers;
+    };
+    std::vector<Reference> references;
+    bool usable = false;
+  };
+  struct PinnedLivenessBloomReaders {
+    TableCache* table_cache = nullptr;
+    std::vector<Cache::Handle*> handles;
+
+    ~PinnedLivenessBloomReaders() {
+      for (auto* handle : handles) {
+        table_cache->ReleaseHandle(handle);
+      }
+    }
+  } pinned_liveness_bloom_readers;
+  pinned_liveness_bloom_readers.table_cache = cfd->table_cache();
+  std::unordered_map<uint64_t, LivenessBloomPlan> liveness_bloom_plans;
+  const bool liveness_bloom_requested =
+      sub_compact->compaction->mutable_cf_options()->gc_liveness_bloom &&
+      !cfd->user_comparator()->CanKeysWithDifferentByteContentsBeEqual();
+  if (liveness_bloom_requested) {
+    for (const auto& input_level : *sub_compact->compaction->inputs()) {
+      for (const auto* blob_file : input_level.files) {
+        LivenessBloomPlan plan;
+        const auto references =
+            input_version->storage_info()
+                ->GetGarbageCollectionReferenceFiles(blob_file);
+        plan.usable =
+            !references.empty() &&
+            input_version->storage_info()
+                ->HasCompleteGarbageCollectionReferences(blob_file);
+        if (plan.usable) {
+          for (const auto& reference : references) {
+            if (!reference.direct || reference.file == nullptr ||
+                reference.file->prop.is_map_sst()) {
+              plan.usable = false;
+              plan.references.clear();
+              break;
+            }
+            LivenessBloomPlan::Reference bloom_reference;
+            bool found_logical_reference = false;
+            for (const auto& dependence : reference.file->prop.dependence) {
+              const auto target = dependence_map.find(dependence.file_number);
+              if (target != dependence_map.end() && target->second != nullptr &&
+                  target->second->fd.GetNumber() ==
+                      blob_file->fd.GetNumber()) {
+                bloom_reference.logical_file_numbers.push_back(
+                    dependence.file_number);
+                found_logical_reference = true;
+              }
+            }
+            if (!found_logical_reference) {
+              plan.usable = false;
+              plan.references.clear();
+              break;
+            }
+            TableReader* table_reader = reference.file->fd.table_reader;
+            if (table_reader == nullptr) {
+              Cache::Handle* handle = nullptr;
+              Status table_status = cfd->table_cache()->FindTable(
+                  env_options_for_read_, reference.file->fd, &handle,
+                  sub_compact->compaction->mutable_cf_options()
+                      ->prefix_extractor.get(),
+                  false /* no_io */, true /* record_read_stats */,
+                  nullptr /* file_read_hist */, false /* skip_filters */,
+                  reference.level,
+                  false /* prefetch_index_and_filter_in_cache */);
+              if (!table_status.ok()) {
+                plan.usable = false;
+                plan.references.clear();
+                break;
+              }
+              table_reader =
+                  cfd->table_cache()->GetTableReaderFromHandle(handle);
+              pinned_liveness_bloom_readers.handles.push_back(handle);
+            }
+            std::sort(bloom_reference.logical_file_numbers.begin(),
+                      bloom_reference.logical_file_numbers.end());
+            bloom_reference.logical_file_numbers.erase(
+                std::unique(bloom_reference.logical_file_numbers.begin(),
+                            bloom_reference.logical_file_numbers.end()),
+                bloom_reference.logical_file_numbers.end());
+            bloom_reference.reader = table_reader;
+            plan.references.push_back(std::move(bloom_reference));
+          }
+        }
+        liveness_bloom_plans.emplace(blob_file->fd.GetNumber(),
+                                     std::move(plan));
+      }
+    }
+  }
+
+  std::unordered_set<uint64_t> streaming_target_files;
+  std::unordered_set<uint64_t> streaming_unsafe_files;
+  const bool streaming_validation_requested =
+      sub_compact->compaction->mutable_cf_options()->gc_streaming_validation;
+  uint64_t streaming_reference_files = 0;
+  std::string streaming_fallback_reason =
+      streaming_validation_requested ? "not_attempted" : "disabled";
+  Arena streaming_arena;
+  ScopedArenaIterator streaming_references;
+  std::unique_ptr<StreamingGarbageCollectionValidator> streaming_validator;
+  auto build_streaming_validator = [&]() {
+    if (!streaming_validation_requested) {
+      return;
+    }
+    if (!existing_snapshots_.empty()) {
+      streaming_fallback_reason = "snapshots";
+      return;
+    }
+    if (earliest_write_conflict_snapshot_ != kMaxSequenceNumber) {
+      streaming_fallback_reason = "write_conflict_snapshot";
+      return;
+    }
+    for (const auto& input_level : *sub_compact->compaction->inputs()) {
+      for (const auto* file : input_level.files) {
+        streaming_target_files.insert(file->fd.GetNumber());
+      }
+    }
+    if (streaming_target_files.empty()) {
+      streaming_fallback_reason = "no_target_files";
+      return;
+    }
+
+    const auto* version_storage = input_version->storage_info();
+    std::vector<std::vector<FileMetaData*>> reference_files_by_level(
+        version_storage->num_levels());
+    std::vector<std::unordered_set<uint64_t>>
+        reference_file_numbers_by_level(version_storage->num_levels());
+    for (const auto& input_level : *sub_compact->compaction->inputs()) {
+      for (const auto* target_file : input_level.files) {
+        bool target_safe = true;
+        std::vector<std::vector<FileMetaData*>> target_files_by_level(
+            version_storage->num_levels());
+        const auto validation_files =
+            version_storage->GetGarbageCollectionValidationFiles(target_file);
+        uint64_t reference_entries = 0;
+        for (const auto& validation_file : validation_files) {
+          reference_entries = SaturatingGarbageCollectionCostAdd(
+              reference_entries, validation_file.file->prop.num_entries);
+        }
+        if (!IsGarbageCollectionStreamingEfficient(
+                target_file->prop.num_entries, reference_entries)) {
+          streaming_unsafe_files.insert(target_file->fd.GetNumber());
+          continue;
+        }
+        for (const auto& validation_file : validation_files) {
+          FileMetaData* reference_file = validation_file.file;
+          if (reference_file->prop.is_map_sst() ||
+              reference_file->prop.has_range_deletions()) {
+            target_safe = false;
+            break;
+          }
+          target_files_by_level[validation_file.level].push_back(
+              reference_file);
+        }
+        if (!target_safe) {
+          streaming_unsafe_files.insert(target_file->fd.GetNumber());
+          continue;
+        }
+        for (int level = 0; level < version_storage->num_levels(); ++level) {
+          for (auto* reference_file : target_files_by_level[level]) {
+            if (reference_file_numbers_by_level[level].insert(
+                    reference_file->fd.GetNumber())
+                    .second) {
+              reference_files_by_level[level].push_back(reference_file);
+              ++streaming_reference_files;
+            }
+          }
+        }
+      }
+    }
+    for (int level = 1; level < version_storage->num_levels(); ++level) {
+      auto& files = reference_files_by_level[level];
+      std::sort(files.begin(), files.end(),
+                [&](const FileMetaData* left, const FileMetaData* right) {
+                  return cfd->internal_comparator().Compare(
+                             left->smallest, right->smallest) < 0;
+                });
+    }
+    for (uint64_t unsafe_file : streaming_unsafe_files) {
+      streaming_target_files.erase(unsafe_file);
+    }
+    if (!streaming_unsafe_files.empty()) {
+      streaming_fallback_reason = "partial_unsafe";
+    }
+    if (streaming_target_files.empty() || streaming_reference_files == 0) {
+      if (streaming_fallback_reason == "not_attempted") {
+        streaming_fallback_reason = "no_reference_files";
+      }
+      return;
+    }
+    MergeIteratorBuilder reference_builder(&cfd->internal_comparator(),
+                                           &streaming_arena);
+    ReadOptions read_options;
+    read_options.fill_cache = false;
+    read_options.total_order_seek = true;
+    input_version->AddGarbageCollectionIterators(
+        read_options, env_options_for_read_, reference_files_by_level,
+        &reference_builder);
+    streaming_references.set(reference_builder.Finish());
+    streaming_validator.reset(new StreamingGarbageCollectionValidator(
+        streaming_references.get(), cfd->user_comparator(), &dependence_map));
+    streaming_fallback_reason =
+        streaming_unsafe_files.empty() ? "ready" : "partial_ready";
+  };
+
+  enum class ValidationResult {
+    kUnknown,
+    kDead,
+    kSourceMismatch,
+    kLive,
+  };
+  std::string cached_validation_key;
+  uint64_t cached_validation_blob_file = uint64_t(-1);
+  uint64_t cached_validation_source_file = uint64_t(-1);
+  ValidationResult cached_validation_result = ValidationResult::kUnknown;
+  auto cache_validation_result = [&](const Slice& key, uint64_t blob_file,
+                                     ValidationResult result,
+                                     uint64_t source_file) {
+    cached_validation_key.assign(key.data(), key.size());
+    cached_validation_blob_file = blob_file;
+    cached_validation_source_file = source_file;
+    cached_validation_result = result;
+  };
+
   assert(!sub_compact->compaction->inputs()->empty());
+  build_streaming_validator();
   blob_meta_cache.reserve(sub_compact->compaction->inputs()->front().size());
   while (status.ok() && !cfd->IsDropped() && input->Valid()) {
     ++counter.input;
+    bool is_live = false;
     Slice curr_key = input->key();
     uint64_t curr_file_number = uint64_t(-1);
     if (!ParseInternalKey(curr_key, &ikey)) {
@@ -2118,6 +2399,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
           Status::Corruption("ProcessGarbageCollection invalid InternalKey");
       break;
     }
+
     uint64_t blob_file_number = input->value().file_number();
     FileMetaData* blob_meta;
     auto find_cache = std::find_if(
@@ -2138,46 +2420,186 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       blob_meta_cache.emplace_back(blob_file_number, blob_meta);
       assert(blob_meta->fd.GetNumber() == blob_file_number);
     }
+
     do {
       if (ikey.type != kTypeValue && ikey.type != kTypeMerge) {
         ++counter.garbage_type;
         break;
       }
-      iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kValueTypeForSeek);
-      Status s;
-      ValueType type = kTypeDeletion;
-      SequenceNumber seq = kMaxSequenceNumber;
-      LazyBuffer value;
-      input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
-                            &seq, &value, *blob_meta);
-      if (s.IsNotFound()) {
-        ++counter.get_not_found;
-        break;
-      } else if (!s.ok()) {
-        status = std::move(s);
-        break;
-      } else if (seq != ikey.sequence ||
-                 (type != kTypeValueIndex && type != kTypeMergeIndex)) {
-        ++counter.get_not_found;
-        break;
+
+      const bool validation_cache_hit =
+          cached_validation_result != ValidationResult::kUnknown &&
+          cached_validation_blob_file == blob_file_number &&
+          Slice(cached_validation_key).compare(curr_key) == 0;
+      bool validation_used_point_lookup = false;
+      if (validation_cache_hit) {
+        ++counter.validity_cache_hits;
+        switch (cached_validation_result) {
+          case ValidationResult::kDead:
+            ++counter.get_not_found;
+            break;
+          case ValidationResult::kSourceMismatch:
+            ++counter.file_number_mismatch;
+            break;
+          case ValidationResult::kLive:
+            curr_file_number = cached_validation_source_file;
+            break;
+          case ValidationResult::kUnknown:
+            assert(false);
+            break;
+        }
+        if (cached_validation_result != ValidationResult::kLive) {
+          break;
+        }
+      } else {
+        Status lookup_status;
+        ValueType type = kTypeDeletion;
+        SequenceNumber seq = kMaxSequenceNumber;
+        LazyBuffer lookup_value;
+        bool bloom_proves_dead = false;
+        if (liveness_bloom_requested) {
+          const auto plan = liveness_bloom_plans.find(blob_file_number);
+          if (plan != liveness_bloom_plans.end() && plan->second.usable) {
+            bool any_reference_may_contain = false;
+            bool bloom_complete = true;
+            for (const auto& reference : plan->second.references) {
+              bool may_contain = true;
+              Status bloom_status =
+                  reference.reader->MayContainGarbageCollectionReference(
+                      reference.logical_file_numbers, ikey, &may_contain);
+              if (!bloom_status.ok()) {
+                bloom_complete = false;
+                plan->second.usable = false;
+                break;
+              }
+              if (may_contain) {
+                any_reference_may_contain = true;
+                break;
+              }
+            }
+            if (bloom_complete && !any_reference_may_contain) {
+              bloom_proves_dead = true;
+              ++counter.bloom_negatives;
+              RecordTick(stats_, GC_BLOOM_NEGATIVE);
+            } else if (bloom_complete) {
+              ++counter.bloom_positives;
+              RecordTick(stats_, GC_BLOOM_POSITIVE);
+            } else {
+              ++counter.bloom_fallbacks;
+              RecordTick(stats_, GC_BLOOM_FALLBACK);
+            }
+          } else {
+            ++counter.bloom_fallbacks;
+            RecordTick(stats_, GC_BLOOM_FALLBACK);
+          }
+        }
+        if (bloom_proves_dead) {
+          lookup_status = Status::NotFound();
+        }
+        bool used_streaming_validation = false;
+        if (!bloom_proves_dead && streaming_validator != nullptr &&
+            streaming_target_files.count(blob_file_number) != 0) {
+          const auto validation =
+              streaming_validator->Validate(ikey, blob_file_number);
+          switch (validation) {
+            case StreamingGarbageCollectionValidator::Result::kDead:
+              ++counter.streaming_validations;
+              lookup_status = Status::NotFound();
+              used_streaming_validation = true;
+              break;
+            case StreamingGarbageCollectionValidator::Result::kSourceMismatch:
+              ++counter.streaming_validations;
+              lookup_status = Status::OK();
+              type = kTypeValueIndex;
+              seq = ikey.sequence;
+              curr_file_number = uint64_t(-1);
+              used_streaming_validation = true;
+              break;
+            case StreamingGarbageCollectionValidator::Result::kLive:
+              ++counter.streaming_validations;
+              lookup_status = Status::OK();
+              type = kTypeValueIndex;
+              seq = ikey.sequence;
+              curr_file_number = blob_file_number;
+              used_streaming_validation = true;
+              break;
+            case StreamingGarbageCollectionValidator::Result::kUnknown:
+              ++counter.streaming_fallbacks;
+              break;
+          }
+        }
+        if (!bloom_proves_dead && !used_streaming_validation) {
+          validation_used_point_lookup = true;
+          ++counter.point_lookups;
+          iter_key.SetInternalKey(ikey.user_key, ikey.sequence,
+                                  kValueTypeForSeek);
+          constexpr uint64_t kLookupTimingSampleInterval = 1024;
+          const bool sample_lookup =
+              (counter.input % kLookupTimingSampleInterval) == 0;
+          const uint64_t lookup_begin_ts =
+              sample_lookup ? env_->NowMicros() : 0;
+          input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(),
+                                &lookup_status, &type, &seq, &lookup_value,
+                                *blob_meta);
+          if (sample_lookup) {
+            counter.lookup_micros += env_->NowMicros() - lookup_begin_ts;
+            ++counter.sampled_lookups;
+          }
+        }
+
+        if (lookup_status.IsNotFound()) {
+          cache_validation_result(curr_key, blob_file_number,
+                                  ValidationResult::kDead, uint64_t(-1));
+          ++counter.get_not_found;
+          break;
+        }
+        if (!lookup_status.ok()) {
+          status = std::move(lookup_status);
+          break;
+        }
+        if (seq != ikey.sequence ||
+            (type != kTypeValueIndex && type != kTypeMergeIndex)) {
+          cache_validation_result(curr_key, blob_file_number,
+                                  ValidationResult::kDead, uint64_t(-1));
+          ++counter.get_not_found;
+          break;
+        }
+
+        if (validation_used_point_lookup) {
+          status = lookup_value.fetch();
+          if (!status.ok()) {
+            break;
+          }
+          const uint64_t file_number =
+              SeparateHelper::DecodeFileNumber(lookup_value.slice());
+          auto find = dependence_map.find(file_number);
+          if (find == dependence_map.end()) {
+            status = Status::Corruption("Separate value dependence missing");
+            break;
+          }
+          curr_file_number = file_number;
+          if (find->second->fd.GetNumber() != blob_file_number) {
+            cache_validation_result(curr_key, blob_file_number,
+                                    ValidationResult::kSourceMismatch,
+                                    uint64_t(-1));
+            ++counter.file_number_mismatch;
+            break;
+          }
+        }
+        if (used_streaming_validation &&
+            curr_file_number != blob_file_number) {
+          ++counter.file_number_mismatch;
+          break;
+        }
+        cache_validation_result(curr_key, blob_file_number,
+                                ValidationResult::kLive, curr_file_number);
       }
-      status = value.fetch();
-      if (!status.ok()) {
-        break;
-      }
-      uint64_t file_number = SeparateHelper::DecodeFileNumber(value.slice());
-      auto find = dependence_map.find(file_number);
-      if (find == dependence_map.end()) {
-        status = Status::Corruption("Separate value dependence missing");
-        break;
-      }
-      value = input->value();
-      if (find->second->fd.GetNumber() != value.file_number()) {
+
+      if (curr_file_number != blob_file_number) {
         ++counter.file_number_mismatch;
         break;
       }
-      curr_file_number = value.file_number();
-
+      LazyBuffer value = input->value();
       assert(sub_compact->blob_builder != nullptr);
       assert(sub_compact->current_blob_output() != nullptr);
       status = sub_compact->blob_builder->Add(curr_key, value);
@@ -2187,7 +2609,20 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
       sub_compact->current_blob_output()->meta.UpdateBoundaries(curr_key,
                                                                 ikey.sequence);
       sub_compact->num_output_records++;
+      is_live = true;
     } while (false);
+
+    if (!counter.has_run || counter.run_live != is_live) {
+      if (counter.has_run && counter.run_live) {
+        counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
+      }
+      counter.has_run = true;
+      counter.run_live = is_live;
+      counter.curr_run = 0;
+      is_live ? ++counter.live_runs : ++counter.dead_runs;
+    }
+    ++counter.curr_run;
+    is_live ? ++counter.live : ++counter.dead;
 
     if (counter.input > 1 && comp.Compare(curr_key, last_key) == 0 &&
         (last_file_number & curr_file_number) != uint64_t(-1)) {
@@ -2200,7 +2635,6 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     }
     last_key.assign(curr_key.data(), curr_key.size());
     last_file_number = curr_file_number;
-
     input->Next();
   }
 
@@ -2212,6 +2646,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   if (status.ok()) {
     status = input->status();
   }
+
   std::vector<uint64_t> inheritance_tree;
   size_t inheritance_tree_pruge_count = 0;
   if (status.ok()) {
@@ -2219,27 +2654,74 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         *sub_compact->compaction->inputs(), dependence_map, input_version,
         &inheritance_tree, &inheritance_tree_pruge_count);
   }
-  Status s = FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
+  Status output_status =
+      FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
   if (status.ok()) {
-    status = s;
+    status = output_status;
   }
+
   if (status.ok()) {
+    if (counter.has_run && counter.run_live) {
+      counter.max_live_run = std::max(counter.max_live_run, counter.curr_run);
+    }
+    uint64_t gc_input_bytes = 0;
+    for (const auto& input_level : *sub_compact->compaction->inputs()) {
+      for (const auto* file : input_level.files) {
+        gc_input_bytes += file->fd.GetFileSize();
+      }
+    }
+    uint64_t gc_output_bytes = 0;
+    for (const auto& output : sub_compact->blob_outputs) {
+      gc_output_bytes += output.meta.fd.GetFileSize();
+    }
+    const uint64_t gc_read_bytes =
+        measure_io_stats_ ? IOSTATS(bytes_read) - prev_read_bytes : 0;
+    const uint64_t gc_write_bytes =
+        measure_io_stats_ ? IOSTATS(bytes_written) - prev_write_bytes : 0;
+    const uint64_t estimated_lookup_micros =
+        counter.sampled_lookups == 0
+            ? 0
+            : counter.lookup_micros * counter.point_lookups /
+                  counter.sampled_lookups;
     auto& meta = sub_compact->blob_outputs.front().meta;
     auto& inputs = *sub_compact->compaction->inputs();
     assert(inputs.size() == 1 && inputs.front().level == -1);
     auto& files = inputs.front().files;
     ROCKS_LOG_INFO(
         db_options_.info_log,
-        "[%s] [JOB %d] Table #%" PRIu64 " GC: %" PRIu64
-        " inputs from %zd files. %" PRIu64
-        " clear, %.2f%% estimation: [ %" PRIu64 " garbage type, %" PRIu64
-        " get not found, %" PRIu64
-        " file number mismatch ], inheritance tree: %zd -> %zd",
+        "[%s] [JOB %d] Table #%" PRIu64 " GC summary: in=%" PRIu64
+        ", files=%zd, clear=%" PRIu64 ", est=%.2f%%, dead=[type=%" PRIu64
+        ", not_found=%" PRIu64 ", mismatch=%" PRIu64 "]"
+        ", layout=[live=%" PRIu64 ", dead=%" PRIu64
+        ", live_runs=%" PRIu64 ", dead_runs=%" PRIu64
+        ", max_live_run=%" PRIu64 "]"
+        ", cache_hits=%" PRIu64 ", lookup_micros=%" PRIu64
+        ", run_micros=%" PRIu64
+        ", input_file_bytes=%" PRIu64 ", output_file_bytes=%" PRIu64
+        ", io_read_bytes=%" PRIu64 ", io_write_bytes=%" PRIu64
+        ", bloom_negatives=%" PRIu64
+        ", bloom_positives=%" PRIu64
+        ", bloom_fallbacks=%" PRIu64
+        ", streaming_validations=%" PRIu64
+        ", streaming_fallbacks=%" PRIu64
+        ", streaming_reference_files=%" PRIu64
+        ", streaming_reason=%s"
+        ", streaming_targets=%zu, streaming_unsafe_targets=%zu"
+        ", inheritance=%zd->%zd",
         cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
         files.size(), counter.input - meta.prop.num_entries,
         sub_compact->compaction->num_antiquation() * 100. / counter.input,
         counter.garbage_type, counter.get_not_found,
-        counter.file_number_mismatch,
+        counter.file_number_mismatch, counter.live, counter.dead,
+        counter.live_runs, counter.dead_runs, counter.max_live_run,
+        counter.validity_cache_hits, estimated_lookup_micros,
+        env_->NowMicros() - gc_begin_ts, gc_input_bytes, gc_output_bytes,
+        gc_read_bytes, gc_write_bytes, counter.bloom_negatives,
+        counter.bloom_positives, counter.bloom_fallbacks,
+        counter.streaming_validations, counter.streaming_fallbacks,
+        streaming_reference_files,
+        streaming_fallback_reason.c_str(), streaming_target_files.size(),
+        streaming_unsafe_files.size(),
         meta.prop.inheritance.size() + inheritance_tree_pruge_count,
         meta.prop.inheritance.size());
     if ((std::find_if(files.begin(), files.end(),
@@ -2248,11 +2730,11 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
                       }) == files.end() &&
          files.size() == 1 && counter.input == meta.prop.num_entries) ||
         meta.prop.num_entries == 0) {
-      ROCKS_LOG_INFO(db_options_.info_log,
-                     "[%s] [JOB %d] Table #%" PRIu64
-                     " GC purge %s records, dropped",
-                     cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(),
-                     meta.prop.num_entries == 0 ? "whole" : "0");
+      ROCKS_LOG_INFO(
+          db_options_.info_log,
+          "[%s] [JOB %d] Table #%" PRIu64 " GC purge %s records, dropped",
+          cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(),
+          meta.prop.num_entries == 0 ? "whole" : "0");
       std::string fname = TableFileName(
           sub_compact->compaction->immutable_cf_options()->cf_paths,
           meta.fd.GetNumber(), meta.fd.GetPathId());
@@ -2320,7 +2802,8 @@ Status CompactionJob::FinishCompactionOutputFile(
     const Status& input_status, SubcompactionState* sub_compact,
     CompactionRangeDelAggregator* range_del_agg,
     CompactionIterationStats* range_del_out_stats,
-    const std::unordered_map<uint64_t, uint64_t>& dependence,
+    const std::unordered_map<uint64_t, SeparateHelper::ReferenceStats>&
+        dependence,
     const Slice* next_table_min_key /* = nullptr */) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_SYNC_FILE);
@@ -2437,7 +2920,10 @@ Status CompactionJob::FinishCompactionOutputFile(
                                       : 0;
     meta->prop.num_entries = sub_compact->builder->NumEntries();
     for (auto& pair : dependence) {
-      meta->prop.dependence.emplace_back(Dependence{pair.first, pair.second});
+      const uint64_t byte_count =
+          pair.second.complete ? pair.second.byte_count : 0;
+      meta->prop.dependence.emplace_back(
+          Dependence{pair.first, pair.second.entry_count, byte_count});
     }
     std::sort(meta->prop.dependence.begin(), meta->prop.dependence.end(),
               TERARK_CMP(file_number, <));
@@ -2666,10 +3152,62 @@ Status CompactionJob::InstallCompactionResults(
   // still exist in the current version and in the same original level.
   // This ensures that a concurrent compaction did not erroneously
   // pick the same files to compact_.
+  bool purge_certificate_valid = true;
+  const bool stale_garbage_collection =
+      compaction->compaction_type() == kGarbageCollection &&
+      compaction->input_version() !=
+          compaction->column_family_data()->current();
+  if (stale_garbage_collection && !compaction->purge_only()) {
+    Compaction::InputLevelSummaryBuffer inputs_summary;
+    ROCKS_LOG_INFO(
+        db_options_.info_log,
+        "[%s] [JOB %d] Compaction %s discarded because its input version is "
+        "stale",
+        compaction->column_family_data()->GetName().c_str(), job_id_,
+        compaction->InputLevelSummary(&inputs_summary));
+    return Status::Incomplete("Compaction input version is stale");
+  }
+  if (stale_garbage_collection && compaction->purge_only()) {
+    const auto* current_storage =
+        compaction->column_family_data()->current()->storage_info();
+    for (const auto* input_file : compaction->inputs()->front().files) {
+      const auto current_file = std::find_if(
+          current_storage->LevelFiles(-1).begin(),
+          current_storage->LevelFiles(-1).end(),
+          [input_file](const FileMetaData* file) {
+            return file->fd.GetNumber() == input_file->fd.GetNumber();
+          });
+      if (current_file == current_storage->LevelFiles(-1).end() ||
+          !current_storage->CanPurgeBlobFile(*current_file)) {
+        purge_certificate_valid = false;
+        break;
+      }
+    }
+  }
+  if (!purge_certificate_valid) {
+    Compaction::InputLevelSummaryBuffer inputs_summary;
+    ROCKS_LOG_INFO(
+        db_options_.info_log,
+        "[%s] [JOB %d] Compaction %s discarded because its purge "
+        "certificate is stale",
+        compaction->column_family_data()->GetName().c_str(), job_id_,
+        compaction->InputLevelSummary(&inputs_summary));
+    return Status::Incomplete("Compaction input version is stale");
+  }
   if (!versions_->VerifyCompactionFileConsistency(compaction)) {
     Compaction::InputLevelSummaryBuffer inputs_summary;
 
-    ROCKS_LOG_ERROR(db_options_.info_log, "[%s] [JOB %d] Compaction %s aborted",
+    if (compaction->compaction_type() == kGarbageCollection) {
+      ROCKS_LOG_INFO(
+          db_options_.info_log,
+          "[%s] [JOB %d] Compaction %s discarded because its input files "
+          "changed",
+          compaction->column_family_data()->GetName().c_str(), job_id_,
+          compaction->InputLevelSummary(&inputs_summary));
+      return Status::Incomplete("Compaction input version is stale");
+    }
+    ROCKS_LOG_ERROR(db_options_.info_log,
+                    "[%s] [JOB %d] Compaction %s aborted",
                     compaction->column_family_data()->GetName().c_str(),
                     job_id_, compaction->InputLevelSummary(&inputs_summary));
     return Status::Corruption("Compaction input files inconsistent");
@@ -2816,10 +3354,9 @@ Status CompactionJob::InstallCompactionResults(
       current->table_properties.reset(prop.release());
     }
   } else {
-    // Add compaction inputs
-    if (compaction->compaction_type() != kGarbageCollection) {
-      compaction->AddInputDeletions(compaction->edit());
-    }
+    // GC replaces its input vSSTs with the newly written blob outputs. The
+    // input deletion must be recorded even though GC has no key-SST output.
+    compaction->AddInputDeletions(compaction->edit());
 
     for (const auto& sub_compact : compact_->sub_compact_states) {
       for (const auto& out : sub_compact.outputs) {

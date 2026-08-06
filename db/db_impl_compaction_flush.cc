@@ -2421,8 +2421,6 @@ void DBImpl::BackgroundCallGarbageCollection() {
     // IngestExternalFile() calls to finish.
     WaitForIngestFile();
 
-    num_running_garbage_collections_++;
-
     auto pending_outputs_inserted_elem =
         CaptureCurrentFileNumberInPendingOutputs();
 
@@ -2430,7 +2428,17 @@ void DBImpl::BackgroundCallGarbageCollection() {
     Status s =
         BackgroundGarbageCollection(&made_progress, &job_context, &log_buffer);
     TEST_SYNC_POINT("BackgroundCallGarbageCollection:1");
-    if (!s.ok() && !s.IsShutdownInProgress()) {
+    const bool is_stale_gc =
+        s.IsIncomplete() &&
+        s.ToString().find("Compaction input version is stale") !=
+            std::string::npos;
+    if (is_stale_gc) {
+      mutex_.Unlock();
+      log_buffer.FlushBufferToLog();
+      env_->SleepForMicroseconds(100000);
+      mutex_.Lock();
+    }
+    if (!s.ok() && !s.IsShutdownInProgress() && !is_stale_gc) {
       // Wait a little bit before retrying background garbage collection in
       // case this is an environmental problem and we do not want to
       // chew up resources for failed garbage collections for the duration of
@@ -2477,8 +2485,6 @@ void DBImpl::BackgroundCallGarbageCollection() {
       mutex_.Lock();
     }
 
-    assert(num_running_garbage_collections_ > 0);
-    num_running_garbage_collections_--;
     bg_compaction_scheduled_--;
     bg_garbage_collection_scheduled_--;
 
@@ -2999,13 +3005,10 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
           // update statistics
           MeasureTime(stats_, NUM_FILES_IN_SINGLE_COMPACTION,
                       c->inputs(0)->size());
+          // Do not requeue against the old Version here. Install() below
+          // creates the replacement Version and schedules GC from its
+          // recomputed garbage state.
           bool maybe_schedule = false;
-          if (cfd->NeedsGarbageCollection()) {
-            // Yes, we need more garbage collections!
-            AddToGarbageCollectionQueue(cfd);
-            ++unscheduled_garbage_collections_;
-            maybe_schedule = true;
-          }
           if (!cfd->queued_for_compaction() && cfd->NeedsCompaction()) {
             // Yes, we need more compactions!
             AddToCompactionQueue(cfd);
@@ -3047,11 +3050,22 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             garbage_collection_job_stats, job_context->job_id);
 
+    const uint64_t gc_begin_ts = env_->NowMicros();
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[%s] [JOB %d] GarbageCollection begin: ts=%" PRIu64,
+                   c->column_family_data()->GetName().c_str(),
+                   job_context->job_id, gc_begin_ts);
     mutex_.Unlock();
     garbage_collection_job.Run();
     TEST_SYNC_POINT("DBImpl::BackgroundGarbageCollection:NonTrivial:AfterRun");
     mutex_.Lock();
+    const uint64_t gc_run_end_ts = env_->NowMicros();
     status = garbage_collection_job.Install(*c->mutable_cf_options());
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[%s] [JOB %d] GarbageCollection end: status=%s, run_micros=%" PRIu64,
+                   c->column_family_data()->GetName().c_str(),
+                   job_context->job_id, status.ToString().c_str(),
+                   gc_run_end_ts - gc_begin_ts);
     if (status.ok()) {
       InstallSuperVersionAndScheduleWork(
           c->column_family_data(), &job_context->superversion_contexts[0],
@@ -3081,6 +3095,22 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
     // Done
   } else if (status.IsShutdownInProgress()) {
     // Ignore garbage collection errors found during shutting down
+  } else if (status.IsIncomplete() &&
+             status.ToString().find("Compaction input version is stale") !=
+                 std::string::npos) {
+    // A GC built from an older Version is safe to discard but must not be
+    // reported as a database error. A foreground compaction or flush may have
+    // installed a newer key-SST set while this GC was scanning vSSTs.
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "Discarding stale garbage collection: %s",
+                   status.ToString().c_str());
+    if (c != nullptr) {
+      auto cfd = c->column_family_data();
+      if (!cfd->queued_for_garbage_collection()) {
+        AddToGarbageCollectionQueue(cfd);
+        ++unscheduled_garbage_collections_;
+      }
+    }
   } else {
     ROCKS_LOG_WARN(immutable_db_options_.info_log,
                    "GarbageCollection error: %s", status.ToString().c_str());

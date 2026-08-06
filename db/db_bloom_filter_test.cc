@@ -11,6 +11,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/terark_namespace.h"
+#include "table/table_reader.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -63,6 +64,98 @@ class SliceTransformLimitedDomainGeneric : public SliceTransform {
     return dst.size() == 5;
   }
 };
+
+TEST_F(DBBloomFilterTest, GarbageCollectionGetKeyUsesBloomFilter) {
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.blob_size = 1;
+  options.disable_auto_compactions = true;
+  options.max_background_garbage_collections = 0;
+  options.statistics = CreateDBStatistics();
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(20, false));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", std::string(1024, 'a')));
+  ASSERT_OK(Put("c", std::string(1024, 'c')));
+  ASSERT_OK(Flush());
+
+  auto* version = dbfull()
+                      ->TEST_GetVersionSet()
+                      ->GetColumnFamilySet()
+                      ->GetColumnFamily("default")
+                      ->current();
+  const auto& blob_files = version->storage_info()->LevelFiles(-1);
+  ASSERT_EQ(1U, blob_files.size());
+
+  options.statistics->setTickerCount(BLOOM_FILTER_USEFUL, 0);
+  options.statistics->setTickerCount(GC_GET_KEYS, 0);
+  InternalKey lookup_key("b", 1, kTypeValue);
+  Status status;
+  ValueType type = kTypeDeletion;
+  SequenceNumber sequence = kMaxSequenceNumber;
+  LazyBuffer value;
+  version->GetKey("b", lookup_key.Encode(), &status, &type, &sequence, &value,
+                  *blob_files.front());
+
+  ASSERT_TRUE(status.IsNotFound());
+  ASSERT_EQ(1U, TestGetTickerCount(options, GC_GET_KEYS));
+  ASSERT_EQ(1U, TestGetTickerCount(options, BLOOM_FILTER_USEFUL));
+}
+
+TEST_F(DBBloomFilterTest, GarbageCollectionLivenessBloomRoundTrip) {
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.blob_size = 1;
+  options.disable_auto_compactions = true;
+  options.max_background_garbage_collections = 0;
+  options.gc_liveness_bloom = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("live", std::string(1024, 'v')));
+  ASSERT_OK(Flush());
+
+  auto* column_family = dbfull()
+                            ->TEST_GetVersionSet()
+                            ->GetColumnFamilySet()
+                            ->GetColumnFamily("default");
+  auto* version = column_family->current();
+  const auto& blob_files = version->storage_info()->LevelFiles(-1);
+  ASSERT_EQ(1U, blob_files.size());
+  const auto references =
+      version->storage_info()->GetGarbageCollectionReferenceFiles(
+          blob_files.front());
+  ASSERT_EQ(1U, references.size());
+
+  std::vector<uint64_t> logical_file_numbers;
+  for (const auto& dependence : references.front().file->prop.dependence) {
+    auto target =
+        version->storage_info()->dependence_map().find(dependence.file_number);
+    if (target != version->storage_info()->dependence_map().end() &&
+        target->second == blob_files.front()) {
+      logical_file_numbers.push_back(dependence.file_number);
+    }
+  }
+  ASSERT_FALSE(logical_file_numbers.empty());
+
+  TableReader* table_reader = nullptr;
+  ReadOptions read_options;
+  std::unique_ptr<InternalIterator> iterator(
+      column_family->table_cache()->NewIterator(
+          read_options, EnvOptions(options), *references.front().file,
+          version->storage_info()->dependence_map(), nullptr,
+          version->GetMutableCFOptions().prefix_extractor.get(), &table_reader,
+          nullptr, false, nullptr, false, references.front().level));
+  ASSERT_NE(nullptr, table_reader);
+  ParsedInternalKey live_key;
+  ASSERT_TRUE(ParseInternalKey(references.front().file->smallest.Encode(),
+                               &live_key));
+  bool may_contain = false;
+  ASSERT_OK(table_reader->MayContainGarbageCollectionReference(
+      logical_file_numbers, live_key, &may_contain));
+  ASSERT_TRUE(may_contain);
+}
 
 // KeyMayExist can lead to a few false positives, but not false negatives.
 // To make test deterministic, use a much larger number of bits per key-20 than

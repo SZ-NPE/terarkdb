@@ -786,7 +786,42 @@ struct ParsedInternalKeyComparator {
 
 class SeparateHelper {
  public:
+  struct ValueReference {
+    uint64_t file_number = uint64_t(-1);
+    uint64_t value_size = 0;
+    bool has_value_size = false;
+    Slice value_meta;
+  };
+
+  struct ReferenceStats {
+    uint64_t entry_count = 0;
+    uint64_t byte_count = 0;
+    bool complete = true;
+
+    void Add(const ValueReference& reference) {
+      if (entry_count == port::kMaxUint64) {
+        complete = false;
+        return;
+      }
+      ++entry_count;
+      if (reference.has_value_size) {
+        if (byte_count <= port::kMaxUint64 - reference.value_size) {
+          byte_count += reference.value_size;
+        } else {
+          complete = false;
+        }
+      } else {
+        complete = false;
+      }
+    }
+  };
+
   virtual ~SeparateHelper() = default;
+  virtual bool TrackValueSize() const { return false; }
+
+  static constexpr uint64_t kValueSizeFlag = uint64_t{1} << 63;
+  static constexpr uint64_t kReferenceFileNumberMask =
+      (uint64_t{1} << 62) - 1;
 
   static Slice EncodeFileNumber(uint64_t& file_number) {
     if (!port::kLittleEndian) {
@@ -795,31 +830,63 @@ class SeparateHelper {
     return Slice(reinterpret_cast<char*>(&file_number), sizeof file_number);
   }
   static uint64_t DecodeFileNumber(const Slice& slice) {
-    assert(slice.size() >= sizeof(uint64_t));
-    uint64_t file_number;
-    memcpy(&file_number, slice.data(), sizeof(uint64_t));
-    if (!port::kLittleEndian) {
-      file_number = EndianTransform(file_number, sizeof file_number);
+    ValueReference reference;
+    return DecodeValueReference(slice, &reference) ? reference.file_number
+                                                   : uint64_t(-1);
+  }
+  static bool DecodeValueReference(const Slice& slice,
+                                   ValueReference* reference) {
+    if (reference == nullptr || slice.size() < sizeof(uint64_t)) {
+      return false;
     }
-    return file_number;
+    uint64_t encoded_file_number;
+    memcpy(&encoded_file_number, slice.data(), sizeof(encoded_file_number));
+    if (!port::kLittleEndian) {
+      encoded_file_number =
+          EndianTransform(encoded_file_number, sizeof encoded_file_number);
+    }
+    if (encoded_file_number == uint64_t(-1)) {
+      return false;
+    }
+    if ((encoded_file_number &
+         ~(kValueSizeFlag | kReferenceFileNumberMask)) != 0) {
+      return false;
+    }
+    ValueReference decoded;
+    decoded.has_value_size =
+        (encoded_file_number & kValueSizeFlag) != 0;
+    decoded.file_number =
+        encoded_file_number & kReferenceFileNumberMask;
+    Slice suffix(slice.data() + sizeof(uint64_t),
+                 slice.size() - sizeof(uint64_t));
+    if (decoded.has_value_size &&
+        !GetVarint64(&suffix, &decoded.value_size)) {
+      return false;
+    }
+    decoded.value_meta = suffix;
+    *reference = decoded;
+    return true;
   }
   static Slice DecodeValueMeta(const Slice& slice) {
-    assert(slice.size() >= sizeof(uint64_t));
-    return Slice(slice.data() + sizeof(uint64_t),
-                 slice.size() - sizeof(uint64_t));
+    ValueReference reference;
+    return DecodeValueReference(slice, &reference) ? reference.value_meta
+                                                    : Slice();
   }
 
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                 uint64_t file_number, const Slice& meta,
                                 bool is_merge, bool is_index,
-                                const ValueExtractor* value_meta_extractor);
+                                const ValueExtractor* value_meta_extractor,
+                                uint64_t value_size, bool has_value_size);
 
   virtual Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                  const Slice& meta, bool is_merge,
-                                 bool is_index) {
+                                 bool is_index, uint64_t value_size,
+                                 bool has_value_size) {
     assert(value.file_number() != uint64_t(-1));
     return TransToSeparate(internal_key, value, value.file_number(), meta,
-                           is_merge, is_index, nullptr);
+                           is_merge, is_index, nullptr, value_size,
+                           has_value_size);
   }
 
   virtual Status TransToSeparate(const Slice& /*internal_key*/,

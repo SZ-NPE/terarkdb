@@ -96,6 +96,7 @@ struct CompactionParams {
   bool manual_compaction = false;
   double score = -1;
   bool partial_compaction = false;
+  bool purge_only = false;
   CompactionType compaction_type = kKeyValueCompaction;
   SeparationType separation_type = kCompactionAutoRebuildBlob;
   std::vector<SelectedRange> input_range = {};
@@ -144,6 +145,7 @@ struct CompactionWorkerContext {
   EncodedString compaction_filter_data;
 
   BlobConfig blob_config;
+  bool track_value_size = false;
   uint32_t separation_type;
   std::string table_factory;
   std::string table_factory_options;
@@ -276,6 +278,10 @@ class Compaction {
 
   // Whether need to write output file to second DB path.
   uint32_t output_path_id() const { return output_path_id_; }
+
+  // True when the selected blob inputs are proven unreachable and can be
+  // removed through the normal VersionEdit install path without rewriting.
+  bool purge_only() const { return purge_only_; }
 
   // Is this a trivial compaction that can be implemented by just
   // moving a single input file to the next level (no merging or splitting)
@@ -470,6 +476,7 @@ class Compaction {
   const uint32_t output_path_id_;
   CompressionType output_compression_;
   CompressionOptions output_compression_opts_;
+  const bool purge_only_;
 
   // If true, then enable partial compaction
   const bool partial_compaction_;

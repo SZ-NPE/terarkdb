@@ -179,6 +179,8 @@ class CompactionIterator {
   // current output.
   LazyBuffer value_;
   std::string value_meta_;
+  uint64_t input_value_size_ = 0;
+  bool input_has_value_size_ = false;
   // The status is OK unless compaction iterator encounters a merge operand
   // while not having a merge operator defined.
   Status status_;

@@ -17,10 +17,12 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <functional>
 #include <list>
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "db/compaction.h"
@@ -1146,6 +1148,47 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
   }
 }
 
+void Version::AddGarbageCollectionIterators(
+    const ReadOptions& read_options, const EnvOptions& soptions,
+    const std::vector<std::vector<FileMetaData*>>& files_by_level,
+    MergeIteratorBuilder* merge_iter_builder) {
+  assert(storage_info_.finalized_);
+  auto* arena = merge_iter_builder->GetArena();
+  for (size_t level = 0; level < files_by_level.size(); ++level) {
+    const auto& files = files_by_level[level];
+    if (files.empty()) {
+      continue;
+    }
+    if (level == 0 || files.size() == 1) {
+      for (auto* file : files) {
+        merge_iter_builder->AddIterator(cfd_->table_cache()->NewIterator(
+            read_options, soptions, *file, storage_info_.dependence_map(),
+            nullptr, mutable_cf_options_.prefix_extractor.get(), nullptr,
+            cfd_->internal_stats()->GetFileReadHist(level),
+            true /* for_compaction */, arena, false /* skip_filters */,
+            static_cast<int>(level)));
+      }
+      continue;
+    }
+    auto* file_level = new LevelFilesBrief;
+    DoGenerateLevelFilesBrief(file_level, files, arena);
+    auto* memory = arena->AllocateAligned(sizeof(LevelIterator));
+    auto* iterator = new (memory) LevelIterator(
+        cfd_->table_cache(), read_options, soptions,
+        cfd_->internal_comparator(), file_level, storage_info_.dependence_map(),
+        mutable_cf_options_.prefix_extractor.get(), false /* should_sample */,
+        cfd_->internal_stats()->GetFileReadHist(level),
+        true /* for_compaction */, false /* skip_filters */,
+        static_cast<int>(level), nullptr);
+    iterator->RegisterCleanup(
+        [](void* pointer, void* /*unused*/) {
+          delete static_cast<LevelFilesBrief*>(pointer);
+        },
+        file_level, nullptr);
+    merge_iter_builder->AddIterator(iterator);
+  }
+}
+
 Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
                                          const EnvOptions& env_options,
                                          const Slice& smallest_user_key,
@@ -1475,8 +1518,8 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
   while (f != nullptr) {
     *status = table_cache_->Get(
         options, *f->file_metadata, storage_info_.dependence_map(), ikey,
-        &get_context, mutable_cf_options_.prefix_extractor.get(), nullptr, true,
-        fp.GetCurrentLevel(), &blob);
+        &get_context, mutable_cf_options_.prefix_extractor.get(), nullptr,
+        false /* skip_filters */, fp.GetCurrentLevel(), &blob);
     if (!status->ok()) {
       return;
     }
@@ -1515,6 +1558,122 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
     DoGenerateLevelFilesBrief(&level_files_brief_[level], files_[level],
                               &arena_);
   }
+}
+
+void VersionStorageInfo::BuildGarbageCollectionReferenceIndex() const {
+  std::call_once(garbage_collection_reference_index_once_, [&]() {
+    std::unordered_set<uint64_t> blob_file_numbers;
+    blob_file_numbers.reserve(files_[-1].size());
+    for (const auto* blob_file : files_[-1]) {
+      blob_file_numbers.insert(blob_file->fd.GetNumber());
+    }
+
+    std::unordered_set<uint64_t> incomplete_root_file_numbers;
+    auto mark_incomplete = [&](FileMetaData* root_file, int root_level,
+                               bool direct) {
+      if (root_file != nullptr &&
+          incomplete_root_file_numbers.insert(root_file->fd.GetNumber())
+              .second) {
+        incomplete_garbage_collection_reference_files_.push_back(
+            {root_file, root_level, direct});
+      }
+    };
+    std::function<void(FileMetaData*, int, FileMetaData*, bool,
+                       std::unordered_set<uint64_t>*)>
+        collect_references;
+    collect_references =
+        [&](FileMetaData* root_file, int root_level, FileMetaData* current_file,
+            bool direct, std::unordered_set<uint64_t>* visited) {
+          if (current_file == nullptr ||
+              !visited->insert(current_file->fd.GetNumber()).second) {
+            return;
+          }
+          if (!(current_file->prop.flags &
+                TablePropertyCache::kCompleteDependence)) {
+            mark_incomplete(root_file, root_level, direct);
+          }
+          for (const auto& dependence : current_file->prop.dependence) {
+            auto dependency = dependence_map_.find(dependence.file_number);
+            if (dependency == dependence_map_.end() ||
+                dependency->second == nullptr) {
+              mark_incomplete(root_file, root_level, direct);
+              continue;
+            }
+            FileMetaData* target = dependency->second;
+            if (blob_file_numbers.count(target->fd.GetNumber()) != 0) {
+              referenced_garbage_collection_blob_files_.insert(
+                  target->fd.GetNumber());
+              continue;
+            }
+            if (!target->prop.is_map_sst()) {
+              mark_incomplete(root_file, root_level, direct);
+              continue;
+            }
+            collect_references(root_file, root_level, target, false, visited);
+          }
+        };
+
+    for (int level = 0; level < num_levels_; ++level) {
+      for (auto* key_file : files_[level]) {
+        std::unordered_set<uint64_t> visited;
+        collect_references(key_file, level, key_file, true, &visited);
+      }
+    }
+  });
+}
+
+std::vector<GarbageCollectionReferenceFile>
+VersionStorageInfo::GetGarbageCollectionValidationFiles(
+    const FileMetaData* blob_file) const {
+  std::vector<GarbageCollectionReferenceFile> validation_files;
+  if (blob_file == nullptr) {
+    return validation_files;
+  }
+  for (int level = 0; level < num_levels_; ++level) {
+    std::vector<FileMetaData*> overlapping_files;
+    GetOverlappingInputs(level, &blob_file->smallest, &blob_file->largest,
+                         &overlapping_files, -1, nullptr, false);
+    for (auto* key_file : overlapping_files) {
+      validation_files.push_back({key_file, level, true});
+    }
+  }
+  return validation_files;
+}
+
+std::vector<GarbageCollectionReferenceFile>
+VersionStorageInfo::GetGarbageCollectionReferenceFiles(
+    const FileMetaData* blob_file) const {
+  std::vector<GarbageCollectionReferenceFile> reference_files;
+  for (const auto& candidate :
+       GetGarbageCollectionValidationFiles(blob_file)) {
+    for (const auto& dependence : candidate.file->prop.dependence) {
+      auto target = dependence_map_.find(dependence.file_number);
+      if (target != dependence_map_.end() && target->second != nullptr &&
+          target->second->fd.GetNumber() == blob_file->fd.GetNumber()) {
+        reference_files.push_back(candidate);
+        break;
+      }
+    }
+  }
+  return reference_files;
+}
+
+bool VersionStorageInfo::HasCompleteGarbageCollectionReferences(
+    const FileMetaData* blob_file) const {
+  if (blob_file == nullptr) {
+    return false;
+  }
+  BuildGarbageCollectionReferenceIndex();
+  for (const auto& incomplete : incomplete_garbage_collection_reference_files_) {
+    if (incomplete.file != nullptr &&
+        user_comparator_->Compare(incomplete.file->largest.user_key(),
+                                  blob_file->smallest.user_key()) >= 0 &&
+        user_comparator_->Compare(incomplete.file->smallest.user_key(),
+                                  blob_file->largest.user_key()) <= 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void Version::PrepareApply(const MutableCFOptions& mutable_cf_options) {
@@ -1847,20 +2006,45 @@ void VersionStorageInfo::ComputeCompactionScore(
   }
 
   // Calculate total_garbage_ratio_ as criterion for NeedsGarbageCollection().
+  // precise_gc:
+  //   false (entry-based): total_antiquation_entries / total_blob_entries
+  //   true  (byte-based) : logical-byte files use byte ratio, while legacy
+  //                             files use entry ratio
   uint64_t num_antiquation = 0;
   uint64_t num_entries = 0;
+  uint64_t logical_antiquation_bytes = 0;
+  uint64_t logical_blob_bytes = 0;
+  uint64_t entry_based_antiquation = 0;
+  uint64_t entry_based_entries = 0;
   bool marked = false;
   for (auto& f : LevelFiles(-1)) {
     if (!f->is_gc_permitted()) {
       continue;
     }
-    // if a file being_compacted, gc_status must be kGarbageCollectionCandidate
     marked |= f->marked_for_compaction;
     num_antiquation += f->num_antiquation;
     num_entries += f->prop.num_entries;
+    if (f->HasLogicalValueBytes()) {
+      logical_antiquation_bytes += f->num_antiquation_bytes;
+      logical_blob_bytes += f->GcValueBytes();
+    } else {
+      entry_based_antiquation += f->num_antiquation;
+      entry_based_entries += f->prop.num_entries;
+    }
   }
   blob_marked_for_compaction_ = marked;
-  total_garbage_ratio_ = num_antiquation / std::max<double>(1, num_entries);
+  const double logical_byte_ratio =
+      logical_antiquation_bytes /
+      std::max<double>(1, logical_blob_bytes);
+  const double entry_based_ratio =
+      num_antiquation / std::max<double>(1, num_entries);
+  const double legacy_entry_ratio =
+      entry_based_antiquation /
+      std::max<double>(1, entry_based_entries);
+  total_garbage_ratio_ =
+      mutable_cf_options.precise_gc
+          ? std::max(logical_byte_ratio, legacy_entry_ratio)
+          : entry_based_ratio;
 
   is_pick_compaction_fail = false;
   ComputeFilesMarkedForCompaction();
@@ -2230,6 +2414,79 @@ void VersionStorageInfo::UpdateOldestSnapshot(SequenceNumber seqnum) {
   if (oldest_snapshot_seqnum_ > bottommost_files_mark_threshold_) {
     ComputeBottommostFilesMarkedForCompaction();
   }
+}
+
+bool VersionStorageInfo::CanPurgeBlobFile(
+    const FileMetaData* blob_file) const {
+  if (blob_file == nullptr || blob_file->fd.GetNumber() == uint64_t(-1) ||
+      blob_file->prop.has_snapshots()) {
+    return false;
+  }
+  if (!finalized_ && (blob_file->refs < 1 || blob_file->refs > 2)) {
+    return false;
+  }
+  const uint64_t blob_file_number = blob_file->fd.GetNumber();
+  if (finalized_ && HasCompleteGarbageCollectionReferences(blob_file)) {
+    return referenced_garbage_collection_blob_files_.count(blob_file_number) ==
+           0;
+  }
+  enum class Reachability { kNo, kYes, kUnknown };
+  const auto is_blob_file = [&](const FileMetaData* file) {
+    return std::find(files_[-1].begin(), files_[-1].end(), file) !=
+           files_[-1].end();
+  };
+  std::function<Reachability(const FileMetaData*,
+                             std::unordered_set<uint64_t>*)>
+      find_blob;
+  find_blob = [&](const FileMetaData* file,
+                  std::unordered_set<uint64_t>* visited) {
+    if (file == nullptr ||
+        !(file->prop.flags & TablePropertyCache::kCompleteDependence)) {
+      return Reachability::kUnknown;
+    }
+    if (!visited->insert(file->fd.GetNumber()).second) {
+      return Reachability::kNo;
+    }
+    for (const auto& dependence : file->prop.dependence) {
+      if (dependence.file_number == blob_file_number) {
+        return Reachability::kYes;
+      }
+      auto dependence_file = dependence_map_.find(dependence.file_number);
+      if (dependence_file == dependence_map_.end()) {
+        return Reachability::kUnknown;
+      }
+      if (is_blob_file(dependence_file->second)) {
+        continue;
+      }
+      if (!dependence_file->second->prop.is_map_sst()) {
+        return Reachability::kUnknown;
+      }
+      Reachability result = find_blob(dependence_file->second, visited);
+      if (result != Reachability::kNo) {
+        return result;
+      }
+    }
+    return Reachability::kNo;
+  };
+  for (int level = 0; level < num_levels_; ++level) {
+    for (const FileMetaData* key_file : files_[level]) {
+      std::unordered_set<uint64_t> visited;
+      if (find_blob(key_file, &visited) != Reachability::kNo) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool VersionStorageInfo::HasPurgeableBlobFile() const {
+  for (const auto* blob_file : files_[-1]) {
+    if (blob_file->is_gc_permitted() && !blob_file->being_compacted &&
+        CanPurgeBlobFile(blob_file)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction() {
@@ -4701,10 +4958,11 @@ InternalIterator* VersionSet::MakeInputIterator(
 // verify that the files listed in this compaction are present
 // in the current version
 bool VersionSet::VerifyCompactionFileConsistency(Compaction* c) {
-#ifndef NDEBUG
-  if (c->compaction_type() == kGarbageCollection) {
+#ifdef NDEBUG
+  if (c->compaction_type() != kGarbageCollection) {
     return true;
   }
+#endif
   Version* version = c->column_family_data()->current();
   const VersionStorageInfo* vstorage = version->storage_info();
   if (c->input_version() != version) {
@@ -4745,9 +5003,6 @@ bool VersionSet::VerifyCompactionFileConsistency(Compaction* c) {
       }
     }
   }
-#else
-  (void)c;
-#endif
   return true;  // everything good
 }
 
@@ -4904,9 +5159,13 @@ void VersionStorageInfo::CalculateBlobInfo() {
   }
   for (auto f : file_map) {
     auto depend_it = dependence_map_.find(f.first);
-    assert(depend_it != dependence_map_.end());
     if (depend_it == dependence_map_.end()) {
-      std::abort();
+      // A GC install can retire a blob before the key-SST dependence
+      // metadata is compacted away. Count the stale reference as invalid
+      // instead of aborting Version installation.
+      invalid_file_set.insert(f.first);
+      invalid_entry_cnt_ += f.second;
+      continue;
     }
     uint64_t newest_file_number = depend_it->second->fd.GetNumber();
     if (newest_file_number != f.first) {

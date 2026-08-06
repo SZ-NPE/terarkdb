@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "db/column_family.h"
+#include "db/separated_value_reference.h"
 #include "db/version_set.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/terark_namespace.h"
@@ -201,6 +202,11 @@ void ProcessFileMetaData(const char* job_info, FileMetaData* meta,
       tp->num_range_deletions > 0 ? 0 : TablePropertyCache::kNoRangeDeletions;
   meta->prop.flags |=
       tp->snapshots.empty() ? 0 : TablePropertyCache::kHasSnapshots;
+  if (HasCompleteSeparatedValueReferenceMetadata(*tp)) {
+    meta->prop.flags |= TablePropertyCache::kCompleteDependence;
+  } else {
+    meta->prop.flags &= ~TablePropertyCache::kCompleteDependence;
+  }
 
   if (tp->num_range_deletions > 0 && mopt->optimize_range_deletion &&
       !iopt->enable_lazy_compaction) {
@@ -330,6 +336,7 @@ Compaction::Compaction(CompactionParams&& params)
       output_path_id_(params.output_path_id),
       output_compression_(params.compression),
       output_compression_opts_(params.compression_opts),
+      purge_only_(params.purge_only),
       partial_compaction_(params.partial_compaction),
       compaction_type_(params.compaction_type),
       separation_type_(params.separation_type),

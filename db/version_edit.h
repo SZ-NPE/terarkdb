@@ -85,6 +85,8 @@ struct TablePropertyCache {
     kMapHandleRangeDeletions = 1ULL << 0,
     kHasSnapshots = 1ULL << 1,
     kNoRangeDeletions = 1ULL << 2,
+    // The table's separated-value dependence set was completely enumerated.
+    kCompleteDependence = 1ULL << 3,
   };
   uint64_t num_entries = 0;            // the number of entries.
   uint64_t num_deletions = 0;          // the number of deletion entries.
@@ -135,7 +137,8 @@ struct FileMetaData {
   uint64_t compensated_file_size;
   // These values can mutate, but they can only be read or written from
   // single-threaded LogAndApply thread
-  uint64_t num_antiquation;  // the number of out-dated entries.
+  uint64_t num_antiquation;        // the number of out-dated entries.
+  uint64_t num_antiquation_bytes;  // the size of out-dated blob bytes.
 
   int refs;  // Reference count
 
@@ -154,11 +157,18 @@ struct FileMetaData {
       : table_reader_handle(nullptr),
         compensated_file_size(0),
         num_antiquation(0),
+        num_antiquation_bytes(0),
         refs(0),
         being_compacted(false),
         need_upgrade(false),
         marked_for_compaction(0),
         gc_status(kGarbageCollectionForbidden) {}
+
+  uint64_t GcValueBytes() const {
+    return prop.raw_value_size != 0 ? prop.raw_value_size : fd.GetFileSize();
+  }
+
+  bool HasLogicalValueBytes() const { return prop.raw_value_size != 0; }
 
   void Ref() {
     reinterpret_cast<std::atomic<int>&>(refs).fetch_add(
@@ -233,6 +243,7 @@ struct FileMetaData {
     return gc_status == kGarbageCollectionPermitted;
   }
   void set_gc_candidate() { gc_status = kGarbageCollectionCandidate; }
+  void set_gc_permitted() { gc_status = kGarbageCollectionPermitted; }
 };
 
 // A compressed copy of file meta data that just contain minimum data needed

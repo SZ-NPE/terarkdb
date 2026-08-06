@@ -78,6 +78,7 @@ enum CustomTag : uint32_t {
   kPropertyCache = 64,
   kPathId = 65,
 };
+constexpr uint64_t kPropertyCacheByteCountExtensionTag = 1;
 // If this bit for the custom tag is set, opening DB should fail if
 // we don't know this field.
 uint32_t kCustomTagNonSafeIgnoreMask = 1 << 6;
@@ -230,6 +231,18 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
                           f.prop.raw_value_size);
       PutVarint64(&encode_property_cache, f.prop.earliest_time_begin_compact);
       PutVarint64(&encode_property_cache, f.prop.latest_time_end_compact);
+      bool has_byte_count = false;
+      for (const auto& dependence : f.prop.dependence) {
+        has_byte_count |= dependence.byte_count != 0;
+      }
+      if (has_byte_count) {
+        PutVarint64(&encode_property_cache,
+                    kPropertyCacheByteCountExtensionTag);
+        PutVarint64(&encode_property_cache, f.prop.dependence.size());
+        for (const auto& dependence : f.prop.dependence) {
+          PutVarint64(&encode_property_cache, dependence.byte_count);
+        }
+      }
       PutLengthPrefixedSlice(dst, encode_property_cache);
     }
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
@@ -355,7 +368,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &file_number)) {
                 return error_msg;
               }
-              f.prop.dependence.emplace_back(Dependence{file_number, 0});
+              f.prop.dependence.emplace_back(Dependence{file_number, 0, 0});
             }
             if (!field.empty()) {
               if (!GetVarint64(&field, &f.prop.num_entries)) {
@@ -406,6 +419,21 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &f.prop.earliest_time_begin_compact) ||
                   !GetVarint64(&field, &f.prop.latest_time_end_compact)) {
                 return error_msg;
+              }
+            }
+            if (!field.empty()) {
+              uint64_t extension_tag;
+              uint64_t dependence_count;
+              if (!GetVarint64(&field, &extension_tag) ||
+                  extension_tag != kPropertyCacheByteCountExtensionTag ||
+                  !GetVarint64(&field, &dependence_count) ||
+                  dependence_count != f.prop.dependence.size()) {
+                return error_msg;
+              }
+              for (auto& dependence : f.prop.dependence) {
+                if (!GetVarint64(&field, &dependence.byte_count)) {
+                  return error_msg;
+                }
               }
             }
             if (f.prop.num_entries > 0 || f.prop.raw_key_size > 0 ||

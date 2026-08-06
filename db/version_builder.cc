@@ -126,6 +126,7 @@ struct VersionBuilderContextImpl : VersionBuilder::Context {
     int level;
     FileMetaData* f;
     double entry_depended;
+    double bytes_depended;
   };
   struct InheritanceItem {
     size_t depended : 1;
@@ -255,7 +256,8 @@ class VersionBuilder::Rep {
     auto& dependence_map_ = context_->dependence_map;
     uint64_t file_number = f->fd.GetNumber();
     auto ib = dependence_map_.emplace(
-        file_number, DependenceItem{file_number, 0, 0, false, level, f, 0});
+        file_number,
+        DependenceItem{file_number, 0, 0, false, level, f, 0, 0});
     f->Ref();
     if (ib.second) {
       PutInheritance(&ib.first->second, ib.first.pos());
@@ -278,6 +280,26 @@ class VersionBuilder::Rep {
     context_->levels[level].erase(file_number);
   }
 
+  void DelHiddenSst(uint64_t file_number) {
+    auto& dependence_map = context_->dependence_map;
+    auto find = dependence_map.find(file_number);
+    assert(find != dependence_map.end());
+    assert(find->second.level == -1);
+    FileMetaData* file = find->second.f;
+    // A hidden file can be addressed by its physical number and by every
+    // logical number in its inheritance set. Remove all aliases before
+    // releasing the metadata object.
+    for (auto it = dependence_map.begin(); it != dependence_map.end();) {
+      if (it->second.f == file) {
+        it = dependence_map.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    DelInheritance(file);
+    context_->UnrefFile(file);
+  }
+
   DependenceItem* TransFileNumber(uint64_t file_number) {
     auto& dependence_map = context_->dependence_map;
     auto& inheritance_counter = context_->inheritance_counter;
@@ -288,8 +310,31 @@ class VersionBuilder::Rep {
     return nullptr;
   }
 
+  // precise_gc: resolve the per-dependence byte cost charged to `item`.
+  // A byte_count is exact only when the source has logical value metadata and
+  // the count is within that source's value-byte budget. Otherwise fall back
+  // to an averaged estimate and mark the result as estimated.
+  static double ResolveDepBytes(const Dependence& dep,
+                                const DependenceItem* item,
+                                bool* is_estimation) {
+    *is_estimation = false;
+    const uint64_t value_bytes = item->f->GcValueBytes();
+    if (dep.byte_count > 0 &&
+        item->f->prop.raw_value_size > 0 &&
+        dep.byte_count <= item->f->prop.raw_value_size) {
+      return static_cast<double>(dep.byte_count);
+    }
+    *is_estimation = true;
+    const uint64_t num_entries =
+        std::max<uint64_t>(1, item->f->prop.num_entries);
+    const double estimated_bytes =
+        static_cast<double>(dep.entry_count) *
+        static_cast<double>(value_bytes) / static_cast<double>(num_entries);
+    return std::min<double>(value_bytes, estimated_bytes);
+  }
+
   void SetDependence(FileMetaData* f, bool is_map, bool is_estimation,
-                     double ratio, bool finish) {
+                     double entry_ratio, double bytes_ratio, bool finish) {
     auto& dependence_map = context_->dependence_map;
     auto& inheritance_counter = context_->inheritance_counter;
     auto dependence_version = context_->dependence_version;
@@ -307,17 +352,31 @@ class VersionBuilder::Rep {
         find->second.depended = true;
         item->is_estimation |= is_estimation;
         assert(is_map || dependence.entry_count > 0);
-        item->entry_depended += dependence.entry_count * ratio;
+        item->entry_depended += dependence.entry_count * entry_ratio;
+        bool dep_is_estimation = false;
+        double dep_bytes =
+            ResolveDepBytes(dependence, item, &dep_is_estimation);
+        item->is_estimation |= is_estimation || dep_is_estimation;
+        item->bytes_depended += dep_bytes * bytes_ratio;
       }
       item->dependence_version = dependence_version;
       if (is_map) {
         item->gc_forbidden_version = dependence_version;
         if (!item->f->prop.dependence.empty()) {
+          uint64_t num_entries =
+              std::max<uint64_t>(1, item->f->prop.num_entries);
+          uint64_t value_bytes =
+              std::max<uint64_t>(1, item->f->GcValueBytes());
+          double child_entry_ratio =
+              entry_ratio * dependence.entry_count / num_entries;
+          bool dep_is_estimation = false;
+          double dep_bytes =
+              ResolveDepBytes(dependence, item, &dep_is_estimation);
+          item->is_estimation |= is_estimation || dep_is_estimation;
+          double child_bytes_ratio = bytes_ratio * dep_bytes / value_bytes;
           SetDependence(item->f, item->f->prop.is_map_sst(),
                         is_estimation || item->f->prop.is_map_sst(),
-                        ratio * dependence.entry_count /
-                            std::max<uint64_t>(1, item->f->prop.num_entries),
-                        finish);
+                        child_entry_ratio, child_bytes_ratio, finish);
         }
       }
     }
@@ -342,7 +401,7 @@ class VersionBuilder::Rep {
         item.gc_forbidden_version = dependence_version;
         if (!item.f->prop.dependence.empty()) {
           SetDependence(item.f, item.f->prop.is_map_sst(),
-                        item.f->prop.is_map_sst(), 1, finish);
+                        item.f->prop.is_map_sst(), 1, 1, finish);
         }
       }
     }
@@ -354,9 +413,14 @@ class VersionBuilder::Rep {
           !f->prop.dependence.empty() &&
           !f->has_marked_for_compaction(FileMetaData::kMarkedFromUpdateBlob)) {
         for (auto& dependence : f->prop.dependence) {
-          if (TransFileNumber(dependence.file_number)->file_number !=
-              dependence.file_number) {
-            // item maybe invalid pointer, don't access it
+          auto item = TransFileNumber(dependence.file_number);
+          if (item == nullptr) {
+            // Missing dependence metadata is not safe to classify as an old
+            // blob. Leave the file unchanged and let the normal fallback
+            // path handle it.
+            continue;
+          }
+          if (item->file_number != dependence.file_number) {
             old_file_queue.push_back(f->fd.GetNumber());
             std::push_heap(old_file_queue.begin(), old_file_queue.end());
             if (old_file_queue.size() > max_queue_size) {
@@ -379,6 +443,11 @@ class VersionBuilder::Rep {
           uint64_t entry_depended = std::max<uint64_t>(1, item.entry_depended);
           entry_depended = std::min(item.f->prop.num_entries, entry_depended);
           uint64_t num_antiquation = item.f->prop.num_entries - entry_depended;
+          uint64_t bytes_depended = static_cast<uint64_t>(std::min<double>(
+              item.f->GcValueBytes(),
+              std::max<double>(0, item.bytes_depended)));
+          uint64_t num_antiquation_bytes =
+              item.f->GcValueBytes() - bytes_depended;
           switch (item.f->gc_status) {
             case FileMetaData::kGarbageCollectionForbidden:
               if (item.gc_forbidden_version == dependence_version) {
@@ -412,6 +481,7 @@ class VersionBuilder::Rep {
               break;
           }
           item.f->num_antiquation = num_antiquation;
+          item.f->num_antiquation_bytes = num_antiquation_bytes;
         }
         ++it;
       } else {
@@ -559,10 +629,18 @@ class VersionBuilder::Rep {
 
     // maybe this file was added in a previous edit that was Applied
     if (!found) {
-      auto& level_added = context_->levels[level];
-      auto got = level_added.find(number);
-      if (got != level_added.end()) {
-        found = true;
+      if (level == -1) {
+        auto got = context_->dependence_map.find(number);
+        if (got != context_->dependence_map.end() &&
+            got->second.level == -1) {
+          found = true;
+        }
+      } else {
+        auto& level_added = context_->levels[level];
+        auto got = level_added.find(number);
+        if (got != level_added.end()) {
+          found = true;
+        }
       }
     }
     if (!found) {
@@ -615,6 +693,7 @@ class VersionBuilder::Rep {
       for (auto& pair : context_->dependence_map) {
         pair.second.is_estimation = false;
         pair.second.entry_depended = 0;
+        pair.second.bytes_depended = 0;
       }
       for (auto& pair : context_->inheritance_counter) {
         pair.second.depended = 0;
@@ -640,7 +719,10 @@ class VersionBuilder::Rep {
     for (auto& pair : del) {
       int level = pair.first;
       auto file_number = pair.second;
-      if (level < num_levels_) {
+      if (level == -1) {
+        CheckConsistencyForDeletes(edit, file_number, level);
+        DelHiddenSst(file_number);
+      } else if (level >= 0 && level < num_levels_) {
         CheckConsistencyForDeletes(edit, file_number, level);
         assert(context_->levels[level].count(file_number) > 0);
         DelSst(file_number, level);
@@ -746,7 +828,6 @@ class VersionBuilder::Rep {
     Init();
     // <file metadata, level>
     std::vector<std::pair<FileMetaData*, int>> files_meta;
-    auto dependence_version = context_->dependence_version;
     for (int level = 0; level < num_levels_; level++) {
       for (auto& file_meta_pair : context_->levels[level]) {
         auto* file_meta = file_meta_pair.second;
@@ -756,14 +837,10 @@ class VersionBuilder::Rep {
         }
       }
     }
-    for (auto& pair : context_->dependence_map) {
-      auto& item = pair.second;
-      if (item.dependence_version == dependence_version && item.level == -1 &&
-          (load_essence_sst || item.f->prop.is_map_sst()) &&
-          item.f->table_reader_handle == nullptr) {
-        files_meta.emplace_back(item.f, -1);
-      }
-    }
+    // Hidden files are retained for dependency lifetime management. They may
+    // include files removed by an edit that have not yet been pruned from the
+    // builder context, so loading them here can probe deleted SST paths during
+    // recovery. Hidden files are opened on demand through the dependence map.
     if (files_meta.empty()) {
       return;
     }

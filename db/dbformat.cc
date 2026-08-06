@@ -201,15 +201,35 @@ void IterKey::EnlargeBuffer(size_t key_size) {
 Status SeparateHelper::TransToSeparate(
     const Slice& internal_key, LazyBuffer& value, uint64_t file_number,
     const Slice& meta, bool is_merge, bool is_index,
-    const ValueExtractor* value_meta_extractor) {
-  assert(file_number != uint64_t(-1));
+    const ValueExtractor* value_meta_extractor, uint64_t value_size,
+    bool has_value_size) {
+  if (file_number == uint64_t(-1)) {
+    return Status::Corruption(
+        "Separate value reference has no source file",
+        internal_key.ToString(true));
+  }
+  if (file_number > kReferenceFileNumberMask) {
+    return Status::Corruption(
+        "Separate value reference file number is out of range",
+        internal_key.ToString(true));
+  }
+  uint64_t encoded_file_number =
+      file_number | (has_value_size ? kValueSizeFlag : 0);
+  std::string encoded_value_size;
+  if (has_value_size) {
+    PutVarint64(&encoded_value_size, value_size);
+  }
+  auto set_reference = [&](const Slice& value_meta) {
+    Slice parts[] = {EncodeFileNumber(encoded_file_number),
+                     Slice(encoded_value_size), value_meta};
+    value.reset(SliceParts(parts, 3), file_number);
+  };
   if (value_meta_extractor == nullptr || is_merge) {
-    value.reset(EncodeFileNumber(file_number), true, file_number);
+    set_reference(Slice());
     return Status::OK();
   }
   if (is_index) {
-    Slice parts[] = {EncodeFileNumber(file_number), meta};
-    value.reset(SliceParts(parts, 2), file_number);
+    set_reference(meta);
     return Status::OK();
   } else {
     auto s = value.fetch();
@@ -220,8 +240,7 @@ Status SeparateHelper::TransToSeparate(
     s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
                                       value.slice(), &value_meta);
     if (s.ok()) {
-      Slice parts[] = {EncodeFileNumber(file_number), value_meta};
-      value.reset(SliceParts(parts, 2), file_number);
+      set_reference(value_meta);
     }
     return s;
   }

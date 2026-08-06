@@ -12,6 +12,7 @@
 
 #include "db/column_family.h"
 #include "db/error_handler.h"
+#include "db/gc_streaming_validator.h"
 #include "db/version_set.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
@@ -28,6 +29,71 @@
 namespace TERARKDB_NAMESPACE {
 
 namespace {
+
+std::string EncodeReference(uint64_t file_number) {
+  return std::string(SeparateHelper::EncodeFileNumber(file_number).data(),
+                     sizeof(file_number));
+}
+
+class ErrorInternalIterator : public InternalIterator {
+ public:
+  bool Valid() const override { return false; }
+  void SeekToFirst() override {}
+  void SeekToLast() override {}
+  void Seek(const Slice& /* target */) override {}
+  void SeekForPrev(const Slice& /* target */) override {}
+  void Next() override {}
+  void Prev() override {}
+  Slice key() const override { return Slice(); }
+  LazyBuffer value() const override { return LazyBuffer(); }
+  Status status() const override { return Status::IOError("injected"); }
+};
+
+class InternalKeyVectorIterator : public InternalIterator {
+ public:
+  InternalKeyVectorIterator(std::vector<std::string> keys,
+                            std::vector<std::string> values)
+      : keys_(std::move(keys)),
+        values_(std::move(values)),
+        comparator_(BytewiseComparator()),
+        current_(keys_.size()) {
+    assert(keys_.size() == values_.size());
+  }
+
+  bool Valid() const override { return current_ < keys_.size(); }
+  void SeekToFirst() override { current_ = 0; }
+  void SeekToLast() override { current_ = keys_.size() - 1; }
+  void Seek(const Slice& target) override {
+    current_ =
+        std::lower_bound(keys_.begin(), keys_.end(), target,
+                         [this](const std::string& key, const Slice& target) {
+                           return comparator_.Compare(Slice(key), target) < 0;
+                         }) -
+        keys_.begin();
+  }
+  void SeekForPrev(const Slice& target) override {
+    current_ =
+        std::upper_bound(keys_.begin(), keys_.end(), target,
+                         [this](const Slice& target, const std::string& key) {
+                           return comparator_.Compare(target, Slice(key)) < 0;
+                         }) -
+        keys_.begin();
+    if (current_ > 0) {
+      --current_;
+    }
+  }
+  void Next() override { ++current_; }
+  void Prev() override { --current_; }
+  Slice key() const override { return Slice(keys_[current_]); }
+  LazyBuffer value() const override { return LazyBuffer(values_[current_]); }
+  Status status() const override { return Status::OK(); }
+
+ private:
+  std::vector<std::string> keys_;
+  std::vector<std::string> values_;
+  InternalKeyComparator comparator_;
+  size_t current_;
+};
 
 void VerifyInitializationOfCompactionJobStats(
     const CompactionJobStats& compaction_job_stats) {
@@ -62,6 +128,89 @@ void VerifyInitializationOfCompactionJobStats(
 }
 
 }  // namespace
+
+TEST(StreamingGarbageCollectionValidatorTest, ResolvesLiveAndDeadValues) {
+  FileMetaData blob_100;
+  blob_100.fd = FileDescriptor(100, 0, 1);
+  FileMetaData blob_200;
+  blob_200.fd = FileDescriptor(200, 0, 1);
+  DependenceMap dependence_map;
+  dependence_map[10] = &blob_100;
+  dependence_map[20] = &blob_200;
+
+  std::vector<std::string> keys = {
+      test::KeyStr("a", 7, kTypeValueIndex),
+      test::KeyStr("b", 9, kTypeValue),
+      test::KeyStr("c", 5, kTypeValueIndex),
+      test::KeyStr("d", 8, kTypeMergeIndex),
+      test::KeyStr("e", 6, kTypeValueIndex),
+      test::KeyStr("e", 6, kTypeValueIndex),
+  };
+  std::vector<std::string> values = {
+      EncodeReference(10),
+      "inline",
+      EncodeReference(20),
+      EncodeReference(10),
+      EncodeReference(10),
+      EncodeReference(20),
+  };
+  InternalKeyVectorIterator references(std::move(keys), std::move(values));
+  StreamingGarbageCollectionValidator validator(
+      &references, BytewiseComparator(), &dependence_map);
+
+  ParsedInternalKey candidate("a", 7, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kLive,
+            validator.Validate(candidate, 100));
+
+  candidate = ParsedInternalKey("b", 8, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kDead,
+            validator.Validate(candidate, 100));
+
+  candidate = ParsedInternalKey("c", 5, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kSourceMismatch,
+            validator.Validate(candidate, 100));
+
+  candidate = ParsedInternalKey("d", 8, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kUnknown,
+            validator.Validate(candidate, 100));
+
+  candidate = ParsedInternalKey("e", 6, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kUnknown,
+            validator.Validate(candidate, 100));
+
+  candidate = ParsedInternalKey("f", 1, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kDead,
+            validator.Validate(candidate, 100));
+}
+
+TEST(StreamingGarbageCollectionValidatorTest, RejectsNonMonotonicCandidates) {
+  FileMetaData blob;
+  blob.fd = FileDescriptor(100, 0, 1);
+  DependenceMap dependence_map;
+  dependence_map[10] = &blob;
+  InternalKeyVectorIterator references(
+      {test::KeyStr("b", 7, kTypeValueIndex)}, {EncodeReference(10)});
+  StreamingGarbageCollectionValidator validator(
+      &references, BytewiseComparator(), &dependence_map);
+
+  ParsedInternalKey candidate("b", 7, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kLive,
+            validator.Validate(candidate, 100));
+  candidate = ParsedInternalKey("a", 6, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kUnknown,
+            validator.Validate(candidate, 100));
+}
+
+TEST(StreamingGarbageCollectionValidatorTest, RejectsIteratorError) {
+  ErrorInternalIterator references;
+  DependenceMap dependence_map;
+  StreamingGarbageCollectionValidator validator(
+      &references, BytewiseComparator(), &dependence_map);
+
+  ParsedInternalKey candidate("a", 7, kTypeValue);
+  ASSERT_EQ(StreamingGarbageCollectionValidator::Result::kUnknown,
+            validator.Validate(candidate, 100));
+}
 
 // TODO(icanadi) Make it simpler once we mock out VersionSet
 class CompactionJobTest : public testing::Test {
@@ -324,6 +473,207 @@ TEST_F(CompactionJobTest, Simple) {
   auto files = cfd->current()->storage_info()->LevelFiles(0);
   ASSERT_EQ(2U, files.size());
   RunCompaction({files}, expected_results);
+}
+
+TEST_F(CompactionJobTest, PurgeOnlyDeletesInputWithoutOutput) {
+  NewDB();
+
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  const uint64_t blob_file_number = versions_->NewFileNumber();
+  const uint64_t key_file_number = versions_->NewFileNumber();
+  TablePropertyCache blob_properties;
+  blob_properties.flags |= TablePropertyCache::kCompleteDependence;
+  blob_properties.num_entries = 1;
+  blob_properties.raw_value_size = 4096;
+  TablePropertyCache key_properties;
+  key_properties.flags |= TablePropertyCache::kCompleteDependence;
+  key_properties.num_entries = 1;
+  key_properties.dependence.emplace_back(
+      Dependence{blob_file_number, 1, 4096});
+  VersionEdit edit;
+  edit.AddFile(-1, blob_file_number, 0, 4096,
+               InternalKey("a", 1, kTypeValue),
+               InternalKey("a", 1, kTypeValue), 1, 1, false,
+               blob_properties);
+  edit.AddFile(1, key_file_number, 0, 10,
+               InternalKey("a", 1, kTypeValueIndex),
+               InternalKey("a", 1, kTypeValueIndex), 1, 1, false,
+               key_properties);
+  mutex_.Lock();
+  ASSERT_OK(versions_->LogAndApply(cfd, mutable_cf_options_, &edit, &mutex_));
+  mutex_.Unlock();
+
+  auto* storage = cfd->current()->storage_info();
+  ASSERT_EQ(1U, storage->LevelFiles(-1).size());
+  FileMetaData* blob = storage->LevelFiles(-1).front();
+  ASSERT_EQ(blob_file_number, blob->fd.GetNumber());
+  ASSERT_EQ(1U, storage->LevelFiles(1).size());
+  FileMetaData* key_file = storage->LevelFiles(1).front();
+  ASSERT_EQ(key_file_number, key_file->fd.GetNumber());
+  key_file->prop.dependence.clear();
+  storage->BuildGarbageCollectionReferenceIndex();
+  ASSERT_EQ(2, blob->refs);
+  ASSERT_FALSE(blob->prop.has_snapshots());
+  ASSERT_NE(0U,
+            blob->prop.flags & TablePropertyCache::kCompleteDependence);
+  ASSERT_NE(0U,
+            key_file->prop.flags & TablePropertyCache::kCompleteDependence);
+  ASSERT_TRUE(key_file->prop.dependence.empty());
+  ASSERT_TRUE(storage->CanPurgeBlobFile(blob));
+  blob->gc_status = FileMetaData::kGarbageCollectionPermitted;
+  blob->num_antiquation = 1;
+  blob->num_antiquation_bytes = 4096;
+
+  MutableCFOptions gc_options(*cfd->GetLatestMutableCFOptions());
+  gc_options.blob_gc_defer_enabled = false;
+  gc_options.blob_gc_ratio = 0.5;
+  gc_options.precise_gc = true;
+  gc_options.gc_cost_aware_selection = true;
+  gc_options.gc_purge_only = true;
+  std::unique_ptr<Compaction> compaction(
+      cfd->PickGarbageCollection(gc_options, nullptr));
+  ASSERT_NE(nullptr, compaction);
+  ASSERT_TRUE(compaction->purge_only());
+  ASSERT_EQ(blob_file_number, compaction->input(0, 0)->fd.GetNumber());
+
+  LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL, db_options_.info_log.get());
+  EventLogger event_logger(db_options_.info_log.get());
+  CompactionJob compaction_job(
+      1, compaction.get(), db_options_, env_options_, versions_.get(),
+      &shutting_down_, preserve_deletes_seqnum_, &log_buffer, nullptr, nullptr,
+      nullptr, &mutex_, &error_handler_, {}, kMaxSequenceNumber,
+      DisableGCSnapshotChecker::Instance(), table_cache_, &event_logger, false,
+      false, dbname_, &compaction_job_stats_);
+
+  mutex_.Lock();
+  ASSERT_EQ(0, compaction_job.Prepare(0));
+  mutex_.Unlock();
+  ASSERT_OK(compaction_job.Run());
+  EXPECT_TRUE(compaction->edit()->GetNewFiles().empty());
+  EXPECT_EQ(0U, compaction_job_stats_.num_output_files);
+  EXPECT_EQ(0U, compaction_job_stats_.total_output_bytes);
+
+  mutex_.Lock();
+  ASSERT_OK(compaction_job.Install(gc_options));
+  mutex_.Unlock();
+  ASSERT_TRUE(compaction->edit()->GetNewFiles().empty());
+  ASSERT_EQ(1U, compaction->edit()->GetDeletedFiles().size());
+  compaction->ReleaseCompactionFiles(Status::OK());
+
+  storage = cfd->current()->storage_info();
+  ASSERT_TRUE(storage->LevelFiles(-1).empty());
+  ASSERT_EQ(storage->dependence_map().end(),
+            storage->dependence_map().find(blob_file_number));
+}
+
+TEST_F(CompactionJobTest, GarbageCollectionAcceptsRetainedInput) {
+  NewDB();
+
+  auto* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  const uint64_t blob_file_number = versions_->NewFileNumber();
+  const uint64_t key_file_number = versions_->NewFileNumber();
+  TablePropertyCache blob_properties;
+  blob_properties.flags |= TablePropertyCache::kCompleteDependence;
+  blob_properties.num_entries = 2;
+  blob_properties.raw_value_size = 8192;
+  TablePropertyCache key_properties;
+  key_properties.flags |= TablePropertyCache::kCompleteDependence;
+  key_properties.num_entries = 1;
+  key_properties.dependence.emplace_back(
+      Dependence{blob_file_number, 1, 4096});
+  VersionEdit add_files;
+  add_files.AddFile(-1, blob_file_number, 0, 8192,
+                    InternalKey("a", 1, kTypeValue),
+                    InternalKey("b", 1, kTypeValue), 1, 1, false,
+                    blob_properties);
+  add_files.AddFile(1, key_file_number, 0, 10,
+                    InternalKey("a", 1, kTypeValueIndex),
+                    InternalKey("a", 1, kTypeValueIndex), 1, 1, false,
+                    key_properties);
+  mutex_.Lock();
+  ASSERT_OK(
+      versions_->LogAndApply(cfd, mutable_cf_options_, &add_files, &mutex_));
+  mutex_.Unlock();
+
+  auto* blob = cfd->current()->storage_info()->LevelFiles(-1).front();
+  blob->gc_status = FileMetaData::kGarbageCollectionPermitted;
+  blob->num_antiquation = 1;
+  blob->num_antiquation_bytes = 4096;
+  MutableCFOptions gc_options(*cfd->GetLatestMutableCFOptions());
+  gc_options.blob_gc_defer_enabled = false;
+  gc_options.blob_gc_ratio = 0.5;
+  std::unique_ptr<Compaction> compaction(
+      cfd->PickGarbageCollection(gc_options, nullptr));
+  ASSERT_NE(nullptr, compaction);
+  ASSERT_FALSE(compaction->purge_only());
+
+  VersionEdit concurrent_edit;
+  const uint64_t concurrent_file_number = versions_->NewFileNumber();
+  concurrent_edit.AddFile(
+      2, concurrent_file_number, 0, 10,
+      InternalKey("z", 2, kTypeValue), InternalKey("z", 2, kTypeValue), 2, 2,
+      false, TablePropertyCache{});
+  mutex_.Lock();
+  ASSERT_OK(versions_->LogAndApply(cfd, gc_options, &concurrent_edit, &mutex_));
+  mutex_.Unlock();
+
+  ASSERT_NE(compaction->input_version(), cfd->current());
+  ASSERT_TRUE(versions_->VerifyCompactionFileConsistency(compaction.get()));
+  compaction->ReleaseCompactionFiles(Status::OK());
+}
+
+TEST_F(CompactionJobTest, GarbageCollectionRejectsRemovedInput) {
+  NewDB();
+
+  auto* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  const uint64_t blob_file_number = versions_->NewFileNumber();
+  const uint64_t key_file_number = versions_->NewFileNumber();
+  TablePropertyCache blob_properties;
+  blob_properties.flags |= TablePropertyCache::kCompleteDependence;
+  blob_properties.num_entries = 2;
+  blob_properties.raw_value_size = 8192;
+  TablePropertyCache key_properties;
+  key_properties.flags |= TablePropertyCache::kCompleteDependence;
+  key_properties.num_entries = 1;
+  key_properties.dependence.emplace_back(
+      Dependence{blob_file_number, 1, 4096});
+  VersionEdit add_files;
+  add_files.AddFile(-1, blob_file_number, 0, 8192,
+                    InternalKey("a", 1, kTypeValue),
+                    InternalKey("b", 1, kTypeValue), 1, 1, false,
+                    blob_properties);
+  add_files.AddFile(1, key_file_number, 0, 10,
+                    InternalKey("a", 1, kTypeValueIndex),
+                    InternalKey("a", 1, kTypeValueIndex), 1, 1, false,
+                    key_properties);
+  mutex_.Lock();
+  ASSERT_OK(
+      versions_->LogAndApply(cfd, mutable_cf_options_, &add_files, &mutex_));
+  mutex_.Unlock();
+
+  auto* blob = cfd->current()->storage_info()->LevelFiles(-1).front();
+  blob->gc_status = FileMetaData::kGarbageCollectionPermitted;
+  blob->num_antiquation = 1;
+  blob->num_antiquation_bytes = 4096;
+  MutableCFOptions gc_options(*cfd->GetLatestMutableCFOptions());
+  gc_options.blob_gc_defer_enabled = false;
+  gc_options.blob_gc_ratio = 0.5;
+  std::unique_ptr<Compaction> compaction(
+      cfd->PickGarbageCollection(gc_options, nullptr));
+  ASSERT_NE(nullptr, compaction);
+
+  VersionEdit remove_blob;
+  remove_blob.DeleteFile(-1, blob_file_number);
+  remove_blob.DeleteFile(1, key_file_number);
+  mutex_.Lock();
+  ASSERT_OK(
+      versions_->LogAndApply(cfd, gc_options, &remove_blob, &mutex_));
+  mutex_.Unlock();
+
+  ASSERT_NE(compaction->input_version(), cfd->current());
+  ASSERT_FALSE(versions_->VerifyCompactionFileConsistency(compaction.get()));
+  compaction->ReleaseCompactionFiles(Status::Incomplete());
+  ASSERT_TRUE(blob->is_gc_permitted());
 }
 
 TEST_F(CompactionJobTest, SimpleCorrupted) {

@@ -123,6 +123,16 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
       val.emplace_back(dependence.entry_count);
     }
     Add(TablePropertiesNames::kDependenceEntryCount, val);
+    const bool has_byte_count = std::any_of(
+        props.dependence.begin(), props.dependence.end(),
+        [](const Dependence& dependence) { return dependence.byte_count != 0; });
+    if (has_byte_count) {
+      val.clear();
+      for (auto& dependence : props.dependence) {
+        val.emplace_back(dependence.byte_count);
+      }
+      Add(TablePropertiesNames::kDependenceByteCount, val);
+    }
   }
   if (!props.inheritance_tree.empty()) {
     Add(TablePropertiesNames::kInheritanceTree, props.inheritance_tree);
@@ -413,6 +423,18 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       }
       for (size_t i = 0; i < val.size(); ++i) {
         new_table_properties->dependence[i].entry_count = val[i];
+      }
+    } else if (key == TablePropertiesNames::kDependenceByteCount) {
+      std::vector<uint64_t> val;
+      GetUint64Vector(key, &raw_val, val);
+      if (new_table_properties->dependence.empty()) {
+        new_table_properties->dependence.resize(val.size());
+      } else if (new_table_properties->dependence.size() != val.size()) {
+        log_error();
+        continue;
+      }
+      for (size_t i = 0; i < val.size(); ++i) {
+        new_table_properties->dependence[i].byte_count = val[i];
       }
     } else if (key == TablePropertiesNames::kInheritanceChain) {
       std::vector<uint64_t> val;

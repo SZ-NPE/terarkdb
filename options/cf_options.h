@@ -161,6 +161,11 @@ struct MutableCFOptions {
         blob_gc_ratio(0),
         blob_gc_defer_enabled(true),
         blob_gc_defer_ratio(1.0),
+        precise_gc(false),
+        gc_cost_aware_selection(false),
+        gc_streaming_validation(false),
+        gc_liveness_bloom(false),
+        gc_purge_only(false),
         target_blob_file_size(0),
         blob_file_defragment_size(0),
         max_dependence_blob_overlap(0),
@@ -224,6 +229,11 @@ struct MutableCFOptions {
   double blob_gc_ratio;
   bool blob_gc_defer_enabled;
   double blob_gc_defer_ratio;
+  bool precise_gc;
+  bool gc_cost_aware_selection;
+  bool gc_streaming_validation;
+  bool gc_liveness_bloom;
+  bool gc_purge_only;
   uint64_t target_blob_file_size;
   uint64_t blob_file_defragment_size;
   size_t max_dependence_blob_overlap;
