@@ -36,6 +36,7 @@
 #include "db/file_indexer.h"
 #include "db/log_reader.h"
 #include "db/range_del_aggregator.h"
+#include "db/readahead_lane_manager.h"
 #include "db/read_callback.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
@@ -696,6 +697,25 @@ class Version : public SeparateHelper, private LazyBufferState {
               ValueType* type, SequenceNumber* seq, LazyBuffer* value,
               const FileMetaData& blob);
 
+  const FileMetaData* ResolveValueFile(uint64_t file_number) const;
+
+  size_t ValueFileCount() const;
+
+  bool UsesDirectReads() const;
+
+  InternalIterator* NewValueIterator(const ReadOptions& read_options,
+                                     const FileMetaData& file_meta,
+                                     uint64_t readahead_owner) const;
+
+  std::shared_ptr<ReadaheadLaneProvider> GetReadaheadLaneProvider() const;
+
+  int CompareInternalKeys(const Slice& lhs, const Slice& rhs) const;
+
+  Status FetchValueByFileNumber(const Slice& user_key,
+                                SequenceNumber sequence,
+                                uint64_t file_number,
+                                LazyBuffer* value) const;
+
   // Loads some stats information from files. Call without mutex held. It needs
   // to be called before applying the version to the version set.
   void PrepareApply(const MutableCFOptions& mutable_cf_options);
@@ -1120,6 +1140,10 @@ class VersionSet {
 
   const ImmutableDBOptions* db_options() const { return db_options_; }
 
+  std::shared_ptr<ReadaheadLaneManager> readahead_lane_manager() const {
+    return readahead_lane_manager_;
+  }
+
   static uint64_t GetNumLiveVersions(Version* dummy_versions);
 
   static uint64_t GetTotalSstFilesSize(Version* dummy_versions);
@@ -1223,6 +1247,7 @@ class VersionSet {
 
   // env options for all reads and writes except compactions
   EnvOptions env_options_;
+  std::shared_ptr<ReadaheadLaneManager> readahead_lane_manager_;
 
   // No copying allowed
   VersionSet(const VersionSet&);

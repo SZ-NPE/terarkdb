@@ -9,14 +9,19 @@
 
 #include "db/db_iter.h"
 
+#include <algorithm>
 #include <limits>
+#include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "db/db_impl.h"
 #include "db/dbformat.h"
 #include "db/forward_iterator.h"
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
+#include "db/version_set.h"
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
@@ -27,7 +32,20 @@
 #include "util/arena.h"
 #include "util/logging.h"
 #include "util/string_util.h"
+#include "util/sync_point.h"
 #include "util/util.h"
+
+#ifndef TERARKDB_DUOCURSOR_ENABLED
+#define TERARKDB_DUOCURSOR_ENABLED 1
+#endif
+
+#ifndef TERARKDB_DUOCURSOR_MANAGED_READAHEAD
+#define TERARKDB_DUOCURSOR_MANAGED_READAHEAD 1
+#endif
+
+#ifndef TERARKDB_DUOCURSOR_FIXED_POSITION_CAPACITY
+#define TERARKDB_DUOCURSOR_FIXED_POSITION_CAPACITY 0
+#endif
 
 namespace TERARKDB_NAMESPACE {
 
@@ -43,6 +61,282 @@ static void DumpInternalIter(Iterator* iter) {
   }
 }
 #endif
+
+class ScanFuseResolver final : public LazyBufferState {
+ public:
+  ScanFuseResolver(const Version* version, Statistics* statistics)
+      : version_(version),
+        statistics_(statistics),
+        readahead_lane_provider_(version->GetReadaheadLaneProvider()),
+        uses_managed_readahead_(TERARKDB_DUOCURSOR_MANAGED_READAHEAD &&
+                                version->UsesDirectReads()),
+        cursor_capacity_(CursorCapacity(version)),
+        cursors_(cursor_capacity_),
+        recent_sources_(cursor_capacity_) {
+    cursor_slots_.reserve(cursor_capacity_);
+    recent_source_counts_.reserve(cursor_capacity_);
+  }
+
+  ~ScanFuseResolver() override {
+    Clear();
+    if (readahead_owner_ != 0) {
+      readahead_lane_provider_->ReleaseOwner(readahead_owner_);
+    }
+  }
+
+  void destroy(LazyBuffer* /*buffer*/) const override {}
+
+  LazyBuffer Prepare(const Slice& user_key, SequenceNumber sequence,
+                     const LazyBuffer& value_index) {
+    auto status = value_index.fetch();
+    if (!status.ok()) {
+      return LazyBuffer(std::move(status));
+    }
+
+    const uint64_t file_number =
+        SeparateHelper::DecodeFileNumber(value_index.slice());
+    const FileMetaData* source = version_->ResolveValueFile(file_number);
+    if (source == nullptr) {
+      return LazyBuffer(
+          Status::Corruption("Separate value dependence missing"));
+    }
+
+    request_.user_key.assign(user_key.data(), user_key.size());
+    request_.sequence = sequence;
+    request_.file_number = file_number;
+    request_.source = source;
+    return LazyBuffer(this, LazyBufferContext(), Slice::Invalid(),
+                      source->fd.GetNumber());
+  }
+
+  const Version* version() const { return version_; }
+
+  void Clear() {
+    for (auto& cursor : cursors_) {
+      cursor.iter.reset();
+      if (cursor.source != nullptr && readahead_owner_ != 0) {
+        readahead_lane_provider_->Release(readahead_owner_,
+                                         cursor.source->fd.GetNumber());
+      }
+      cursor.source = nullptr;
+      cursor.last_used = 0;
+    }
+    std::fill(recent_sources_.begin(), recent_sources_.end(), nullptr);
+    cursor_slots_.clear();
+    recent_source_counts_.clear();
+    request_.user_key.clear();
+    request_.sequence = 0;
+    request_.file_number = uint64_t(-1);
+    request_.source = nullptr;
+    clock_ = 0;
+    recent_next_ = 0;
+    recent_size_ = 0;
+  }
+
+ private:
+  static constexpr size_t kMinCursorCapacity = 16;
+  static constexpr size_t kMaxCursorCapacity = 1024;
+  static constexpr size_t kAdvanceLimit = 64;
+
+  static size_t CursorCapacity(const Version* version) {
+    size_t capacity = TERARKDB_DUOCURSOR_FIXED_POSITION_CAPACITY;
+    if (capacity == 0) {
+      capacity = version->ValueFileCount();
+    }
+    if (capacity < kMinCursorCapacity) {
+      capacity = kMinCursorCapacity;
+    } else if (capacity > kMaxCursorCapacity) {
+      capacity = kMaxCursorCapacity;
+    }
+#ifndef NDEBUG
+    TEST_SYNC_POINT_CALLBACK("ScanFuseResolver::CursorCapacity", &capacity);
+#endif
+    return capacity == 0 ? 1 : capacity;
+  }
+
+  struct Request {
+    std::string user_key;
+    SequenceNumber sequence = 0;
+    uint64_t file_number = uint64_t(-1);
+    const FileMetaData* source = nullptr;
+  };
+
+  struct Cursor {
+    const FileMetaData* source = nullptr;
+    std::unique_ptr<InternalIterator> iter;
+    uint64_t last_used = 0;
+  };
+
+  Cursor* FindCursor(const FileMetaData* source) const {
+    auto find = cursor_slots_.find(source);
+    return find == cursor_slots_.end() ? nullptr : &cursors_[find->second];
+  }
+
+  bool TouchRecentSource(const FileMetaData* source) const {
+    const bool recently_seen = recent_source_counts_.count(source) != 0;
+    if (recent_size_ == cursor_capacity_) {
+      const FileMetaData* expired = recent_sources_[recent_next_];
+      auto find = recent_source_counts_.find(expired);
+      assert(find != recent_source_counts_.end());
+      if (--find->second == 0) {
+        recent_source_counts_.erase(find);
+      }
+    } else {
+      ++recent_size_;
+    }
+
+    recent_sources_[recent_next_] = source;
+    ++recent_source_counts_[source];
+    recent_next_ = (recent_next_ + 1) % cursor_capacity_;
+    return recently_seen;
+  }
+
+  Cursor* AllocateCursor(const FileMetaData* source) const {
+    Cursor* empty = nullptr;
+    Cursor* oldest = &cursors_.front();
+    for (auto& cursor : cursors_) {
+      if (cursor.source == nullptr) {
+        empty = &cursor;
+        break;
+      }
+      if (cursor.last_used < oldest->last_used) {
+        oldest = &cursor;
+      }
+    }
+    if (empty == nullptr) {
+      RecordTick(statistics_, SCAN_FUSE_CURSOR_EVICTION);
+      cursor_slots_.erase(oldest->source);
+      if (readahead_owner_ != 0) {
+        readahead_lane_provider_->Release(readahead_owner_,
+                                         oldest->source->fd.GetNumber());
+      }
+      oldest->iter.reset();
+      oldest->source = nullptr;
+      oldest->last_used = 0;
+      empty = oldest;
+    }
+
+    empty->source = source;
+    cursor_slots_[source] = static_cast<size_t>(empty - cursors_.data());
+    return empty;
+  }
+
+  uint64_t ReadaheadOwner() const {
+    if (uses_managed_readahead_ && readahead_owner_ == 0) {
+      readahead_owner_ = readahead_lane_provider_->RegisterOwner(
+          statistics_, version_->ValueFileCount());
+    }
+    return readahead_owner_;
+  }
+
+  bool Match(Cursor* cursor, const Slice& target, LazyBuffer* output) const {
+    if (!cursor->iter->Valid()) {
+      return false;
+    }
+
+    int cmp = version_->CompareInternalKeys(cursor->iter->key(), target);
+    size_t advances = 0;
+    while (cmp < 0 && advances < kAdvanceLimit) {
+      cursor->iter->Next();
+      ++advances;
+      RecordTick(statistics_, SCAN_FUSE_CURSOR_ADVANCE);
+      if (!cursor->iter->Valid()) {
+        return false;
+      }
+      cmp = version_->CompareInternalKeys(cursor->iter->key(), target);
+    }
+    if (cmp != 0) {
+      return false;
+    }
+
+    LazyBuffer value = cursor->iter->value();
+    auto status = std::move(value).dump(*output);
+    if (!status.ok()) {
+      output->reset(std::move(status));
+      return false;
+    }
+    return true;
+  }
+
+  Status fetch_buffer(LazyBuffer* output) const override {
+    if (request_.source == nullptr) {
+      return Status::Corruption("ScanFuse value request missing source");
+    }
+
+    if (request_.source->fd.GetNumber() != request_.file_number) {
+      RecordTick(statistics_, READ_BLOB_INVALID);
+    } else {
+      RecordTick(statistics_, READ_BLOB_VALID);
+    }
+
+    IterKey target_key;
+    target_key.SetInternalKey(Slice(request_.user_key), request_.sequence,
+                              kTypeValue);
+    Cursor* cursor = FindCursor(request_.source);
+    const bool cursor_hit = cursor != nullptr;
+    const bool recently_seen = TouchRecentSource(request_.source);
+    if (!cursor_hit) {
+      RecordTick(statistics_, SCAN_FUSE_CURSOR_MISS);
+      if (cursor_slots_.size() == cursor_capacity_ && !recently_seen) {
+        RecordTick(statistics_, SCAN_FUSE_CURSOR_BYPASS);
+        return version_->FetchValueByFileNumber(
+            Slice(request_.user_key), request_.sequence, request_.file_number,
+            output);
+      }
+      cursor = AllocateCursor(request_.source);
+      const uint64_t readahead_owner = ReadaheadOwner();
+      cursor->iter.reset(
+          version_->NewValueIterator(ReadOptions(), *request_.source,
+                                     readahead_owner));
+      if (cursor->iter == nullptr || !cursor->iter->status().ok()) {
+        cursor->iter.reset();
+        cursor_slots_.erase(cursor->source);
+        cursor->source = nullptr;
+        cursor->last_used = 0;
+        RecordTick(statistics_, SCAN_FUSE_CURSOR_FALLBACK);
+        return version_->FetchValueByFileNumber(
+            Slice(request_.user_key), request_.sequence, request_.file_number,
+            output);
+      }
+      cursor->iter->Seek(target_key.GetInternalKey());
+    }
+
+    cursor->last_used = ++clock_;
+    if (Match(cursor, target_key.GetInternalKey(), output)) {
+      if (cursor_hit) {
+        RecordTick(statistics_, SCAN_FUSE_CURSOR_HIT);
+      }
+      return Status::OK();
+    }
+
+    if (!cursor->iter->status().ok()) {
+      cursor->iter.reset();
+      cursor_slots_.erase(cursor->source);
+      cursor->source = nullptr;
+      cursor->last_used = 0;
+    }
+    RecordTick(statistics_, SCAN_FUSE_CURSOR_FALLBACK);
+    return version_->FetchValueByFileNumber(
+        Slice(request_.user_key), request_.sequence, request_.file_number,
+        output);
+  }
+
+  const Version* version_;
+  Statistics* statistics_;
+  std::shared_ptr<ReadaheadLaneProvider> readahead_lane_provider_;
+  const bool uses_managed_readahead_;
+  mutable uint64_t readahead_owner_ = 0;
+  const size_t cursor_capacity_;
+  mutable Request request_;
+  mutable std::vector<Cursor> cursors_;
+  mutable std::unordered_map<const FileMetaData*, size_t> cursor_slots_;
+  mutable std::vector<const FileMetaData*> recent_sources_;
+  mutable std::unordered_map<const FileMetaData*, size_t>
+      recent_source_counts_;
+  mutable uint64_t clock_ = 0;
+  mutable size_t recent_next_ = 0;
+  mutable size_t recent_size_ = 0;
+};
 
 // Memtables and sstables that make the DB representation contain
 // (userkey,seq,type) => uservalue entries.  DBIter
@@ -113,7 +407,8 @@ class DBIter final : public Iterator {
          InternalIterator* iter, SVDestructCallback* sv_destruct_callback,
          SequenceNumber s, const SeparateHelper* separate_helper,
          bool arena_mode, uint64_t max_sequential_skip_in_iterations,
-         ReadCallback* read_callback, DBImpl* db_impl, ColumnFamilyData* cfd)
+         ReadCallback* read_callback, DBImpl* db_impl, ColumnFamilyData* cfd,
+         const Version* scan_fuse_version)
       : arena_mode_(arena_mode),
         env_(_env),
         logger_(cf_options.info_log),
@@ -135,16 +430,22 @@ class DBIter final : public Iterator {
         read_callback_(read_callback),
         db_impl_(db_impl),
         cfd_(cfd),
-        start_seqnum_(read_options.iter_start_seqnum) {
+        start_seqnum_(read_options.iter_start_seqnum),
+        scan_fuse_allowed_(TERARKDB_DUOCURSOR_ENABLED &&
+                           !read_options.tailing &&
+                           read_options.iter_start_seqnum == 0),
+        scan_fuse_version_(scan_fuse_version) {
     RecordTick(statistics_, NO_ITERATOR_CREATED);
     prefix_extractor_ = mutable_cf_options.prefix_extractor.get();
     max_skip_ = max_sequential_skip_in_iterations;
     max_skippable_internal_keys_ = read_options.max_skippable_internal_keys;
+    InitScanFuse();
     SetSVDestructCallback(sv_destruct_callback);
   }
   virtual ~DBIter() {
     RecordTick(statistics_, NO_ITERATOR_DELETED);
     ResetValueAndCounter();
+    scan_fuse_resolver_.reset();
     merge_context_.Clear();
     local_stats_.BumpGlobalStatistics(statistics_);
     if (!arena_mode_) {
@@ -164,16 +465,22 @@ class DBIter final : public Iterator {
             self->PinLazyBuffer();
             self->separate_helper_ =
                 new_sv == nullptr ? nullptr : new_sv->current;
+            self->scan_fuse_version_ =
+                new_sv == nullptr ? nullptr : new_sv->current;
+            self->InitScanFuse();
           },
           this);
     }
   }
   virtual void SetIter(InternalIterator* iter,
                        SVDestructCallback* sv_destruct_callback,
-                       const SeparateHelper* separate_helper) {
+                       const SeparateHelper* separate_helper,
+                       const Version* scan_fuse_version) {
     assert(iter_ == nullptr);
     iter_ = iter;
     separate_helper_ = separate_helper;
+    scan_fuse_version_ = scan_fuse_version;
+    InitScanFuse();
     SetSVDestructCallback(sv_destruct_callback);
   }
   virtual ReadRangeDelAggregator* GetRangeDelAggregator() {
@@ -239,6 +546,25 @@ class DBIter final : public Iterator {
   // Return false if there was an error, and status() is non-ok, valid_ = false;
   // in this case callers would usually stop what they were doing and return.
   void PinLazyBuffer();
+  void ClearScanFuse() {
+    if (scan_fuse_resolver_ != nullptr) {
+      scan_fuse_resolver_->Clear();
+    }
+  }
+  void InitScanFuse() {
+    if (!scan_fuse_allowed_ || scan_fuse_version_ == nullptr) {
+      scan_fuse_resolver_.reset();
+      return;
+    }
+
+    if (scan_fuse_resolver_ != nullptr &&
+        scan_fuse_resolver_->version() == scan_fuse_version_) {
+      scan_fuse_resolver_->Clear();
+      return;
+    }
+    scan_fuse_resolver_.reset(
+        new ScanFuseResolver(scan_fuse_version_, statistics_));
+  }
   bool ReverseToForward();
   bool ReverseToBackward();
   bool FindValueForCurrentKey();
@@ -249,6 +575,12 @@ class DBIter final : public Iterator {
   bool ParseKey(ParsedInternalKey* key);
   bool MergeValuesNewToOld();
   LazyBuffer GetValue(const ParsedInternalKey& ikey, ValueType index_type) {
+    if (scan_fuse_resolver_ != nullptr && direction_ == kForward &&
+        !current_entry_is_merged_ && ikey.type == kTypeValueIndex &&
+        index_type == kTypeValueIndex) {
+      return scan_fuse_resolver_->Prepare(saved_key_.GetUserKey(),
+                                          ikey.sequence, iter_->value());
+    }
     if (separate_helper_ == nullptr || ikey.type != index_type) {
       return iter_->value();
     } else {
@@ -301,6 +633,7 @@ class DBIter final : public Iterator {
   // and should not be used across functions. Reusing this object can reduce
   // overhead of calling construction of the function if creating it each time.
   ParsedInternalKey ikey_;
+  std::unique_ptr<ScanFuseResolver> scan_fuse_resolver_;
   LazyBuffer value_;
   std::string value_buffer_;
   Direction direction_;
@@ -327,6 +660,8 @@ class DBIter final : public Iterator {
   // for diff snapshots we want the lower bound on the seqnum;
   // if this value > 0 iterator will return internal keys
   SequenceNumber start_seqnum_;
+  const bool scan_fuse_allowed_;
+  const Version* scan_fuse_version_;
 
   // No copying allowed
   DBIter(const DBIter&);
@@ -362,6 +697,7 @@ void DBIter::Next() {
   ResetValueAndCounter();
   bool ok = true;
   if (direction_ == kReverse) {
+    ClearScanFuse();
     if (!ReverseToForward()) {
       ok = false;
     }
@@ -693,6 +1029,7 @@ void DBIter::Prev() {
   ResetValueAndCounter();
   bool ok = true;
   if (direction_ == kForward) {
+    ClearScanFuse();
     if (!ReverseToBackward()) {
       ok = false;
     }
@@ -1190,6 +1527,7 @@ void DBIter::Seek(const Slice& target) {
   StopWatch sw(env_, statistics_, DB_SEEK);
   status_ = Status::OK();
   ResetValueAndCounter();
+  ClearScanFuse();
 
   SequenceNumber seq = MaxVisibleSequenceNumber();
   saved_key_.Clear();
@@ -1254,6 +1592,7 @@ void DBIter::SeekForPrev(const Slice& target) {
   StopWatch sw(env_, statistics_, DB_SEEK);
   status_ = Status::OK();
   ResetValueAndCounter();
+  ClearScanFuse();
   saved_key_.Clear();
   // now saved_key is used to store internal key.
   saved_key_.SetInternalKey(target, 0 /* sequence_number */,
@@ -1324,6 +1663,7 @@ void DBIter::SeekToFirst() {
   status_ = Status::OK();
   direction_ = kForward;
   ResetValueAndCounter();
+  ClearScanFuse();
 
   {
     PERF_TIMER_GUARD(seek_internal_seek_time);
@@ -1377,6 +1717,7 @@ void DBIter::SeekToLast() {
   status_ = Status::OK();
   direction_ = kReverse;
   ResetValueAndCounter();
+  ClearScanFuse();
 
   {
     PERF_TIMER_GUARD(seek_internal_seek_time);
@@ -1412,11 +1753,13 @@ Iterator* NewDBIterator(Env* env, const ReadOptions& read_options,
                         const SeparateHelper* separate_helper,
                         uint64_t max_sequential_skip_in_iterations,
                         ReadCallback* read_callback, DBImpl* db_impl,
-                        ColumnFamilyData* cfd) {
+                        ColumnFamilyData* cfd,
+                        const Version* scan_fuse_version) {
   DBIter* db_iter = new DBIter(
       env, read_options, cf_options, mutable_cf_options, user_key_comparator,
       internal_iter, sv_destruct_callback, sequence, separate_helper, false,
-      max_sequential_skip_in_iterations, read_callback, db_impl, cfd);
+      max_sequential_skip_in_iterations, read_callback, db_impl, cfd,
+      scan_fuse_version);
   return db_iter;
 }
 
@@ -1428,9 +1771,9 @@ ReadRangeDelAggregator* ArenaWrappedDBIter::GetRangeDelAggregator() {
 
 void ArenaWrappedDBIter::SetIterUnderDBIter(
     InternalIterator* iter, SVDestructCallback* sv_destruct_callback,
-    const SeparateHelper* separate_helper) {
+    const SeparateHelper* separate_helper, const Version* scan_fuse_version) {
   static_cast<DBIter*>(db_iter_)->SetIter(iter, sv_destruct_callback,
-                                          separate_helper);
+                                          separate_helper, scan_fuse_version);
 }
 
 inline bool ArenaWrappedDBIter::Valid() const { return db_iter_->Valid(); }
@@ -1471,7 +1814,7 @@ void ArenaWrappedDBIter::Init(Env* env, const ReadOptions& read_options,
   db_iter_ = new (mem) DBIter(
       env, read_options, cf_options, mutable_cf_options,
       cf_options.user_comparator, nullptr, nullptr, sequence, nullptr, true,
-      max_sequential_skip_in_iteration, read_callback, db_impl, cfd);
+      max_sequential_skip_in_iteration, read_callback, db_impl, cfd, nullptr);
   sv_number_ = version_number;
   allow_refresh_ = allow_refresh;
 }
@@ -1500,7 +1843,7 @@ Status ArenaWrappedDBIter::Refresh() {
     InternalIterator* internal_iter = db_impl_->NewInternalIterator(
         read_options_, cfd_, sv, &arena_, db_iter_->GetRangeDelAggregator(),
         latest_seq);
-    SetIterUnderDBIter(internal_iter, nullptr, sv->current);
+    SetIterUnderDBIter(internal_iter, nullptr, sv->current, sv->current);
   } else {
     db_iter_->set_sequence(latest_seq);
     db_iter_->set_valid(false);

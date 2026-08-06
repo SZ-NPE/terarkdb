@@ -2248,7 +2248,8 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::InitDataBlock() {
           // Keep exponentially increasing readahead size until
           // kMaxReadaheadSize.
           readahead_size_ = std::min(kMaxReadaheadSize, readahead_size_ * 2);
-        } else if (rep->file->use_direct_io() && !prefetch_buffer_) {
+        } else if (rep->file->use_direct_io() && !prefetch_buffer_ &&
+                   readahead_lane_provider_ == nullptr) {
           // Direct I/O
           // Let FilePrefetchBuffer take care of the readahead.
           prefetch_buffer_.reset(new FilePrefetchBuffer(
@@ -2257,11 +2258,25 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::InitDataBlock() {
       }
     }
 
+    std::shared_ptr<FilePrefetchBuffer> lane_buffer;
+    FilePrefetchBuffer* active_prefetch_buffer = prefetch_buffer_.get();
+    if (rep->file->use_direct_io() && readahead_lane_provider_ != nullptr &&
+        !for_compaction_ && read_options_.readahead_size == 0 &&
+        num_file_reads_ > 2) {
+      lane_buffer = readahead_lane_provider_->Acquire(
+          readahead_owner_, readahead_source_, rep->file.get(),
+          kInitReadaheadSize, kMaxReadaheadSize);
+      active_prefetch_buffer = lane_buffer.get();
+    }
     Status s;
     BlockBasedTable::NewDataBlockIterator<TBlockIter>(
         rep, read_options_, data_block_handle, &block_iter_, is_index_,
         key_includes_seq_, index_key_is_full_,
-        /* get_context */ nullptr, s, prefetch_buffer_.get());
+        /* get_context */ nullptr, s, active_prefetch_buffer);
+    if (lane_buffer != nullptr) {
+      readahead_lane_provider_->FinishOperation(readahead_owner_,
+                                                readahead_source_);
+    }
     block_iter_points_to_real_block_ = true;
   }
 }

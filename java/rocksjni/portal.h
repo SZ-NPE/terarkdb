@@ -3480,8 +3480,34 @@ class TickerTypeJni {
         return 0x65;
       case TERARKDB_NAMESPACE::Tickers::READ_BLOB_INVALID:
         return 0x66;
-      case TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX:
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_HIT:
         return 0x67;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_MISS:
+        return 0x68;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_FALLBACK:
+        return 0x69;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_ADVANCE:
+        return 0x6A;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_EVICTION:
+        return 0x6B;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_BYPASS:
+        return 0x6C;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_GRANT:
+        return 0x6D;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_REVOCATION:
+        return 0x6E;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_DENIAL:
+        return 0x6F;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_MANAGER_OWNED_PEAK:
+        return 0x70;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_IN_FLIGHT_PEAK:
+        return 0x71;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_TOTAL_LIVE_PEAK:
+        return 0x72;
+      case TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_SUPPRESSION:
+        return 0x73;
+      case TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX:
+        return 0x74;
       default:
         // undefined/default
         return 0x0;
@@ -3699,6 +3725,32 @@ class TickerTypeJni {
       case 0x66:
         return TERARKDB_NAMESPACE::Tickers::READ_BLOB_INVALID;
       case 0x67:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_HIT;
+      case 0x68:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_MISS;
+      case 0x69:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_FALLBACK;
+      case 0x6A:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_ADVANCE;
+      case 0x6B:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_EVICTION;
+      case 0x6C:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_CURSOR_BYPASS;
+      case 0x6D:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_GRANT;
+      case 0x6E:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_REVOCATION;
+      case 0x6F:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_DENIAL;
+      case 0x70:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_MANAGER_OWNED_PEAK;
+      case 0x71:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_IN_FLIGHT_PEAK;
+      case 0x72:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_TOTAL_LIVE_PEAK;
+      case 0x73:
+        return TERARKDB_NAMESPACE::Tickers::SCAN_FUSE_LANE_SUPPRESSION;
+      case 0x74:
         return TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX;
 
       default:

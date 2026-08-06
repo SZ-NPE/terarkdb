@@ -611,6 +611,7 @@ set(SOURCES
         db/periodic_work_scheduler.cc
         db/range_del_aggregator.cc
         db/range_tombstone_fragmenter.cc
+        db/readahead_lane_manager.cc
         db/repair.cc
         db/snapshot_impl.cc
         db/table_cache.cc

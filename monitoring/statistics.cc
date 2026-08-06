@@ -141,6 +141,23 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_SKIP_GET_BY_FILE, "rocksdb.num.gc.skip_by_file_meta"},
     {READ_BLOB_VALID, "rocksdb.num.read.blob_valid"},
     {READ_BLOB_INVALID, "rocksdb.num.read.blob_invalid"},
+    {SCAN_FUSE_CURSOR_HIT, "rocksdb.num.scan_fuse.cursor_hit"},
+    {SCAN_FUSE_CURSOR_MISS, "rocksdb.num.scan_fuse.cursor_miss"},
+    {SCAN_FUSE_CURSOR_FALLBACK, "rocksdb.num.scan_fuse.cursor_fallback"},
+    {SCAN_FUSE_CURSOR_ADVANCE, "rocksdb.num.scan_fuse.cursor_advance"},
+    {SCAN_FUSE_CURSOR_EVICTION, "rocksdb.num.scan_fuse.cursor_eviction"},
+    {SCAN_FUSE_CURSOR_BYPASS, "rocksdb.num.scan_fuse.cursor_bypass"},
+    {SCAN_FUSE_LANE_GRANT, "rocksdb.num.scan_fuse.lane_grant"},
+    {SCAN_FUSE_LANE_REVOCATION, "rocksdb.num.scan_fuse.lane_revocation"},
+    {SCAN_FUSE_LANE_DENIAL, "rocksdb.num.scan_fuse.lane_denial"},
+    {SCAN_FUSE_LANE_MANAGER_OWNED_PEAK,
+     "rocksdb.num.scan_fuse.lane_manager_owned_peak"},
+    {SCAN_FUSE_LANE_IN_FLIGHT_PEAK,
+     "rocksdb.num.scan_fuse.lane_in_flight_peak"},
+    {SCAN_FUSE_LANE_TOTAL_LIVE_PEAK,
+     "rocksdb.num.scan_fuse.lane_total_live_peak"},
+    {SCAN_FUSE_LANE_SUPPRESSION,
+     "rocksdb.num.scan_fuse.lane_suppression"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

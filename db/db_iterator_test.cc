@@ -217,6 +217,29 @@ namespace {
 std::string MakeLongKey(size_t length, char c) {
   return std::string(length, c);
 }
+
+std::string ScanFuseValue(int index) {
+  return ToString(index) +
+         std::string(128, static_cast<char>('a' + index % 26));
+}
+
+void ResetScanFuseTickers(Statistics* statistics) {
+  statistics->setTickerCount(READ_BLOB_VALID, 0);
+  statistics->setTickerCount(READ_BLOB_INVALID, 0);
+  statistics->setTickerCount(SCAN_FUSE_CURSOR_HIT, 0);
+  statistics->setTickerCount(SCAN_FUSE_CURSOR_MISS, 0);
+  statistics->setTickerCount(SCAN_FUSE_CURSOR_FALLBACK, 0);
+  statistics->setTickerCount(SCAN_FUSE_CURSOR_ADVANCE, 0);
+  statistics->setTickerCount(SCAN_FUSE_CURSOR_EVICTION, 0);
+  statistics->setTickerCount(SCAN_FUSE_CURSOR_BYPASS, 0);
+  statistics->setTickerCount(SCAN_FUSE_LANE_GRANT, 0);
+  statistics->setTickerCount(SCAN_FUSE_LANE_REVOCATION, 0);
+  statistics->setTickerCount(SCAN_FUSE_LANE_DENIAL, 0);
+  statistics->setTickerCount(SCAN_FUSE_LANE_MANAGER_OWNED_PEAK, 0);
+  statistics->setTickerCount(SCAN_FUSE_LANE_IN_FLIGHT_PEAK, 0);
+  statistics->setTickerCount(SCAN_FUSE_LANE_TOTAL_LIVE_PEAK, 0);
+  statistics->setTickerCount(SCAN_FUSE_LANE_SUPPRESSION, 0);
+}
 }  // namespace
 
 TEST_P(DBIteratorTest, IterLongKeys) {
@@ -257,6 +280,542 @@ TEST_P(DBIteratorTest, IterLongKeys) {
   iter->Next();
   ASSERT_EQ(IterStatus(iter), MakeLongKey(127, 3) + "->3");
   delete iter;
+}
+
+TEST_P(DBIteratorTest, ScanFuseForwardCursorLifecycle) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_EQ(1, NumTableFilesAtLevel(-1));
+  ResetScanFuseTickers(options.statistics.get());
+
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(0), iter->key().ToString());
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(ScanFuseValue(0), iter->value().ToString());
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(1), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(1), iter->value().ToString());
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(2), iter->key().ToString());
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(3), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(3), iter->value().ToString());
+
+  iter->Seek(Key(4));
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(4), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(4), iter->value().ToString());
+
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(3), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(3), iter->value().ToString());
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(4), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(4), iter->value().ToString());
+  ASSERT_OK(iter->status());
+
+  ASSERT_EQ(6, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(2, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(3, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(3, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+}
+
+TEST_P(DBIteratorTest, ScanFuseBoundedFallback) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 1; i < 99; ++i) {
+    ASSERT_OK(Delete(Key(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_EQ(1, NumTableFilesAtLevel(-1));
+  ResetScanFuseTickers(options.statistics.get());
+
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(0), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(0), iter->value().ToString());
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(99), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(99), iter->value().ToString());
+  ASSERT_OK(iter->status());
+
+  ASSERT_EQ(2, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(64, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+}
+
+TEST_P(DBIteratorTest, ScanFuseSnapshotValues) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+  }
+  ASSERT_OK(Flush());
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(Put(Key(3), ScanFuseValue(103)));
+  ASSERT_OK(Flush());
+  ResetScanFuseTickers(options.statistics.get());
+
+  ReadOptions read_options;
+  read_options.snapshot = snapshot;
+  std::unique_ptr<Iterator> iter(NewIterator(read_options));
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_EQ(Key(index), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(index), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(8, index);
+  iter.reset();
+  db_->ReleaseSnapshot(snapshot);
+
+  ASSERT_EQ(8, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(7, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(7, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+}
+
+TEST_P(DBIteratorTest, ScanFuseRangeDeletionDoesNotTrainAdmission) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                             Key(2), Key(4)));
+  ASSERT_OK(Flush());
+  ResetScanFuseTickers(options.statistics.get());
+
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  const int expected[] = {0, 1, 4, 5};
+  size_t index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_LT(index, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(Key(expected[index]), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(expected[index]), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(sizeof(expected) / sizeof(expected[0]), index);
+
+  ASSERT_EQ(4, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(3, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(5, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_BYPASS));
+}
+
+TEST_P(DBIteratorTest, ScanFuseAdaptiveBufferedCapacity) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 17; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+    ASSERT_OK(Put(Key(i + 17), ScanFuseValue(i + 17)));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_EQ(17, NumTableFilesAtLevel(-1));
+  ResetScanFuseTickers(options.statistics.get());
+
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_EQ(Key(index), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(index), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(34, index);
+
+  ASSERT_EQ(34, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(17, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(17, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(17, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_BYPASS));
+}
+
+TEST_P(DBIteratorTest, ScanFuseDirectReadBudgetRetainsLogicalCursor) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.use_direct_reads = true;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 17; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+    ASSERT_OK(Put(Key(i + 17), ScanFuseValue(i + 17)));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_EQ(17, NumTableFilesAtLevel(-1));
+  ResetScanFuseTickers(options.statistics.get());
+
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_EQ(Key(index), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(index), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(34, index);
+
+  ASSERT_EQ(34, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(17, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(17, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(17, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_BYPASS));
+}
+
+TEST_P(DBIteratorTest, ScanFuseReadaheadLaneLifecycle) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.use_direct_reads = true;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 256;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  for (int index = 0; index < 1000; ++index) {
+    ASSERT_OK(Put(Key(index), ScanFuseValue(index)));
+  }
+  ASSERT_OK(Flush());
+  ResetScanFuseTickers(options.statistics.get());
+
+  auto manager = dbfull()->TEST_GetVersionSet()->readahead_lane_manager();
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_EQ(Key(index), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(index), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(1000, index);
+
+  auto snapshot = manager->GetSnapshot();
+  ASSERT_EQ(1u, snapshot.active_owners);
+  ASSERT_GT(snapshot.grants, 0u);
+  ASSERT_GT(snapshot.manager_owned, 0u);
+  ASSERT_LE(snapshot.manager_owned, snapshot.budget);
+  ASSERT_EQ(0u, snapshot.in_flight);
+  ASSERT_LE(snapshot.total_live, snapshot.budget);
+  ASSERT_GT(TestGetTickerCount(options, SCAN_FUSE_LANE_GRANT), 0);
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_LANE_SUPPRESSION));
+  ASSERT_LE(TestGetTickerCount(options, SCAN_FUSE_LANE_MANAGER_OWNED_PEAK),
+            static_cast<uint64_t>(snapshot.budget));
+  ASSERT_LE(TestGetTickerCount(options, SCAN_FUSE_LANE_TOTAL_LIVE_PEAK),
+            static_cast<uint64_t>(snapshot.budget));
+
+  iter.reset();
+  snapshot = manager->GetSnapshot();
+  ASSERT_EQ(0u, snapshot.active_owners);
+  ASSERT_EQ(0u, snapshot.manager_owned);
+  ASSERT_EQ(0u, snapshot.in_flight);
+  ASSERT_EQ(0u, snapshot.total_live);
+  ASSERT_GT(TestGetTickerCount(options, SCAN_FUSE_LANE_REVOCATION), 0);
+}
+
+TEST_P(DBIteratorTest, ScanFuseRecencyAdmissionBypassesColdSource) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+    ASSERT_OK(Put(Key(i + 3), ScanFuseValue(i + 3)));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_EQ(3, NumTableFilesAtLevel(-1));
+  ResetScanFuseTickers(options.statistics.get());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "ScanFuseResolver::CursorCapacity",
+      [](void* arg) { *static_cast<size_t*>(arg) = 2; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_EQ(Key(index), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(index), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(6, index);
+
+  ASSERT_EQ(6, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(2, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(4, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(2, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+  ASSERT_EQ(2, TestGetTickerCount(options, SCAN_FUSE_CURSOR_BYPASS));
+}
+
+TEST_P(DBIteratorTest, ScanFuseRecencyAdmissionPromotesHotSource) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(0), ScanFuseValue(0)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put(Key(1), ScanFuseValue(1)));
+  ASSERT_OK(Flush());
+  for (int i = 2; i < 5; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_EQ(3, NumTableFilesAtLevel(-1));
+  ResetScanFuseTickers(options.statistics.get());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "ScanFuseResolver::CursorCapacity",
+      [](void* arg) { *static_cast<size_t*>(arg) = 2; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_EQ(Key(index), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(index), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(5, index);
+
+  ASSERT_EQ(5, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(4, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_BYPASS));
+}
+
+TEST_P(DBIteratorTest, ScanFuseMergeUsesLegacyLookup) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.merge_operator = MergeOperators::CreateStringAppendTESTOperator();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(0), ScanFuseValue(0)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Merge(Key(0), ScanFuseValue(1)));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(2, NumTableFilesAtLevel(-1));
+  ResetScanFuseTickers(options.statistics.get());
+
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(0), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(0) + "," + ScanFuseValue(1),
+            iter->value().ToString());
+  ASSERT_OK(iter->status());
+
+  ASSERT_EQ(2, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+}
+
+TEST_P(DBIteratorTest, ScanFuseReopen) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+  }
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(1, NumTableFilesAtLevel(-1));
+  ResetScanFuseTickers(options.statistics.get());
+
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_EQ(Key(index), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(index), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(8, index);
+
+  ASSERT_EQ(8, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(7, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(7, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+}
+
+TEST_P(DBIteratorTest, ScanFuseCursorCreationFailureFallsBack) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(0), ScanFuseValue(0)));
+  ASSERT_OK(Flush());
+  ResetScanFuseTickers(options.statistics.get());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::NewValueIterator:Status", [](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("injected cursor failure");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::unique_ptr<Iterator> iter(NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(Key(0), iter->key().ToString());
+  ASSERT_EQ(ScanFuseValue(0), iter->value().ToString());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(1, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(1, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
+}
+
+TEST_P(DBIteratorTest, ScanFuseTailingUsesLegacyLookup) {
+  Options options = CurrentOptions();
+  options.statistics = TERARKDB_NAMESPACE::CreateDBStatistics();
+  options.blob_size = 32;
+  options.target_blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put(Key(i), ScanFuseValue(i)));
+  }
+  ASSERT_OK(Flush());
+  ResetScanFuseTickers(options.statistics.get());
+
+  ReadOptions read_options;
+  read_options.tailing = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ASSERT_EQ(Key(index), iter->key().ToString());
+    ASSERT_EQ(ScanFuseValue(index), iter->value().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(2, index);
+
+  ASSERT_EQ(2, TestGetTickerCount(options, READ_BLOB_VALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, READ_BLOB_INVALID));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_HIT));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_MISS));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_FALLBACK));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_ADVANCE));
+  ASSERT_EQ(0, TestGetTickerCount(options, SCAN_FUSE_CURSOR_EVICTION));
 }
 
 TEST_P(DBIteratorTest, IterNextWithNewerSeq) {

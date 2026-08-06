@@ -568,7 +568,12 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
         index_key_is_full_(index_key_is_full),
         for_compaction_(for_compaction) {}
 
-  ~BlockBasedTableIteratorBase() { delete index_iter_; }
+  ~BlockBasedTableIteratorBase() {
+    if (readahead_lane_provider_ != nullptr) {
+      readahead_lane_provider_->Release(readahead_owner_, readahead_source_);
+    }
+    delete index_iter_;
+  }
 
   void Seek(const Slice& target) override;
   void SeekForPrev(const Slice& target) override;
@@ -595,6 +600,15 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   }
 
   bool IsOutOfBound() override { return is_out_of_bound_; }
+
+  void SetReadaheadLaneProvider(
+      std::shared_ptr<ReadaheadLaneProvider> provider, uint64_t owner,
+      uint64_t source) override {
+    readahead_lane_provider_ = std::move(provider);
+    readahead_owner_ = owner;
+    readahead_source_ = source;
+    prefetch_buffer_.reset();
+  }
 
   bool CheckPrefixMayMatch(const Slice& ikey) {
     if (check_filter_ &&
@@ -658,6 +672,9 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   size_t readahead_limit_ = 0;
   int num_file_reads_ = 0;
   std::unique_ptr<FilePrefetchBuffer> prefetch_buffer_;
+  std::shared_ptr<ReadaheadLaneProvider> readahead_lane_provider_;
+  uint64_t readahead_owner_ = 0;
+  uint64_t readahead_source_ = 0;
 };
 
 template <class TBlockIter, typename TValue = Slice>

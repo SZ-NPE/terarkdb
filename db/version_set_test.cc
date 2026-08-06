@@ -9,7 +9,12 @@
 
 #include "db/version_set.h"
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #include "db/log_writer.h"
+#include "env/mock_env.h"
 #include "rocksdb/terark_namespace.h"
 #include "table/mock_table.h"
 #include "util/logging.h"
@@ -18,6 +23,208 @@
 #include "util/testutil.h"
 
 namespace TERARKDB_NAMESPACE {
+
+TEST(ReadaheadLaneManagerTest, BudgetAndOwnerRebalance) {
+  std::unique_ptr<Env> env(NewMemEnv(Env::Default()));
+  std::unique_ptr<WritableFile> writable;
+  ASSERT_OK(env->NewWritableFile("/lane-test", &writable, EnvOptions()));
+  ASSERT_OK(writable->Append("lane"));
+  ASSERT_OK(writable->Close());
+  std::unique_ptr<RandomAccessFile> file;
+  ASSERT_OK(env->NewRandomAccessFile("/lane-test", &file, EnvOptions()));
+  RandomAccessFileReader reader(std::move(file), "/lane-test", env.get());
+
+  ReadaheadLaneManager manager(2);
+  uint64_t first = manager.RegisterOwner(nullptr, 2);
+  uint64_t second = manager.RegisterOwner(nullptr, 2);
+  ASSERT_NE(nullptr, manager.Acquire(first, 1, &reader, 4096, 16384));
+  manager.FinishOperation(first, 1);
+  ASSERT_NE(nullptr, manager.Acquire(second, 2, &reader, 4096, 16384));
+  manager.FinishOperation(second, 2);
+
+  auto snapshot = manager.GetSnapshot();
+  ASSERT_EQ(2u, snapshot.budget);
+  ASSERT_EQ(2u, snapshot.registered_owners);
+  ASSERT_EQ(2u, snapshot.active_owners);
+  ASSERT_EQ(2u, snapshot.manager_owned);
+  ASSERT_EQ(0u, snapshot.in_flight);
+
+  ASSERT_EQ(nullptr, manager.Acquire(first, 3, &reader, 4096, 16384));
+  snapshot = manager.GetSnapshot();
+  ASSERT_EQ(2u, snapshot.manager_owned);
+  ASSERT_GE(snapshot.denials, 1u);
+  manager.Release(first, 1);
+  ASSERT_NE(nullptr, manager.Acquire(first, 3, &reader, 4096, 16384));
+  manager.FinishOperation(first, 3);
+
+  manager.ReleaseOwner(first);
+  snapshot = manager.GetSnapshot();
+  ASSERT_EQ(1u, snapshot.registered_owners);
+  ASSERT_EQ(1u, snapshot.active_owners);
+  ASSERT_LE(snapshot.manager_owned, 1u);
+  ASSERT_NE(nullptr, manager.Acquire(second, 4, &reader, 4096, 16384));
+  manager.FinishOperation(second, 4);
+  ASSERT_EQ(nullptr, manager.Acquire(second, 5, &reader, 4096, 16384));
+  manager.Release(second, 2);
+  ASSERT_NE(nullptr, manager.Acquire(second, 5, &reader, 4096, 16384));
+  manager.FinishOperation(second, 5);
+  snapshot = manager.GetSnapshot();
+  ASSERT_EQ(2u, snapshot.manager_owned);
+
+  manager.ReleaseOwner(second);
+  snapshot = manager.GetSnapshot();
+  ASSERT_EQ(0u, snapshot.registered_owners);
+  ASSERT_EQ(0u, snapshot.active_owners);
+  ASSERT_EQ(0u, snapshot.manager_owned);
+  ASSERT_EQ(0u, snapshot.total_live);
+}
+
+TEST(ReadaheadLaneManagerTest, ZeroBudget) {
+  std::unique_ptr<Env> env(NewMemEnv(Env::Default()));
+  std::unique_ptr<WritableFile> writable;
+  ASSERT_OK(env->NewWritableFile("/lane-test", &writable, EnvOptions()));
+  ASSERT_OK(writable->Append("lane"));
+  ASSERT_OK(writable->Close());
+  std::unique_ptr<RandomAccessFile> file;
+  ASSERT_OK(env->NewRandomAccessFile("/lane-test", &file, EnvOptions()));
+  RandomAccessFileReader reader(std::move(file), "/lane-test", env.get());
+
+  ReadaheadLaneManager manager(0);
+  uint64_t owner = manager.RegisterOwner(nullptr, 1);
+  ASSERT_EQ(nullptr, manager.Acquire(owner, 1, &reader, 4096, 16384));
+  auto snapshot = manager.GetSnapshot();
+  ASSERT_EQ(0u, snapshot.manager_owned);
+  ASSERT_EQ(1u, snapshot.denials);
+  manager.ReleaseOwner(owner);
+}
+
+TEST(ReadaheadLaneManagerTest, ConcurrentBudget) {
+  std::unique_ptr<Env> env(NewMemEnv(Env::Default()));
+  std::unique_ptr<WritableFile> writable;
+  ASSERT_OK(env->NewWritableFile("/lane-test", &writable, EnvOptions()));
+  ASSERT_OK(writable->Append("lane"));
+  ASSERT_OK(writable->Close());
+  std::unique_ptr<RandomAccessFile> file;
+  ASSERT_OK(env->NewRandomAccessFile("/lane-test", &file, EnvOptions()));
+  RandomAccessFileReader reader(std::move(file), "/lane-test", env.get());
+
+  ReadaheadLaneManager manager(4);
+  std::vector<uint64_t> owners;
+  for (int index = 0; index < 16; ++index) {
+    owners.push_back(manager.RegisterOwner(nullptr, 1));
+  }
+  std::atomic<bool> failed(false);
+  std::vector<std::thread> threads;
+  for (size_t index = 0; index < 4; ++index) {
+    threads.emplace_back([&, index] {
+      for (int operation = 0; operation < 100; ++operation) {
+        auto buffer =
+            manager.Acquire(owners[index], 0, &reader, 4096, 16384);
+        if (buffer == nullptr) {
+          failed.store(true);
+        } else {
+          manager.FinishOperation(owners[index], 0);
+        }
+        auto snapshot = manager.GetSnapshot();
+        if (snapshot.manager_owned > snapshot.budget ||
+            snapshot.total_live > snapshot.budget + snapshot.in_flight) {
+          failed.store(true);
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  ASSERT_FALSE(failed.load());
+  auto snapshot = manager.GetSnapshot();
+  ASSERT_LE(snapshot.manager_owned, snapshot.budget);
+  ASSERT_EQ(0u, snapshot.in_flight);
+
+  std::vector<bool> received(owners.size(), false);
+  for (int round = 0; round < 128; ++round) {
+    for (size_t index = 0; index < owners.size(); ++index) {
+      auto buffer =
+          manager.Acquire(owners[index], 0, &reader, 4096, 16384);
+      if (buffer != nullptr) {
+        received[index] = true;
+        manager.FinishOperation(owners[index], 0);
+      }
+    }
+  }
+  for (bool value : received) {
+    ASSERT_TRUE(value);
+  }
+  for (uint64_t owner : owners) {
+    manager.ReleaseOwner(owner);
+  }
+  snapshot = manager.GetSnapshot();
+  ASSERT_EQ(0u, snapshot.manager_owned);
+  ASSERT_EQ(0u, snapshot.total_live);
+}
+
+TEST(ReadaheadLaneManagerTest, SuppressesWideSourceSet) {
+  std::unique_ptr<Env> env(NewMemEnv(Env::Default()));
+  std::unique_ptr<WritableFile> writable;
+  ASSERT_OK(env->NewWritableFile("/lane-test", &writable, EnvOptions()));
+  ASSERT_OK(writable->Append("lane"));
+  ASSERT_OK(writable->Close());
+  std::unique_ptr<RandomAccessFile> file;
+  ASSERT_OK(env->NewRandomAccessFile("/lane-test", &file, EnvOptions()));
+  RandomAccessFileReader reader(std::move(file), "/lane-test", env.get());
+
+  ReadaheadLaneManager manager(16);
+  uint64_t owner = manager.RegisterOwner(nullptr, 182);
+  ASSERT_EQ(nullptr, manager.Acquire(owner, 1, &reader, 4096, 16384));
+  auto snapshot = manager.GetSnapshot();
+  ASSERT_EQ(1u, snapshot.registered_owners);
+  ASSERT_EQ(0u, snapshot.active_owners);
+  ASSERT_EQ(0u, snapshot.manager_owned);
+  ASSERT_EQ(1u, snapshot.denials);
+  manager.ReleaseOwner(owner);
+}
+
+TEST(ReadaheadLaneManagerTest, SuppressesAggregateSourcePressure) {
+  std::unique_ptr<Env> env(NewMemEnv(Env::Default()));
+  std::unique_ptr<WritableFile> writable;
+  ASSERT_OK(env->NewWritableFile("/lane-test", &writable, EnvOptions()));
+  ASSERT_OK(writable->Append("lane"));
+  ASSERT_OK(writable->Close());
+  std::unique_ptr<RandomAccessFile> file;
+  ASSERT_OK(env->NewRandomAccessFile("/lane-test", &file, EnvOptions()));
+  RandomAccessFileReader reader(std::move(file), "/lane-test", env.get());
+
+  ReadaheadLaneManager manager(16);
+  std::vector<uint64_t> owners;
+  for (int index = 0; index < 4; ++index) {
+    owners.push_back(manager.RegisterOwner(nullptr, 14));
+  }
+  ASSERT_NE(nullptr, manager.Acquire(owners[0], 1, &reader, 4096, 16384));
+  manager.FinishOperation(owners[0], 1);
+  auto snapshot = manager.GetSnapshot();
+  ASSERT_EQ(4u, snapshot.active_owners);
+  ASSERT_EQ(1u, snapshot.manager_owned);
+
+  owners.push_back(manager.RegisterOwner(nullptr, 14));
+  snapshot = manager.GetSnapshot();
+  ASSERT_EQ(5u, snapshot.registered_owners);
+  ASSERT_EQ(0u, snapshot.active_owners);
+  ASSERT_EQ(0u, snapshot.manager_owned);
+  for (uint64_t owner : owners) {
+    ASSERT_EQ(nullptr, manager.Acquire(owner, 1, &reader, 4096, 16384));
+  }
+
+  manager.ReleaseOwner(owners.back());
+  owners.pop_back();
+  snapshot = manager.GetSnapshot();
+  ASSERT_EQ(4u, snapshot.registered_owners);
+  ASSERT_EQ(4u, snapshot.active_owners);
+  ASSERT_NE(nullptr, manager.Acquire(owners[0], 1, &reader, 4096, 16384));
+  manager.FinishOperation(owners[0], 1);
+  for (uint64_t owner : owners) {
+    manager.ReleaseOwner(owner);
+  }
+}
 
 class GenerateLevelFilesBriefTest : public testing::Test {
  public:

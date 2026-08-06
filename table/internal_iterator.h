@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <stdint.h>
+
+#include <memory>
 #include <string>
 
 #include "rocksdb/comparator.h"
@@ -16,6 +19,24 @@
 #include "table/format.h"
 
 namespace TERARKDB_NAMESPACE {
+
+class FilePrefetchBuffer;
+class RandomAccessFileReader;
+class Statistics;
+
+class ReadaheadLaneProvider {
+ public:
+  virtual ~ReadaheadLaneProvider() = default;
+
+  virtual uint64_t RegisterOwner(Statistics* statistics,
+                                 size_t source_upper_bound) = 0;
+  virtual void ReleaseOwner(uint64_t owner) = 0;
+  virtual std::shared_ptr<FilePrefetchBuffer> Acquire(
+      uint64_t owner, uint64_t source, RandomAccessFileReader* file_reader,
+      size_t initial_readahead_size, size_t maximum_readahead_size) = 0;
+  virtual void FinishOperation(uint64_t owner, uint64_t source) = 0;
+  virtual void Release(uint64_t owner, uint64_t source) = 0;
+};
 
 class InternalIteratorCommon : public Cleanable {
  public:
@@ -76,6 +97,10 @@ class InternalIteratorCommon : public Cleanable {
   virtual Status GetProperty(std::string /*prop_name*/, std::string* /*prop*/) {
     return Status::NotSupported("");
   }
+
+  virtual void SetReadaheadLaneProvider(
+      std::shared_ptr<ReadaheadLaneProvider> /*provider*/, uint64_t /*owner*/,
+      uint64_t /*source*/) {}
 
  protected:
   void SeekForPrevImpl(const Slice& target, const Comparator* cmp) {

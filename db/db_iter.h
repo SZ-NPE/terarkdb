@@ -26,6 +26,7 @@ namespace TERARKDB_NAMESPACE {
 
 class Arena;
 class DBIter;
+class Version;
 struct SVDestructCallback;
 
 // Return a new iterator that converts internal keys (yielded by
@@ -39,7 +40,8 @@ extern Iterator* NewDBIterator(
     SVDestructCallback* sv_destruct_callback, const SequenceNumber& sequence,
     const SeparateHelper* separate_helper,
     uint64_t max_sequential_skip_in_iterations, ReadCallback* read_callback,
-    DBImpl* db_impl = nullptr, ColumnFamilyData* cfd = nullptr);
+    DBImpl* db_impl = nullptr, ColumnFamilyData* cfd = nullptr,
+    const Version* scan_fuse_version = nullptr);
 
 // A wrapper iterator which wraps DB Iterator and the arena, with which the DB
 // iterator is supposed be allocated. This class is used as an entry point of
@@ -59,7 +61,8 @@ class ArenaWrappedDBIter : public Iterator {
   // a merging iterator.
   virtual void SetIterUnderDBIter(InternalIterator* iter,
                                   SVDestructCallback* sv_destruct_callback,
-                                  const SeparateHelper* separate_helper);
+                                  const SeparateHelper* separate_helper,
+                                  const Version* scan_fuse_version = nullptr);
   virtual bool Valid() const override;
   virtual void SeekToFirst() override;
   virtual void SeekToLast() override;

@@ -9,6 +9,10 @@
 
 #include "db/version_set.h"
 
+#ifndef TERARKDB_DUOCURSOR_LANE_BUDGET
+#define TERARKDB_DUOCURSOR_LANE_BUDGET 16
+#endif
+
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
 #endif
@@ -1285,35 +1289,7 @@ Status Version::fetch_buffer(LazyBuffer* buffer) const {
   } else {
     RecordTick(db_statistics_, READ_BLOB_VALID);
   }
-  bool value_found = false;
-  SequenceNumber context_seq;
-  GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
-                         cfd_->ioptions()->info_log, db_statistics_,
-                         GetContext::kNotFound, user_key, buffer, &value_found,
-                         nullptr, nullptr, nullptr, env_, &context_seq);
-  IterKey iter_key;
-  iter_key.SetInternalKey(user_key, sequence, kValueTypeForSeek);
-  auto s = table_cache_->Get(
-      ReadOptions(), *pair.second, storage_info_.dependence_map(),
-      iter_key.GetInternalKey(), &get_context,
-      mutable_cf_options_.prefix_extractor.get(), nullptr, true);
-  if (!s.ok()) {
-    return s;
-  }
-  if (context_seq != sequence || (get_context.State() != GetContext::kFound &&
-                                  get_context.State() != GetContext::kMerge)) {
-    if (get_context.State() == GetContext::kCorrupt) {
-      return std::move(get_context).CorruptReason();
-    } else {
-      char buf[128];
-      snprintf(buf, sizeof buf,
-               "file number = %" PRIu64 "(%" PRIu64 "), sequence = %" PRIu64,
-               pair.second->fd.GetNumber(), pair.first, sequence);
-      return Status::Corruption("Separate value missing", buf);
-    }
-  }
-  assert(buffer->file_number() == pair.second->fd.GetNumber());
-  return Status::OK();
+  return FetchValueByFileNumber(user_key, sequence, pair.first, buffer);
 }
 
 LazyBuffer Version::TransToCombined(const Slice& user_key, uint64_t sequence,
@@ -1334,6 +1310,93 @@ LazyBuffer Version::TransToCombined(const Slice& user_key, uint64_t sequence,
          reinterpret_cast<uint64_t>(&*find)},
         Slice::Invalid(), find->second->fd.GetNumber());
   }
+}
+
+const FileMetaData* Version::ResolveValueFile(uint64_t file_number) const {
+  auto find = storage_info_.dependence_map().find(file_number);
+  return find == storage_info_.dependence_map().end() ? nullptr
+                                                       : find->second;
+}
+
+size_t Version::ValueFileCount() const {
+  return storage_info_.LevelFiles(-1).size();
+}
+
+bool Version::UsesDirectReads() const { return env_options_.use_direct_reads; }
+
+InternalIterator* Version::NewValueIterator(
+    const ReadOptions& read_options, const FileMetaData& file_meta,
+    uint64_t readahead_owner) const {
+  InternalIterator* iter = table_cache_->NewIterator(
+      read_options, env_options_, file_meta, storage_info_.dependence_map(),
+      nullptr /* range_del_agg */, mutable_cf_options_.prefix_extractor.get(),
+      nullptr /* table_reader_ptr */, nullptr /* file_read_hist */,
+      false /* for_compaction */, nullptr /* arena */, false /* skip_filters */,
+      -1 /* level */);
+  if (readahead_owner != 0) {
+    iter->SetReadaheadLaneProvider(vset_->readahead_lane_manager(),
+                                   readahead_owner,
+                                   file_meta.fd.GetNumber());
+  }
+#ifndef NDEBUG
+  Status injected_status;
+  TEST_SYNC_POINT_CALLBACK("Version::NewValueIterator:Status",
+                           &injected_status);
+  if (!injected_status.ok()) {
+    delete iter;
+    return NewErrorInternalIterator<LazyBuffer>(injected_status);
+  }
+#endif
+  return iter;
+}
+
+std::shared_ptr<ReadaheadLaneProvider>
+Version::GetReadaheadLaneProvider() const {
+  return vset_->readahead_lane_manager();
+}
+
+int Version::CompareInternalKeys(const Slice& lhs, const Slice& rhs) const {
+  return internal_comparator()->Compare(lhs, rhs);
+}
+
+Status Version::FetchValueByFileNumber(const Slice& user_key,
+                                       SequenceNumber sequence,
+                                       uint64_t file_number,
+                                       LazyBuffer* value) const {
+  const FileMetaData* file_meta = ResolveValueFile(file_number);
+  if (file_meta == nullptr) {
+    return Status::Corruption("Separate value dependence missing");
+  }
+
+  bool value_found = false;
+  SequenceNumber context_seq;
+  GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
+                         cfd_->ioptions()->info_log, db_statistics_,
+                         GetContext::kNotFound, user_key, value, &value_found,
+                         nullptr, nullptr, nullptr, env_, &context_seq);
+  IterKey iter_key;
+  iter_key.SetInternalKey(user_key, sequence, kValueTypeForSeek);
+  auto s = table_cache_->Get(
+      ReadOptions(), *file_meta, storage_info_.dependence_map(),
+      iter_key.GetInternalKey(), &get_context,
+      mutable_cf_options_.prefix_extractor.get(), nullptr, true);
+  if (!s.ok()) {
+    return s;
+  }
+  if (context_seq != sequence || (get_context.State() != GetContext::kFound &&
+                                  get_context.State() != GetContext::kMerge)) {
+    if (get_context.State() == GetContext::kCorrupt) {
+      return std::move(get_context).CorruptReason();
+    }
+
+    char buf[128];
+    snprintf(buf, sizeof buf,
+             "file number = %" PRIu64 "(%" PRIu64 "), sequence = %" PRIu64,
+             file_meta->fd.GetNumber(), file_number, sequence);
+    return Status::Corruption("Separate value missing", buf);
+  }
+  assert(value->file_number() == file_meta->fd.GetNumber());
+  return Status::OK();
 }
 
 void Version::Get(const ReadOptions& read_options, const Slice& user_key,
@@ -2983,7 +3046,13 @@ VersionSet::VersionSet(const std::string& dbname,
       manifest_file_size_(0),
       manifest_edit_count_(0),
       seq_per_batch_(seq_per_batch),
-      env_options_(storage_options) {}
+      env_options_(storage_options) {
+  size_t readahead_lane_budget = TERARKDB_DUOCURSOR_LANE_BUDGET;
+  TEST_SYNC_POINT_CALLBACK("VersionSet::ReadaheadLaneBudget",
+                           &readahead_lane_budget);
+  readahead_lane_manager_ =
+      std::make_shared<ReadaheadLaneManager>(readahead_lane_budget);
+}
 
 void CloseTables(void* ptr, size_t) {
   TableReader* table_reader = reinterpret_cast<TableReader*>(ptr);
