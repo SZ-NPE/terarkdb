@@ -45,6 +45,9 @@ MAX_WRITE_BUFFER_NUMBER=${MAX_WRITE_BUFFER_NUMBER:-4}
 NUM_LEVELS=${NUM_LEVELS:-5}
 L1_SIZE=${L1_SIZE:-$((256 * MB_SIZE))}
 OPEN_FILES=${OPEN_FILES:--1}
+MAX_DEPENDENCE_BLOB_OVERLAP=${MAX_DEPENDENCE_BLOB_OVERLAP:-1024}
+SEED=${SEED:-0}
+REPORT_FILE_OPERATIONS=${REPORT_FILE_OPERATIONS:-false}
 
 # Run exactly one GC policy per pipeline invocation. "baseline" is for
 # dev.1.4, which does not recognize strategy-specific db_bench flags.
@@ -256,6 +259,8 @@ base_flags() {
   add_flag base_out sync false
   add_flag base_out statistics true
   add_flag base_out histogram true
+  add_flag base_out seed "${SEED}"
+  add_flag base_out report_file_operations "${REPORT_FILE_OPERATIONS}"
   add_flag base_out stats_interval_seconds 60
   add_flag base_out compression_type none
   add_flag base_out use_terark_table false
@@ -294,7 +299,8 @@ base_flags() {
         "${BLOB_GC_CEPH_MAX_FILES_PER_CYCLE}"
       ;;
   esac
-  add_flag base_out max_dependence_blob_overlap 1024
+  add_flag base_out max_dependence_blob_overlap \
+    "${MAX_DEPENDENCE_BLOB_OVERLAP}"
   add_flag base_out maintainer_job_ratio 0
   add_flag base_out verify_checksum true
 }
