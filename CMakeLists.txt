@@ -596,6 +596,8 @@ set(SOURCES
         db/flush_job.cc
         db/flush_scheduler.cc
         db/forward_iterator.cc
+        db/hot_region.cc
+        db/hot_key_write_buffer.cc
         db/internal_stats.cc
         db/logs_with_prep_tracker.cc
         db/log_reader.cc
@@ -1030,6 +1032,9 @@ if(WITH_TESTS)
         db/file_indexer_test.cc
         db/filename_test.cc
         db/flush_job_test.cc
+        db/hot_region_test.cc
+        db/hot_key_write_buffer_test.cc
+        db/key_hotness_tracker_test.cc
         db/listener_test.cc
         db/log_test.cc
         db/manual_compaction_test.cc

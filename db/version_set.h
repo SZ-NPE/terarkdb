@@ -1070,8 +1070,9 @@ class VersionSet {
       }
       // It's safe to ignore dropped column families here:
       // cfd->IsDropped() becomes true after the drop is persisted in MANIFEST.
-      if (min_log_num > cfd->GetLogNumber() && !cfd->IsDropped()) {
-        min_log_num = cfd->GetLogNumber();
+      const uint64_t oldest_log = cfd->OldestLogToKeep();
+      if (min_log_num > oldest_log && !cfd->IsDropped()) {
+        min_log_num = oldest_log;
       }
     }
     return min_log_num;

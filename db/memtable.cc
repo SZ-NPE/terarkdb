@@ -702,6 +702,48 @@ bool MemTable::Add(SequenceNumber s, ValueType type,
   return true;
 }
 
+bool MemTable::AddMaterializedMutation(SequenceNumber sequence,
+                                       ValueType type, const Slice& key,
+                                       const Slice& value) {
+  InternalKey internal_key(key, sequence, type);
+  const size_t encoded_length =
+      MemTableRep::EncodeKeyValueSize(internal_key.Encode(), value);
+  if (!table_->InsertKeyValue(internal_key.Encode(), value)) {
+    return false;
+  }
+
+  num_entries_.store(num_entries_.load(std::memory_order_relaxed) + 1,
+                     std::memory_order_relaxed);
+  data_size_.store(data_size_.load(std::memory_order_relaxed) + encoded_length,
+                   std::memory_order_relaxed);
+  if (type == kTypeDeletion) {
+    num_deletes_.store(num_deletes_.load(std::memory_order_relaxed) + 1,
+                       std::memory_order_relaxed);
+  }
+  if (prefix_bloom_ != nullptr) {
+    assert(prefix_extractor_ != nullptr);
+    prefix_bloom_->Add(prefix_extractor_->Transform(key));
+  }
+
+  uint64_t first_sequence = first_seqno_.load(std::memory_order_relaxed);
+  while ((first_sequence == 0 || sequence < first_sequence) &&
+         !first_seqno_.compare_exchange_weak(
+             first_sequence, sequence, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
+  uint64_t earliest_sequence =
+      earliest_seqno_.load(std::memory_order_relaxed);
+  while ((earliest_sequence == kMaxSequenceNumber ||
+          sequence < earliest_sequence) &&
+         !earliest_seqno_.compare_exchange_weak(
+             earliest_sequence, sequence, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
+  UpdateOldestKeyTime();
+  UpdateFlushState();
+  return true;
+}
+
 // Callback from MemTable::Get()
 namespace {
 

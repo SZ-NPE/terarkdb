@@ -87,6 +87,12 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"verify_checksums_in_compaction", "false"},
       {"max_sequential_skip_in_iterations", "24"},
       {"enable_lazy_compaction", "true"},
+      {"enable_hot_key_write_buffer", "true"},
+      {"hot_key_write_buffer_size", "1048576"},
+      {"hot_key_admission_threshold", "8"},
+      {"hot_key_sketch_columns", "32768"},
+      {"hot_key_sketch_decay_interval", "4096"},
+      {"hot_key_max_buffered_value_size", "65536"},
       {"pin_table_properties_in_reader", "false"},
       {"inplace_update_support", "true"},
       {"report_bg_io_stats", "true"},
@@ -204,6 +210,12 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.max_sequential_skip_in_iterations,
             static_cast<uint64_t>(24));
   ASSERT_EQ(new_cf_opt.enable_lazy_compaction, true);
+  ASSERT_EQ(new_cf_opt.enable_hot_key_write_buffer, true);
+  ASSERT_EQ(new_cf_opt.hot_key_write_buffer_size, 1048576U);
+  ASSERT_EQ(new_cf_opt.hot_key_admission_threshold, 8U);
+  ASSERT_EQ(new_cf_opt.hot_key_sketch_columns, 32768U);
+  ASSERT_EQ(new_cf_opt.hot_key_sketch_decay_interval, 4096U);
+  ASSERT_EQ(new_cf_opt.hot_key_max_buffered_value_size, 65536U);
   ASSERT_EQ(new_cf_opt.pin_table_properties_in_reader, false);
   ASSERT_EQ(new_cf_opt.inplace_update_support, true);
   ASSERT_EQ(new_cf_opt.inplace_update_num_locks, 25U);

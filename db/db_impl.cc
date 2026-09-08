@@ -82,6 +82,7 @@
 #include "util/filename.h"
 #include "util/log_buffer.h"
 #include "util/logging.h"
+#include "util/mutexlock.h"
 #include "util/sst_file_manager_impl.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
@@ -313,7 +314,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       low_pri_write_rate_limiter_(NewGenericRateLimiter(std::min(
           static_cast<int64_t>(mutable_db_options_.delayed_write_rate / 8),
           kDefaultLowPriThrottledRate))),
-      last_batch_group_size_(0),
+      last_batch_group_memtable_size_(0),
       unscheduled_flushes_(0),
       unscheduled_compactions_(0),
       unscheduled_garbage_collections_(0),
@@ -591,9 +592,26 @@ Status DBImpl::ResumeImpl() {
 void DBImpl::WaitForBackgroundWork() {
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_) {
+         bg_flush_scheduled_ ||
+         bg_hot_region_scheduled_.load(std::memory_order_relaxed) != 0) {
     bg_cv_.Wait();
   }
+}
+
+Status DBImpl::WaitForCompact() {
+  InstrumentedMutexLock lock(&mutex_);
+  while ((bg_bottom_compaction_scheduled_ != 0 ||
+          bg_compaction_scheduled_ != 0 || bg_flush_scheduled_ != 0 ||
+          bg_hot_region_scheduled_.load(std::memory_order_relaxed) != 0 ||
+          bg_garbage_collection_scheduled_ != 0 ||
+          unscheduled_flushes_ != 0 || unscheduled_compactions_ != 0 ||
+          unscheduled_garbage_collections_ != 0 ||
+          pending_purge_obsolete_files_ != 0 || bg_purge_scheduled_ != 0) &&
+         error_handler_.GetBGError().ok()) {
+    MaybeScheduleFlushOrCompaction();
+    bg_cv_.Wait();
+  }
+  return error_handler_.GetBGError();
 }
 
 // Will lock the mutex_,  will wait for completion if wait is true
@@ -613,7 +631,10 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
       !mutable_db_options_.avoid_flush_during_shutdown) {
     autovector<ColumnFamilyData*> cfds;
     for (auto cfd : *versions_->GetColumnFamilySet()) {
-      if (!cfd->IsDropped() && cfd->initialized() && !cfd->mem()->IsEmpty()) {
+      const bool has_buffered_hot_keys =
+          cfd->hot_region() != nullptr && !cfd->hot_region()->empty();
+      if (!cfd->IsDropped() && cfd->initialized() &&
+          (!cfd->mem()->IsEmpty() || has_buffered_hot_keys)) {
         cfd->Ref();
         cfds.push_back(cfd);
       }
@@ -658,12 +679,16 @@ Status DBImpl::CloseHelper() {
   int bg_unscheduled = env_->UnSchedule(this, Env::Priority::BOTTOM);
   bg_unscheduled += env_->UnSchedule(this, Env::Priority::LOW);
   bg_unscheduled += env_->UnSchedule(this, Env::Priority::HIGH);
+  env_->UnSchedule(&bg_hot_region_scheduled_, Env::Priority::LOW);
 
   // Wait for background work to finish
   while (true) {
     int bg_scheduled = bg_bottom_compaction_scheduled_ +
                        bg_compaction_scheduled_ + bg_flush_scheduled_ +
-                       bg_purge_scheduled_ - bg_unscheduled;
+                       bg_purge_scheduled_ +
+                       bg_hot_region_scheduled_.load(
+                           std::memory_order_relaxed) -
+                       bg_unscheduled;
     if (bg_scheduled || pending_purge_obsolete_files_ ||
         error_handler_.IsRecoveryInProgress() || !console_runner_.closed_) {
       TEST_SYNC_POINT("DBImpl::~DBImpl:WaitJob");
@@ -672,6 +697,7 @@ Status DBImpl::CloseHelper() {
       bg_bottom_compaction_scheduled_ = 0;
       bg_compaction_scheduled_ = 0;
       bg_flush_scheduled_ = 0;
+      bg_hot_region_scheduled_.store(0, std::memory_order_relaxed);
       bg_purge_scheduled_ = 0;
       break;
     }
@@ -2034,8 +2060,16 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
     }
   }
 
-  // Acquire SuperVersion
-  SuperVersion* sv = GetAndRefSuperVersion(cfd);
+  std::unique_ptr<ReadLock> hot_key_publish_lock;
+  SuperVersion* sv = nullptr;
+  if (cfd->IsHotKeyWriteBufferEnabled()) {
+    mutex_.Lock();
+    hot_key_publish_lock.reset(new ReadLock(&hot_key_publish_mutex_));
+    sv = cfd->GetSuperVersion()->Ref();
+    mutex_.Unlock();
+  } else {
+    sv = GetAndRefSuperVersion(cfd);
+  }
 
   TEST_SYNC_POINT("DBImpl::GetImpl:1");
   TEST_SYNC_POINT("DBImpl::GetImpl:2");
@@ -2088,11 +2122,54 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
                         has_unpersisted_data_.load(std::memory_order_relaxed));
   bool done = false;
   if (!skip_memtable) {
-    if (sv->mem->Get(lkey, lazy_val, &s, &merge_context,
-                     &max_covering_tombstone_seq, read_options, callback)) {
+    std::string buffered_value;
+    SequenceNumber buffered_sequence = 0;
+    ValueType buffered_type = kTypeValue;
+    const bool buffered =
+        cfd->hot_region() != nullptr &&
+        cfd->hot_region()->Lookup(
+            key, snapshot, sv->mem->GetID(), &buffered_value,
+            &buffered_sequence, &buffered_type) &&
+        (callback == nullptr || callback->IsVisible(buffered_sequence));
+    hot_key_publish_lock.reset();
+    LazyBuffer memtable_value;
+    Status memtable_status;
+    SequenceNumber memtable_sequence = kMaxSequenceNumber;
+    const bool memtable_found =
+        sv->mem->Get(lkey, &memtable_value, &memtable_status, &merge_context,
+                     &max_covering_tombstone_seq, &memtable_sequence,
+                     read_options, callback);
+    if (memtable_found &&
+        (!buffered || memtable_sequence > buffered_sequence)) {
+      if (lazy_val != nullptr && memtable_status.ok()) {
+        *lazy_val = std::move(memtable_value);
+      }
+      if (value_found != nullptr) {
+        *value_found = memtable_status.ok();
+      }
+      s = memtable_status;
       done = true;
       RecordTick(stats_, MEMTABLE_HIT);
-    } else if ((s.ok() || s.IsMergeInProgress()) &&
+    } else if (buffered) {
+      if (buffered_type == kTypeValue) {
+        if (lazy_val != nullptr) {
+          lazy_val->reset(Slice(buffered_value), true);
+        }
+        if (value_found != nullptr) {
+          *value_found = true;
+        }
+        s = Status::OK();
+      } else {
+        if (value_found != nullptr) {
+          *value_found = false;
+        }
+        s = Status::NotFound();
+      }
+      done = true;
+    } else {
+      s = memtable_status;
+    }
+    if (!done && (s.ok() || s.IsMergeInProgress()) &&
                sv->imm->Get(lkey, lazy_val, &s, &merge_context,
                             &max_covering_tombstone_seq, read_options,
                             callback)) {
@@ -2100,9 +2177,15 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
       RecordTick(stats_, MEMTABLE_HIT);
     }
     if (!done && !s.ok() && !s.IsMergeInProgress()) {
-      ReturnAndCleanupSuperVersion(cfd, sv);
+      if (cfd->IsHotKeyWriteBufferEnabled()) {
+        CleanupSuperVersion(sv);
+      } else {
+        ReturnAndCleanupSuperVersion(cfd, sv);
+      }
       return s;
     }
+  } else {
+    hot_key_publish_lock.reset();
   }
   if (!done) {
     PERF_TIMER_GUARD(get_from_output_files_time);
@@ -2234,6 +2317,38 @@ std::vector<Status> DBImpl::MultiGet(
   PERF_TIMER_GUARD(get_snapshot_time);
 
   SequenceNumber snapshot;
+  SequenceNumber materialized_snapshot = kMaxSequenceNumber;
+  if (has_hot_key_write_buffer_.load(std::memory_order_relaxed)) {
+    mutex_.Lock();
+    WriteThread::Writer writer;
+    write_thread_.EnterUnbatched(&writer, &mutex_);
+    Status materialize_status;
+    {
+      WriteLock publish_lock(&hot_key_publish_mutex_);
+      for (auto* handle : column_family) {
+        auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(handle)->cfd();
+        materialize_status = MaterializeAllHotKeys(cfd);
+        if (!materialize_status.ok()) {
+          break;
+        }
+      }
+      if (materialize_status.ok()) {
+        materialized_snapshot =
+            read_options.snapshot != nullptr
+                ? reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)
+                      ->number_
+                : last_seq_same_as_publish_seq_
+                      ? versions_->LastSequence()
+                      : versions_->LastPublishedSequence();
+      }
+    }
+    write_thread_.ExitUnbatched(&writer);
+    mutex_.Unlock();
+    if (!materialize_status.ok()) {
+      values->assign(keys.size(), std::string());
+      return std::vector<Status>(keys.size(), materialize_status);
+    }
+  }
 
   struct MultiGetColumnFamilyData {
     ColumnFamilyData* cfd;
@@ -2252,7 +2367,9 @@ std::vector<Status> DBImpl::MultiGet(
   }
 
   mutex_.Lock();
-  if (read_options.snapshot != nullptr) {
+  if (materialized_snapshot != kMaxSequenceNumber) {
+    snapshot = materialized_snapshot;
+  } else if (read_options.snapshot != nullptr) {
     snapshot =
         reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)->number_;
   } else {
@@ -2530,6 +2647,15 @@ autovector<Status> DBImpl::CreateColumnFamilyImpl(
       s[i] = CheckCFPathsSupported(initial_db_options_, *cf_options[i]);
     }
     if (s[i].ok()) {
+      s[i] = CheckHotKeyWriteBufferSupported(*cf_options[i]);
+    }
+    if (s[i].ok() && cf_options[i]->enable_hot_key_write_buffer &&
+        (seq_per_batch_ || two_write_queues_ || allow_2pc())) {
+      s[i] = Status::NotSupported(
+          "hot-key write buffering does not support transactional write "
+          "queues");
+    }
+    if (s[i].ok()) {
       for (auto& cf_path : cf_options[i]->cf_paths) {
         s[i] = env_->CreateDirIfMissing(cf_path.path);
         if (!s[i].ok()) {
@@ -2620,6 +2746,9 @@ autovector<Status> DBImpl::CreateColumnFamilyImpl(
         auto* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(
             *column_family_name[i]);
         assert(cfd != nullptr);
+        if (cfd->IsHotKeyWriteBufferEnabled()) {
+          has_hot_key_write_buffer_.store(true, std::memory_order_relaxed);
+        }
         InstallSuperVersionAndScheduleWork(cfd, &sv_context,
                                            *cfd->GetLatestMutableCFOptions());
 
@@ -2796,6 +2925,31 @@ Iterator* DBImpl::NewIterator(const ReadOptions& read_options,
   }
   auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
   auto cfd = cfh->cfd();
+  if (read_options.tailing && cfd->IsHotKeyWriteBufferEnabled()) {
+    return NewErrorIterator(Status::NotSupported(
+        "tailing iterators are incompatible with hot-key write buffering"));
+  }
+  SequenceNumber materialized_snapshot = kMaxSequenceNumber;
+  if (cfd->IsHotKeyWriteBufferEnabled()) {
+    mutex_.Lock();
+    WriteThread::Writer writer;
+    write_thread_.EnterUnbatched(&writer, &mutex_);
+    {
+      WriteLock publish_lock(&hot_key_publish_mutex_);
+      Status status = MaterializeAllHotKeys(cfd);
+      if (!status.ok()) {
+        write_thread_.ExitUnbatched(&writer);
+        mutex_.Unlock();
+        return NewErrorIterator(status);
+      }
+      materialized_snapshot =
+          read_options.snapshot != nullptr
+              ? read_options.snapshot->GetSequenceNumber()
+              : versions_->LastSequence();
+    }
+    write_thread_.ExitUnbatched(&writer);
+    mutex_.Unlock();
+  }
   ReadCallback* read_callback = nullptr;  // No read callback provided.
   if (read_options.tailing) {
 #ifdef ROCKSDB_LITE
@@ -2815,9 +2969,11 @@ Iterator* DBImpl::NewIterator(const ReadOptions& read_options,
     // Note: no need to consider the special case of
     // last_seq_same_as_publish_seq_==false since NewIterator is overridden in
     // WritePreparedTxnDB
-    auto snapshot = read_options.snapshot != nullptr
-                        ? read_options.snapshot->GetSequenceNumber()
-                        : versions_->LastSequence();
+    auto snapshot = materialized_snapshot != kMaxSequenceNumber
+                        ? materialized_snapshot
+                        : read_options.snapshot != nullptr
+                              ? read_options.snapshot->GetSequenceNumber()
+                              : versions_->LastSequence();
     result = NewIteratorImpl(read_options, cfd, snapshot, read_callback);
   }
   return result;
@@ -2903,6 +3059,43 @@ Status DBImpl::NewIterators(
   ReadCallback* read_callback = nullptr;  // No read callback provided.
   iterators->clear();
   iterators->reserve(column_families.size());
+  for (auto* column_family : column_families) {
+    auto* cfd =
+        reinterpret_cast<ColumnFamilyHandleImpl*>(column_family)->cfd();
+    if (read_options.tailing && cfd->IsHotKeyWriteBufferEnabled()) {
+      return Status::NotSupported(
+          "tailing iterators are incompatible with hot-key write buffering");
+    }
+  }
+  SequenceNumber materialized_snapshot = kMaxSequenceNumber;
+  if (has_hot_key_write_buffer_.load(std::memory_order_relaxed)) {
+    mutex_.Lock();
+    WriteThread::Writer writer;
+    write_thread_.EnterUnbatched(&writer, &mutex_);
+    Status status;
+    {
+      WriteLock publish_lock(&hot_key_publish_mutex_);
+      for (auto* column_family : column_families) {
+        auto* cfd =
+            reinterpret_cast<ColumnFamilyHandleImpl*>(column_family)->cfd();
+        status = MaterializeAllHotKeys(cfd);
+        if (!status.ok()) {
+          break;
+        }
+      }
+      if (status.ok()) {
+        materialized_snapshot =
+            read_options.snapshot != nullptr
+                ? read_options.snapshot->GetSequenceNumber()
+                : versions_->LastSequence();
+      }
+    }
+    write_thread_.ExitUnbatched(&writer);
+    mutex_.Unlock();
+    if (!status.ok()) {
+      return status;
+    }
+  }
   if (read_options.tailing) {
 #ifdef ROCKSDB_LITE
     return Status::InvalidArgument(
@@ -2923,9 +3116,11 @@ Status DBImpl::NewIterators(
     // Note: no need to consider the special case of
     // last_seq_same_as_publish_seq_==false since NewIterators is overridden in
     // WritePreparedTxnDB
-    auto snapshot = read_options.snapshot != nullptr
-                        ? read_options.snapshot->GetSequenceNumber()
-                        : versions_->LastSequence();
+    auto snapshot = materialized_snapshot != kMaxSequenceNumber
+                        ? materialized_snapshot
+                        : read_options.snapshot != nullptr
+                              ? read_options.snapshot->GetSequenceNumber()
+                              : versions_->LastSequence();
     for (size_t i = 0; i < column_families.size(); ++i) {
       auto* cfd =
           reinterpret_cast<ColumnFamilyHandleImpl*>(column_families[i])->cfd();
@@ -2951,15 +3146,35 @@ SnapshotImpl* DBImpl::GetSnapshotImpl(bool is_write_conflict_boundary) {
   SnapshotImpl* s = new SnapshotImpl;
 
   InstrumentedMutexLock l(&mutex_);
+  std::unique_ptr<WriteThread::Writer> writer;
+  if (has_hot_key_write_buffer_.load(std::memory_order_relaxed)) {
+    writer.reset(new WriteThread::Writer());
+    write_thread_.EnterUnbatched(writer.get(), &mutex_);
+    WriteLock publish_lock(&hot_key_publish_mutex_);
+    Status status = MaterializeAllHotKeys();
+    if (!status.ok()) {
+      write_thread_.ExitUnbatched(writer.get());
+      delete s;
+      return nullptr;
+    }
+  }
   // returns null if the underlying memtable does not support snapshot.
   if (!is_snapshot_supported_) {
+    if (writer != nullptr) {
+      write_thread_.ExitUnbatched(writer.get());
+    }
     delete s;
     return nullptr;
   }
   auto snapshot_seq = last_seq_same_as_publish_seq_
                           ? versions_->LastSequence()
                           : versions_->LastPublishedSequence();
-  return snapshots_.New(s, snapshot_seq, unix_time, is_write_conflict_boundary);
+  SnapshotImpl* snapshot =
+      snapshots_.New(s, snapshot_seq, unix_time, is_write_conflict_boundary);
+  if (writer != nullptr) {
+    write_thread_.ExitUnbatched(writer.get());
+  }
+  return snapshot;
 }
 
 void DBImpl::ReleaseSnapshot(const Snapshot* s) {
@@ -3253,7 +3468,11 @@ void DBImpl::ReturnAndCleanupSuperVersion(uint32_t column_family_id,
   // If SuperVersion is held, and we successfully fetched a cfd using
   // GetAndRefSuperVersion(), it must still exist.
   assert(cfd != nullptr);
-  ReturnAndCleanupSuperVersion(cfd, sv);
+  if (cfd->IsHotKeyWriteBufferEnabled()) {
+    CleanupSuperVersion(sv);
+  } else {
+    ReturnAndCleanupSuperVersion(cfd, sv);
+  }
 }
 
 // REQUIRED: this function should only be called on the write thread or if the

@@ -53,6 +53,18 @@ struct ImmutableCFOptions {
 
   bool enable_lazy_compaction;
 
+  bool enable_hot_key_write_buffer;
+
+  size_t hot_key_write_buffer_size;
+
+  uint32_t hot_key_admission_threshold;
+
+  uint32_t hot_key_sketch_columns;
+
+  uint64_t hot_key_sketch_decay_interval;
+
+  size_t hot_key_max_buffered_value_size;
+
   bool pin_table_properties_in_reader;
 
   bool inplace_update_support;

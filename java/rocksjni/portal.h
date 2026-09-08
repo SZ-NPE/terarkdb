@@ -3480,8 +3480,16 @@ class TickerTypeJni {
         return 0x65;
       case TERARKDB_NAMESPACE::Tickers::READ_BLOB_INVALID:
         return 0x66;
-      case TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX:
+      case TERARKDB_NAMESPACE::Tickers::HOT_KEY_WRITE_BUFFER_COALESCED_WRITES:
         return 0x67;
+      case TERARKDB_NAMESPACE::Tickers::HOT_KEY_WRITE_BUFFER_IN_PLACE_UPDATES:
+        return 0x68;
+      case TERARKDB_NAMESPACE::Tickers::HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS:
+        return 0x69;
+      case TERARKDB_NAMESPACE::Tickers::HOT_KEY_WRITE_BUFFER_MATERIALIZED_BYTES:
+        return 0x6A;
+      case TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX:
+        return 0x6B;
       default:
         // undefined/default
         return 0x0;
@@ -3699,6 +3707,18 @@ class TickerTypeJni {
       case 0x66:
         return TERARKDB_NAMESPACE::Tickers::READ_BLOB_INVALID;
       case 0x67:
+        return TERARKDB_NAMESPACE::Tickers::
+            HOT_KEY_WRITE_BUFFER_COALESCED_WRITES;
+      case 0x68:
+        return TERARKDB_NAMESPACE::Tickers::
+            HOT_KEY_WRITE_BUFFER_IN_PLACE_UPDATES;
+      case 0x69:
+        return TERARKDB_NAMESPACE::Tickers::
+            HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS;
+      case 0x6A:
+        return TERARKDB_NAMESPACE::Tickers::
+            HOT_KEY_WRITE_BUFFER_MATERIALIZED_BYTES;
+      case 0x6B:
         return TERARKDB_NAMESPACE::Tickers::TICKER_ENUM_MAX;
 
       default:

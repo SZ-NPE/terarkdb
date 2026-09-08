@@ -13,7 +13,6 @@
 #include <condition_variable>
 #include <mutex>
 #include <type_traits>
-#include <vector>
 
 #include "db/dbformat.h"
 #include "db/pre_release_callback.h"
@@ -120,6 +119,7 @@ class WriteThread {
     bool no_slowdown;
     bool disable_wal;
     bool disable_memtable;
+    size_t memtable_write_bytes;
     size_t batch_cnt;  // if non-zero, number of sub-batches in the write batch
     PreReleaseCallback* pre_release_callback;
     uint64_t log_used;  // log number that this batch was inserted into
@@ -143,6 +143,7 @@ class WriteThread {
           no_slowdown(false),
           disable_wal(false),
           disable_memtable(false),
+          memtable_write_bytes(0),
           batch_cnt(0),
           pre_release_callback(nullptr),
           log_used(0),
@@ -164,6 +165,7 @@ class WriteThread {
           no_slowdown(write_options.no_slowdown),
           disable_wal(write_options.disableWAL),
           disable_memtable(_disable_memtable),
+          memtable_write_bytes(0),
           batch_cnt(_batch_cnt),
           pre_release_callback(_pre_release_callback),
           log_used(0),

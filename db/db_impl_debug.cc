@@ -134,6 +134,12 @@ Status DBImpl::TEST_WaitForFlushMemTable(ColumnFamilyHandle* column_family) {
   return WaitForFlushMemTable(cfd, nullptr, false);
 }
 
+Status DBImpl::TEST_WriteWithSequence(const WriteOptions& options,
+                                      WriteBatch* updates,
+                                      SequenceNumber* sequence) {
+  return WriteImpl(options, updates, nullptr, nullptr, 0, false, sequence);
+}
+
 Status DBImpl::TEST_WaitForCompact(bool wait_unscheduled) {
   // Wait until the compaction completes
 

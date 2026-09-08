@@ -342,6 +342,24 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    collector_names.c_str());
   ROCKS_LOG_HEADER(log, "                 Options.enable_lazy_compaction: %d",
                    enable_lazy_compaction);
+  ROCKS_LOG_HEADER(
+      log, "           Options.enable_hot_key_write_buffer: %d",
+      enable_hot_key_write_buffer);
+  ROCKS_LOG_HEADER(
+      log, "             Options.hot_key_write_buffer_size: %" ROCKSDB_PRIszt,
+      hot_key_write_buffer_size);
+  ROCKS_LOG_HEADER(log,
+                   "            Options.hot_key_admission_threshold: %u",
+                   hot_key_admission_threshold);
+  ROCKS_LOG_HEADER(log, "                 Options.hot_key_sketch_columns: %u",
+                   hot_key_sketch_columns);
+  ROCKS_LOG_HEADER(
+      log, "          Options.hot_key_sketch_decay_interval: %" PRIu64,
+      hot_key_sketch_decay_interval);
+  ROCKS_LOG_HEADER(
+      log,
+      "      Options.hot_key_max_buffered_value_size: %" ROCKSDB_PRIszt,
+      hot_key_max_buffered_value_size);
   ROCKS_LOG_HEADER(log, "         Options.pin_table_properties_in_reader: %d",
                    pin_table_properties_in_reader);
   ROCKS_LOG_HEADER(log, "                 Options.inplace_update_support: %d",

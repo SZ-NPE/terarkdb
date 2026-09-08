@@ -993,6 +993,12 @@ class DB {
       const FlushOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families) = 0;
 
+  // Wait for queued and running flush, compaction, garbage collection, and
+  // obsolete-file purge work to finish.
+  virtual Status WaitForCompact() {
+    return Status::NotSupported("WaitForCompact not implemented");
+  }
+
   // Flush the WAL memory buffer to the file. If sync is true, it calls SyncWAL
   // afterwards.
   virtual Status FlushWAL(bool /*sync*/) {

@@ -116,6 +116,17 @@ class DBImpl : public DB {
   virtual Status Write(const WriteOptions& options,
                        WriteBatch* updates) override;
 
+  Status MaterializeHotKey(ColumnFamilyData* cfd, const Slice& key);
+  Status MaterializeEvictedHotKeys(
+      ColumnFamilyData* cfd,
+      size_t max_value_bytes = std::numeric_limits<size_t>::max(),
+      size_t max_entries = std::numeric_limits<size_t>::max());
+  void ScheduleHotRegionMaterialization(ColumnFamilyData* cfd);
+  Status MaterializeAllHotKeys(ColumnFamilyData* cfd);
+  Status MaterializeAllHotKeys();
+  Status MaterializeHotKeysForFlush(ColumnFamilyData* cfd,
+                                    FlushReason flush_reason);
+
   using DB::Get;
   virtual Status Get(const ReadOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
@@ -241,6 +252,7 @@ class DBImpl : public DB {
   virtual Status Flush(
       const FlushOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families) override;
+  Status WaitForCompact() override;
   virtual Status FlushWAL(bool sync) override;
   bool TEST_WALBufferIsEmpty(bool lock = true);
   virtual Status SyncWAL() override;
@@ -432,6 +444,10 @@ class DBImpl : public DB {
 
   // Wait for memtable compaction
   Status TEST_WaitForFlushMemTable(ColumnFamilyHandle* column_family = nullptr);
+
+  Status TEST_WriteWithSequence(const WriteOptions& options,
+                                WriteBatch* updates,
+                                SequenceNumber* sequence);
 
   // Wait for any compaction
   // We add a bool parameter to wait for unscheduledCompactions_ == 0, but this
@@ -1135,7 +1151,8 @@ class DBImpl : public DB {
 
   void FillLogWriterPool();
 
-  Status SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context);
+  Status SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
+                        bool materialize_hot_key_evictions = true);
 
   // Force current memtable contents to be flushed.
   Status FlushMemTable(const autovector<ColumnFamilyData*>& column_family_datas,
@@ -1251,12 +1268,19 @@ class DBImpl : public DB {
   // separate, bottom-pri thread pool.
   static void BGWorkBottomCompaction(void* arg);
   static void BGWorkFlush(void* db);
+  struct HotRegionArg {
+    DBImpl* db;
+    ColumnFamilyData* cfd;
+  };
+  static void BGWorkHotRegion(void* arg);
   static void BGWorkPurge(void* arg);
+  static void UnscheduleHotRegionCallback(void* arg);
   static void UnscheduleCallback(void* arg);
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 Env::Priority bg_thread_pri);
   void BackgroundCallGarbageCollection();
   void BackgroundCallFlush();
+  void BackgroundCallHotRegion(ColumnFamilyData* cfd);
   void BackgroundCallPurge();
   Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
                               LogBuffer* log_buffer,
@@ -1491,6 +1515,7 @@ class DBImpl : public DB {
   WriteBufferManager* write_buffer_manager_;
 
   WriteThread write_thread_;
+  port::RWMutex hot_key_publish_mutex_;
   WriteBatch tmp_batch_;
   // The write thread when the writers have no memtable write. This will be used
   // in 2PC to batch the prepares separately from the serial commit.
@@ -1500,11 +1525,9 @@ class DBImpl : public DB {
 
   std::unique_ptr<RateLimiter> low_pri_write_rate_limiter_;
 
-  // Size of the last batch group. In slowdown mode, next write needs to
-  // sleep if it uses up the quota.
-  // Note: This is to protect memtable and compaction. If the batch only writes
-  // to the WAL its size need not to be included in this.
-  uint64_t last_batch_group_size_;
+  // Actual MemTable pressure from the last batch group. Resident hot-key
+  // updates are excluded because they do not create flush or compaction work.
+  std::atomic<uint64_t> last_batch_group_memtable_size_;
 
   FlushScheduler flush_scheduler_;
 
@@ -1560,6 +1583,8 @@ class DBImpl : public DB {
   std::deque<ColumnFamilyData*> compaction_queue_;
   std::deque<ColumnFamilyData*> garbage_collection_queue_;
 
+  std::atomic<bool> has_hot_key_write_buffer_{false};
+
   // A queue to store filenames of the files to be purged
   std::deque<PurgeFileInfo> purge_queue_;
 
@@ -1603,6 +1628,8 @@ class DBImpl : public DB {
 
   // stores the number of flushes are currently running
   int num_running_flushes_;
+
+  std::atomic<int> bg_hot_region_scheduled_{0};
 
   // number of background obsolete file purge jobs, submitted to the HIGH pool
   int bg_purge_scheduled_;

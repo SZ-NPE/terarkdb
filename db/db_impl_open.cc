@@ -210,6 +210,9 @@ static Status ValidateOptions(
     if (s.ok()) {
       s = CheckCFPathsSupported(db_options, cfd.options);
     }
+    if (s.ok()) {
+      s = CheckHotKeyWriteBufferSupported(cfd.options);
+    }
     if (!s.ok()) {
       return s;
     }
@@ -1280,6 +1283,23 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   if (!s.ok()) {
     return s;
   }
+  for (const auto& column_family : column_families) {
+    if (!column_family.options.enable_hot_key_write_buffer) {
+      continue;
+    }
+    if (seq_per_batch) {
+      return Status::NotSupported(
+          "hot-key write buffering does not support seq_per_batch");
+    }
+    if (db_options.two_write_queues) {
+      return Status::NotSupported(
+          "hot-key write buffering does not support two_write_queues");
+    }
+    if (db_options.allow_2pc) {
+      return Status::NotSupported(
+          "hot-key write buffering does not support two-phase commit");
+    }
+  }
 
   *dbptr = nullptr;
   handles->clear();
@@ -1307,6 +1327,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   }
 
   DBImpl* impl = new DBImpl(db_options, dbname, seq_per_batch, batch_per_txn);
+  for (const auto& column_family : column_families) {
+    if (column_family.options.enable_hot_key_write_buffer) {
+      impl->has_hot_key_write_buffer_.store(true, std::memory_order_relaxed);
+    }
+  }
   s = impl->env_->CreateDirIfMissing(impl->immutable_db_options_.wal_dir);
   if (s.ok()) {
     std::vector<std::string> paths;
@@ -1377,7 +1402,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
             new log::Writer(
                 std::move(file_writer), new_log_number,
                 impl->immutable_db_options_.recycle_log_file_num > 0,
-                impl->immutable_db_options_.manual_wal_flush));
+                impl->immutable_db_options_.manual_wal_flush,
+                impl->has_hot_key_write_buffer_.load(
+                    std::memory_order_relaxed)));
       }
 
       autovector<const ColumnFamilyOptions*> cf_options_list;

@@ -13,15 +13,47 @@
 #endif
 #include <inttypes.h>
 
+#include <vector>
+
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "db/merge_context.h"
 #include "monitoring/perf_context_imp.h"
 #include "options/options_helper.h"
 #include "rocksdb/metrics_reporter.h"
 #include "rocksdb/terark_namespace.h"
+#include "util/mutexlock.h"
 #include "util/sync_point.h"
 
 namespace TERARKDB_NAMESPACE {
+
+namespace {
+
+size_t MemtableWriteGroupBytes(
+    const WriteThread::WriteGroup& write_group) {
+  size_t bytes = 0;
+  for (const auto* writer : write_group) {
+    bytes = WriteBatchInternal::AppendedByteSize(
+        bytes, writer->memtable_write_bytes);
+  }
+  return bytes;
+}
+
+bool MemtableHasNewerMutation(MemTable* mem,
+                              const HotRegion::BufferedWrite& write) {
+  LookupKey lookup_key(write.key, kMaxSequenceNumber);
+  LazyBuffer value;
+  Status status;
+  MergeContext merge_context;
+  SequenceNumber max_covering_tombstone_sequence = 0;
+  SequenceNumber sequence = kMaxSequenceNumber;
+  ReadOptions read_options;
+  return mem->Get(lookup_key, &value, &status, &merge_context,
+                  &max_covering_tombstone_sequence, &sequence, read_options) &&
+         sequence >= write.sequence;
+}
+
+}  // namespace
 
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
@@ -57,6 +89,148 @@ void DBImpl::SetRecoverableStatePreReleaseCallback(
 
 Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
   return WriteImpl(write_options, my_batch, nullptr, nullptr);
+}
+
+Status DBImpl::MaterializeHotKey(ColumnFamilyData* cfd, const Slice& key) {
+  if (cfd == nullptr || cfd->hot_region() == nullptr) {
+    return Status::OK();
+  }
+
+  HotRegion::BufferedWrite write;
+  const auto result = cfd->hot_region()->MaterializeKey(
+      key,
+      [cfd](const HotRegion::BufferedWrite& mutation) {
+        if (MemtableHasNewerMutation(cfd->mem(), mutation)) {
+          return true;
+        }
+        return cfd->mem()->AddMaterializedMutation(
+            mutation.sequence, mutation.type, mutation.key, mutation.value);
+      },
+      &write);
+  if (result == HotRegion::MaterializeResult::kNotFound) {
+    return Status::OK();
+  }
+  if (result == HotRegion::MaterializeResult::kRetry) {
+    return Status::TryAgain("hot-key materialization key+seq exists");
+  }
+  if (write.wal_number > 0) {
+    cfd->RetainLogNumber(write.wal_number);
+  }
+  RecordTick(cfd->ioptions()->statistics,
+             HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS);
+  RecordTick(cfd->ioptions()->statistics,
+             HOT_KEY_WRITE_BUFFER_MATERIALIZED_BYTES, write.value.size());
+  return Status::OK();
+}
+
+Status DBImpl::MaterializeEvictedHotKeys(ColumnFamilyData* cfd,
+                                         size_t max_value_bytes,
+                                         size_t max_entries) {
+  if (cfd == nullptr || cfd->hot_region() == nullptr ||
+      !cfd->hot_region()->HasPendingEvictions()) {
+    return Status::OK();
+  }
+
+  const auto writes =
+      cfd->hot_region()->GetPendingEvictions(max_value_bytes, max_entries);
+  if (writes.empty()) {
+    return Status::OK();
+  }
+
+  for (const auto& write : writes) {
+    HotRegion::BufferedWrite materialized;
+    const auto result = cfd->hot_region()->MaterializeKey(
+        write.key,
+        [cfd](const HotRegion::BufferedWrite& mutation) {
+          if (mutation.memtable_id != cfd->mem()->GetID()) {
+            return false;
+          }
+          return MemtableHasNewerMutation(cfd->mem(), mutation) ||
+                 cfd->mem()->AddMaterializedMutation(
+                     mutation.sequence, mutation.type, mutation.key,
+                     mutation.value);
+        },
+        &materialized);
+    if (result == HotRegion::MaterializeResult::kNotFound) {
+      continue;
+    }
+    if (result == HotRegion::MaterializeResult::kRetry) {
+      return Status::TryAgain("hot-key materialization key+seq exists");
+    }
+    if (materialized.wal_number > 0) {
+      cfd->RetainLogNumber(materialized.wal_number);
+    }
+    RecordTick(cfd->ioptions()->statistics,
+               HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS);
+    RecordTick(cfd->ioptions()->statistics,
+               HOT_KEY_WRITE_BUFFER_MATERIALIZED_BYTES,
+               materialized.value.size());
+  }
+  return Status::OK();
+}
+
+void DBImpl::ScheduleHotRegionMaterialization(ColumnFamilyData* cfd) {
+  if (cfd == nullptr || cfd->hot_region() == nullptr ||
+      !cfd->hot_region()->HasPendingEvictions() ||
+      shutting_down_.load(std::memory_order_acquire) ||
+      env_->GetBackgroundThreads(Env::Priority::LOW) == 0) {
+    return;
+  }
+  if (!cfd->TryScheduleHotRegionMaterialization()) {
+    return;
+  }
+  cfd->Ref();
+  bg_hot_region_scheduled_.fetch_add(1, std::memory_order_relaxed);
+  env_->Schedule(&DBImpl::BGWorkHotRegion,
+                 new HotRegionArg{this, cfd}, Env::Priority::LOW,
+                 &bg_hot_region_scheduled_,
+                 &DBImpl::UnscheduleHotRegionCallback);
+}
+
+Status DBImpl::MaterializeAllHotKeys(ColumnFamilyData* cfd) {
+  if (cfd == nullptr || cfd->hot_region() == nullptr ||
+      cfd->hot_region()->empty()) {
+    return Status::OK();
+  }
+
+  Status status = MaterializeEvictedHotKeys(cfd);
+  if (!status.ok()) {
+    return status;
+  }
+
+  auto writes = cfd->hot_region()->GetAll();
+  for (const auto& write : writes) {
+    if (!MemtableHasNewerMutation(cfd->mem(), write) &&
+        !cfd->mem()->AddMaterializedMutation(
+            write.sequence, write.type, write.key, write.value)) {
+      return Status::TryAgain("hot-key materialization key+seq exists");
+    }
+    HotRegion::BufferedWrite removed;
+    if (!cfd->hot_region()->Remove(write.key, &removed)) {
+      return Status::Corruption(
+          "hot-key materialization lost buffered value");
+    }
+    if (removed.wal_number > 0) {
+      cfd->RetainLogNumber(removed.wal_number);
+    }
+    RecordTick(cfd->ioptions()->statistics,
+               HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS);
+    RecordTick(cfd->ioptions()->statistics,
+               HOT_KEY_WRITE_BUFFER_MATERIALIZED_BYTES, write.value.size());
+  }
+  return Status::OK();
+}
+
+Status DBImpl::MaterializeAllHotKeys() {
+  for (auto* cfd : *versions_->GetColumnFamilySet()) {
+    if (!cfd->IsDropped()) {
+      Status status = MaterializeAllHotKeys(cfd);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+  }
+  return Status::OK();
 }
 
 #ifndef ROCKSDB_LITE
@@ -154,6 +328,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     }
 
     if (write_thread_.CompleteParallelMemTableWriter(&w)) {
+      last_batch_group_memtable_size_.store(
+          MemtableWriteGroupBytes(*w.write_group),
+          std::memory_order_relaxed);
       // we're responsible for exit batch group
       for (auto* writer : *(w.write_group)) {
         if (!writer->CallbackFailed() && writer->pre_release_callback) {
@@ -228,8 +405,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   // into memtables
 
   TEST_SYNC_POINT("DBImpl::WriteImpl:BeforeLeaderEnters");
-  last_batch_group_size_ =
-      write_thread_.EnterAsBatchGroupLeader(&w, &write_group);
+  write_thread_.EnterAsBatchGroupLeader(&w, &write_group);
 
   if (status.ok()) {
     // Rules for when we can update the memtable concurrently
@@ -243,8 +419,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     // assumed to be true.  Rule 3 is checked for each batch.  We could
     // relax rules 2 if we could prevent write batches from referring
     // more than once to a particular key.
-    bool parallel = immutable_db_options_.allow_concurrent_memtable_write &&
-                    write_group.size > 1;
+    bool parallel =
+        immutable_db_options_.allow_concurrent_memtable_write &&
+        write_group.size > 1;
     size_t total_count = 0;
     size_t valid_batches = 0;
     size_t total_byte_size = 0;
@@ -254,12 +431,18 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
         if (writer->ShouldWriteToMemtable()) {
           total_count += WriteBatchInternal::Count(writer->batch);
           parallel = parallel && !writer->batch->HasMerge();
+          if (has_hot_key_write_buffer_.load(std::memory_order_relaxed)) {
+            parallel = parallel && !writer->batch->HasSingleDelete() &&
+                       !writer->batch->HasDeleteRange();
+          }
         }
 
         total_byte_size = WriteBatchInternal::AppendedByteSize(
             total_byte_size, WriteBatchInternal::ByteSize(writer->batch));
       }
     }
+    TEST_SYNC_POINT_CALLBACK("DBImpl::WriteImpl:ParallelMemTableWrite",
+                             &parallel);
     // Note about seq_per_batch_: either disableWAL is set for the entire write
     // group or not. In either case we inc seq for each write batch with no
     // failed callback. This means that there could be a batch with
@@ -396,6 +579,8 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     should_exit_batch_group = write_thread_.CompleteParallelMemTableWriter(&w);
   }
   if (should_exit_batch_group) {
+    last_batch_group_memtable_size_.store(
+        MemtableWriteGroupBytes(write_group), std::memory_order_relaxed);
     if (status.ok()) {
       for (auto* writer : write_group) {
         if (!writer->CallbackFailed() && writer->pre_release_callback) {
@@ -408,7 +593,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
           }
         }
       }
-      versions_->SetLastSequence(last_sequence);
+      if (status.ok()) {
+        versions_->SetLastSequence(last_sequence);
+      }
     }
     MemTableInsertStatusCheck(w.status);
     write_thread_.ExitAsBatchGroupLeader(write_group, status);
@@ -446,8 +633,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     mutex_.Unlock();
 
     // This can set non-OK status if callback fail.
-    last_batch_group_size_ =
-        write_thread_.EnterAsBatchGroupLeader(&w, &wal_write_group);
+    write_thread_.EnterAsBatchGroupLeader(&w, &wal_write_group);
     const SequenceNumber current_sequence =
         write_thread_.UpdateLastSequence(versions_->LastSequence()) + 1;
     size_t total_count = 0;
@@ -513,8 +699,20 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     PERF_TIMER_GUARD(write_memtable_time);
     assert(w.ShouldWriteToMemtable());
     write_thread_.EnterAsMemTableWriter(&w, &memtable_write_group);
-    if (memtable_write_group.size > 1 &&
-        immutable_db_options_.allow_concurrent_memtable_write) {
+    bool parallel =
+        memtable_write_group.size > 1 &&
+        immutable_db_options_.allow_concurrent_memtable_write;
+    if (parallel &&
+        has_hot_key_write_buffer_.load(std::memory_order_relaxed)) {
+      for (auto* writer : memtable_write_group) {
+        parallel = parallel && !writer->batch->HasMerge() &&
+                   !writer->batch->HasSingleDelete() &&
+                   !writer->batch->HasDeleteRange();
+      }
+    }
+    TEST_SYNC_POINT_CALLBACK("DBImpl::PipelinedWriteImpl:ParallelMemTableWrite",
+                             &parallel);
+    if (parallel) {
       write_thread_.LaunchParallelMemTableWriters(&memtable_write_group);
     } else {
       memtable_write_group.status = WriteBatchInternal::InsertInto(
@@ -522,6 +720,9 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
           &flush_scheduler_, write_options.ignore_missing_column_families,
           0 /*log_number*/, this, false /*concurrent_memtable_writes*/,
           seq_per_batch_, batch_per_txn_);
+      last_batch_group_memtable_size_.store(
+          MemtableWriteGroupBytes(memtable_write_group),
+          std::memory_order_relaxed);
       versions_->SetLastSequence(memtable_write_group.last_sequence);
       write_thread_.ExitAsMemTableWriter(&w, memtable_write_group);
     }
@@ -536,8 +737,13 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
         write_options.ignore_missing_column_families, 0 /*log_number*/, this,
         true /*concurrent_memtable_writes*/);
     if (write_thread_.CompleteParallelMemTableWriter(&w)) {
+      last_batch_group_memtable_size_.store(
+          MemtableWriteGroupBytes(*w.write_group),
+          std::memory_order_relaxed);
       MemTableInsertStatusCheck(w.status);
-      versions_->SetLastSequence(w.write_group->last_sequence);
+      if (w.status.ok()) {
+        versions_->SetLastSequence(w.write_group->last_sequence);
+      }
       write_thread_.ExitAsMemTableWriter(&w, *w.write_group);
     }
   }
@@ -581,8 +787,7 @@ Status DBImpl::WriteImplWALOnly(const WriteOptions& write_options,
   WriteThread::WriteGroup write_group;
   uint64_t last_sequence;
   nonmem_write_thread_.EnterAsBatchGroupLeader(&w, &write_group);
-  // Note: no need to update last_batch_group_size_ here since the batch writes
-  // to WAL only
+  // WAL-only writes do not contribute to MemTable pressure.
 
   size_t total_byte_size = 0;
   for (auto* writer : write_group) {
@@ -758,7 +963,9 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     // for previous one. It might create a fairness issue that expiration
     // might happen for smaller writes but larger writes can go through.
     // Can optimize it if it is an issue.
-    status = DelayWrite(last_batch_group_size_, write_options);
+    status = DelayWrite(
+        last_batch_group_memtable_size_.load(std::memory_order_relaxed),
+        write_options);
     PERF_TIMER_START(write_pre_and_post_process_time);
   }
 
@@ -1456,7 +1663,8 @@ Status DBImpl::NewLogWriter(std::unique_ptr<log::Writer>* new_log,
         immutable_db_options_.listeners));
     new_log->reset(new log::Writer(
         std::move(file_writer), new_log_number,
-        immutable_db_options_.recycle_log_file_num > 0, manual_wal_flush_));
+        immutable_db_options_.recycle_log_file_num > 0, manual_wal_flush_,
+        has_hot_key_write_buffer_.load(std::memory_order_relaxed)));
   }
   return s;
 }
@@ -1509,7 +1717,8 @@ void DBImpl::FillLogWriterPool() {
 
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
-Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
+Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
+                              bool materialize_hot_key_evictions) {
   mutex_.AssertHeld();
   WriteThread::Writer nonmem_w;
   if (two_write_queues_) {
@@ -1536,6 +1745,14 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
     mutex_.Unlock();
     write_thread_.WaitForMemTableWriters();
     mutex_.Lock();
+  }
+
+  if (materialize_hot_key_evictions) {
+    WriteLock publish_lock(&hot_key_publish_mutex_);
+    Status materialize_status = MaterializeEvictedHotKeys(cfd);
+    if (!materialize_status.ok()) {
+      return materialize_status;
+    }
   }
 
   // Attempt to switch to a new memtable and trigger flush of old.
@@ -1714,16 +1931,31 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
   }
 
   SequenceNumber seq = versions_->LastSequence();
+  SequenceNumber hot_key_sequence = seq;
+  if (cfd->hot_region() != nullptr &&
+      !cfd->hot_region()->empty()) {
+    hot_key_sequence =
+        write_thread_.UpdateLastSequence(versions_->LastSequence()) + 1;
+    write_thread_.UpdateLastSequence(hot_key_sequence);
+    versions_->SetLastSequence(hot_key_sequence);
+    seq = hot_key_sequence;
+  }
   MemTable* new_mem =
       cfd->ConstructNewMemtable(mutable_cf_options, seq_per_batch_, seq);
   context->superversion_context.NewSuperVersion();
 
-  cfd->mem()->SetNextLogNumber(logfile_number_);
-  cfd->imm()->Add(cfd->mem(), &context->memtables_to_free);
-  new_mem->Ref();
-  cfd->SetMemtable(new_mem);
-  InstallSuperVersionAndScheduleWork(cfd, &context->superversion_context,
-                                     mutable_cf_options);
+  {
+    WriteLock publish_lock(&hot_key_publish_mutex_);
+    cfd->mem()->SetNextLogNumber(logfile_number_);
+    cfd->imm()->Add(cfd->mem(), &context->memtables_to_free);
+    new_mem->Ref();
+    cfd->SetMemtable(new_mem);
+    if (cfd->hot_region() != nullptr) {
+      cfd->hot_region()->RebindMemtable(new_mem->GetID(), hot_key_sequence);
+    }
+    InstallSuperVersionAndScheduleWork(cfd, &context->superversion_context,
+                                       mutable_cf_options);
+  }
   if (two_write_queues_) {
     nonmem_write_thread_.ExitUnbatched(&nonmem_w);
   }

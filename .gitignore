@@ -26,6 +26,7 @@ make_config.mk
 CMakeCache.txt
 CMakeFiles/
 build/
+build-*/
 
 ldb
 manifest_dump

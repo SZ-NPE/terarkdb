@@ -11,6 +11,10 @@
 
 #include <stdio.h>
 
+#include <cstring>
+
+#include "db/dbformat.h"
+#include "db/write_batch_internal.h"
 #include "rocksdb/env.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/coding.h"
@@ -20,6 +24,13 @@
 
 namespace TERARKDB_NAMESPACE {
 namespace log {
+
+namespace {
+
+constexpr char kDeduplicatedRecordMagic[] = "HKDED01";
+constexpr size_t kMaxDeduplicatedValues = 4096;
+
+}  // namespace
 
 Reader::Reporter::~Reporter() {}
 
@@ -43,6 +54,80 @@ Reader::Reader(std::shared_ptr<Logger> info_log,
       retry_after_eof_(retry_after_eof) {}
 
 Reader::~Reader() { delete[] backing_store_; }
+
+bool Reader::DecodeRecord(const Slice& input, std::string* scratch,
+                          Slice* output) {
+  if (input.size() < sizeof(kDeduplicatedRecordMagic) - 1 + sizeof(uint32_t) ||
+      std::memcmp(input.data(), kDeduplicatedRecordMagic,
+                  sizeof(kDeduplicatedRecordMagic) - 1) != 0) {
+    *output = input;
+    return true;
+  }
+
+  Slice encoded(input);
+  encoded.remove_prefix(sizeof(kDeduplicatedRecordMagic) - 1);
+  uint32_t expected_size = 0;
+  if (!GetFixed32(&encoded, &expected_size)) {
+    return false;
+  }
+  if (encoded.size() < WriteBatchInternal::kHeader) {
+    return false;
+  }
+  scratch->clear();
+  scratch->reserve(expected_size);
+  scratch->append(encoded.data(), WriteBatchInternal::kHeader);
+  encoded.remove_prefix(WriteBatchInternal::kHeader);
+  while (!encoded.empty()) {
+    const char tag = encoded[0];
+    encoded.remove_prefix(1);
+    if (tag != kTypeValue && tag != kTypeColumnFamilyValue) {
+      return false;
+    }
+    scratch->push_back(tag);
+    if (tag == kTypeColumnFamilyValue) {
+      uint32_t column_family = 0;
+      if (!GetVarint32(&encoded, &column_family)) {
+        return false;
+      }
+      PutVarint32(scratch, column_family);
+    }
+    Slice key;
+    if (!GetLengthPrefixedSlice(&encoded, &key)) {
+      return false;
+    }
+    PutLengthPrefixedSlice(scratch, key);
+
+    if (encoded.empty()) {
+      return false;
+    }
+    const uint8_t token = static_cast<uint8_t>(encoded[0]);
+    encoded.remove_prefix(1);
+    if (token == 0) {
+      Slice value;
+      if (!GetLengthPrefixedSlice(&encoded, &value)) {
+        return false;
+      }
+      PutLengthPrefixedSlice(scratch, value);
+      if (deduplicated_values_.size() < kMaxDeduplicatedValues) {
+        deduplicated_values_.emplace_back(value.data(), value.size());
+      }
+    } else if (token == 1) {
+      uint32_t value_index = 0;
+      if (!GetVarint32(&encoded, &value_index) ||
+          value_index >= deduplicated_values_.size()) {
+        return false;
+      }
+      PutLengthPrefixedSlice(scratch, deduplicated_values_[value_index]);
+    } else {
+      return false;
+    }
+  }
+  if (scratch->size() != expected_size) {
+    return false;
+  }
+  *output = Slice(*scratch);
+  return true;
+}
 
 // For kAbsoluteConsistency, on clean shutdown we don't expect any error
 // in the log files.  For other modes, we can ignore only incomplete records
@@ -77,7 +162,10 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
         }
         prospective_record_offset = physical_record_offset;
         scratch->clear();
-        *record = fragment;
+        if (!DecodeRecord(fragment, scratch, record)) {
+          ReportCorruption(fragment.size(), "deduplicated record corrupted");
+          return false;
+        }
         last_record_offset_ = prospective_record_offset;
         return true;
 
@@ -112,7 +200,20 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
                            "missing start of fragmented record(2)");
         } else {
           scratch->append(fragment.data(), fragment.size());
-          *record = Slice(*scratch);
+          if (scratch->size() < sizeof(kDeduplicatedRecordMagic) - 1 ||
+              std::memcmp(scratch->data(), kDeduplicatedRecordMagic,
+                          sizeof(kDeduplicatedRecordMagic) - 1) != 0) {
+            *record = Slice(*scratch);
+            last_record_offset_ = prospective_record_offset;
+            return true;
+          }
+          std::string encoded_record;
+          encoded_record.swap(*scratch);
+          if (!DecodeRecord(Slice(encoded_record), scratch, record)) {
+            ReportCorruption(encoded_record.size(),
+                             "deduplicated record corrupted");
+            return false;
+          }
           last_record_offset_ = prospective_record_offset;
           return true;
         }

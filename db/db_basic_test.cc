@@ -7,10 +7,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/db_test_util.h"
+
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <thread>
+
 #include "port/stack_trace.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/fault_injection_test_env.h"
+#include "utilities/merge_operators.h"
 #if !defined(ROCKSDB_LITE)
 #include "util/sync_point.h"
 #endif
@@ -21,6 +28,665 @@ class DBBasicTest : public DBTestBase {
  public:
   DBBasicTest() : DBTestBase("/db_basic_test") {}
 };
+
+TEST_F(DBBasicTest, HotKeyWriteBufferCollapsesOverwritesBeforeFlush) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 2;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.hot_key_max_buffered_value_size = 64U << 10;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.compression = kNoCompression;
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+
+  const std::string initial_value(4096, 'a');
+  ASSERT_OK(Put("hot-key", initial_value));
+  for (int update = 0; update < 10; ++update) {
+    ASSERT_OK(Put("hot-key", std::string(4096, 'b' + update)));
+  }
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_NE(nullptr, cfd->hot_region());
+  ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+  ASSERT_EQ(1U, cfd->mem()->num_entries());
+  ASSERT_EQ(10U, options.statistics->getTickerCount(
+                     HOT_KEY_WRITE_BUFFER_COALESCED_WRITES));
+  ASSERT_EQ(9U, options.statistics->getTickerCount(
+                    HOT_KEY_WRITE_BUFFER_IN_PLACE_UPDATES));
+  ASSERT_EQ(0U, options.statistics->getTickerCount(
+                    HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS));
+  ASSERT_EQ(std::string(4096, 'k'), Get("hot-key"));
+
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(cfd->hot_region()->empty());
+  ASSERT_EQ(1U, options.statistics->getTickerCount(
+                    HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS));
+  ASSERT_EQ(4096U, options.statistics->getTickerCount(
+                       HOT_KEY_WRITE_BUFFER_MATERIALIZED_BYTES));
+  ASSERT_EQ(std::string(4096, 'k'), Get("hot-key"));
+
+  Reopen(options);
+  ASSERT_EQ(std::string(4096, 'k'), Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferHandlesSmallValueOverwrite) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  const std::string buffered_value(4096, 'a');
+  const std::string small_value(128, 'b');
+  ASSERT_OK(Put("hot-key", buffered_value));
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+  ASSERT_TRUE(cfd->mem()->IsEmpty());
+
+  ASSERT_OK(Put("hot-key", small_value));
+  ASSERT_TRUE(cfd->hot_region()->empty());
+  ASSERT_EQ(small_value, Get("hot-key"));
+
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(small_value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferHandlesOversizedOverwrite) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_max_buffered_value_size = 8U << 10;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  const std::string buffered_value(4096, 'a');
+  const std::string oversized_value(16U << 10, 'b');
+  ASSERT_OK(Put("hot-key", buffered_value));
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+  ASSERT_TRUE(cfd->mem()->IsEmpty());
+
+  ASSERT_OK(Put("hot-key", oversized_value));
+  ASSERT_TRUE(cfd->hot_region()->empty());
+  ASSERT_EQ(oversized_value, Get("hot-key"));
+
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(oversized_value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferPreservesSnapshotAndIteratorViews) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 2;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  const std::string first_value(4096, 'a');
+  const std::string second_value(4096, 'b');
+  const std::string third_value(4096, 'c');
+  ASSERT_OK(Put("hot-key", first_value));
+  ASSERT_OK(Put("hot-key", second_value));
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_NE(nullptr, snapshot);
+
+  ASSERT_OK(Put("hot-key", third_value));
+  ReadOptions snapshot_read;
+  snapshot_read.snapshot = snapshot;
+  std::string snapshot_value;
+  ASSERT_OK(db_->Get(snapshot_read, "hot-key", &snapshot_value));
+  ASSERT_EQ(second_value, snapshot_value);
+  ASSERT_EQ(third_value, Get("hot-key"));
+  db_->ReleaseSnapshot(snapshot);
+
+  std::unique_ptr<Iterator> iterator(db_->NewIterator(ReadOptions()));
+  iterator->Seek("hot-key");
+  ASSERT_TRUE(iterator->Valid());
+  ASSERT_EQ(third_value, iterator->value().ToString());
+  ASSERT_OK(iterator->status());
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferSurvivesOtherColumnFamilyFlush) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 2;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.compression = kNoCompression;
+  CreateAndReopenWithCF({"cold"}, options);
+
+  const std::string first_value(4096, 'a');
+  const std::string second_value(4096, 'b');
+  ASSERT_OK(Put(0, "hot-key", first_value));
+  ASSERT_OK(Put(0, "hot-key", second_value));
+  ASSERT_OK(Put(1, "cold-key", "cold-value"));
+  ASSERT_OK(Flush(1));
+
+  auto* hot_cfd =
+      reinterpret_cast<ColumnFamilyHandleImpl*>(handles_[0])->cfd();
+  ASSERT_EQ(1U, hot_cfd->hot_region()->entry_count());
+  ASSERT_EQ(second_value, Get(0, "hot-key"));
+
+  ReopenWithColumnFamilies({"default", "cold"}, options);
+  ASSERT_EQ(second_value, Get(0, "hot-key"));
+  ASSERT_EQ("cold-value", Get(1, "cold-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferSurvivesAutomaticMemtableSwitch) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.enable_pipelined_write = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.write_buffer_size = 64U << 10;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+
+  const std::string first_value(4096, 'a');
+  const std::string second_value(4096, 'b');
+  ASSERT_OK(Put("hot-key", first_value));
+  ASSERT_OK(Put("hot-key", second_value));
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+  ASSERT_TRUE(cfd->mem()->IsEmpty());
+
+  const std::string cold_value(128, 'c');
+  int cold_key = 0;
+  for (int memtable_switch = 0; memtable_switch < 3; ++memtable_switch) {
+    const uint64_t old_memtable_id = cfd->mem()->GetID();
+    while (cold_key < 10000 && cfd->mem()->GetID() == old_memtable_id) {
+      ASSERT_OK(Put("cold-" + std::to_string(cold_key++), cold_value));
+    }
+    ASSERT_NE(old_memtable_id, cfd->mem()->GetID());
+    ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+    ASSERT_EQ(0U, options.statistics->getTickerCount(
+                      HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS));
+  }
+  ASSERT_EQ(second_value, Get("hot-key"));
+
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(second_value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferStoresDeleteAsLatestMutation) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 2;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  const std::string first_value(4096, 'a');
+  const std::string second_value(4096, 'b');
+  ASSERT_OK(Put("hot-key", first_value));
+  ASSERT_OK(Put("hot-key", second_value));
+  ASSERT_OK(db_->Delete(WriteOptions(), "hot-key"));
+  ASSERT_EQ("NOT_FOUND", Get("hot-key"));
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(cfd->hot_region()->empty());
+  Reopen(options);
+  ASSERT_EQ("NOT_FOUND", Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferMaterializesBeforeMultiGet) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 2;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  const std::string first_value(4096, 'a');
+  const std::string second_value(4096, 'b');
+  ASSERT_OK(Put("hot-key", first_value));
+  ASSERT_OK(Put("hot-key", second_value));
+
+  std::vector<std::string> values;
+  std::vector<Status> statuses =
+      db_->MultiGet(ReadOptions(), {Slice("hot-key"), Slice("missing")},
+                    &values);
+  ASSERT_EQ(2U, statuses.size());
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(second_value, values[0]);
+  ASSERT_TRUE(statuses[1].IsNotFound());
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_TRUE(cfd->hot_region()->empty());
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferMaterializesOnCapacityPressure) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  const std::string value(4096, 'a');
+  ASSERT_OK(Put("hot-key", value));
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_TRUE(cfd->hot_region()->empty());
+  ASSERT_EQ(value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferLruEvictsOnlyColdResidentKey) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 9000;
+  options.hot_key_max_buffered_value_size = 64U << 10;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+
+  const std::string first_value(1024, 'a');
+  const std::string second_value(1024, 'b');
+  ASSERT_OK(Put("cold-key", first_value));
+  ASSERT_OK(Put("hot-key", first_value));
+  ASSERT_OK(Put("hot-key", second_value));
+  ASSERT_GE(options.statistics->getTickerCount(
+                HOT_KEY_WRITE_BUFFER_IN_PLACE_UPDATES),
+            1U);
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  std::string read_value;
+  ASSERT_OK(db_->Get(ReadOptions(), "hot-key", &read_value));
+  for (size_t insert = 0;
+       !cfd->hot_region()->HasPendingEvictions() &&
+       options.statistics->getTickerCount(
+           HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS) == 0;
+       ++insert) {
+    ASSERT_LT(insert, 100U);
+    ASSERT_OK(db_->Get(ReadOptions(), "hot-key", &read_value));
+    ASSERT_OK(Put("new-key-" + std::to_string(insert),
+                  std::string(1024, static_cast<char>('c' + insert))));
+  }
+
+  ASSERT_EQ(second_value, Get("hot-key"));
+  ASSERT_EQ(first_value, Get("cold-key"));
+
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(second_value, Get("hot-key"));
+  ASSERT_EQ(first_value, Get("cold-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferMaterializesEvictionsInBackground) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.hot_key_max_buffered_value_size = 64U << 10;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+
+  std::atomic<size_t> completed_batches{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCallHotRegion:Done", [&](void*) {
+        completed_batches.fetch_add(1, std::memory_order_relaxed);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const std::string value(4096, 'v');
+  for (SequenceNumber sequence = 1;
+       completed_batches.load(std::memory_order_relaxed) == 0; ++sequence) {
+    ASSERT_LT(sequence, 10000U);
+    ASSERT_OK(Put("key-" + std::to_string(sequence), value));
+  }
+  ASSERT_OK(dbfull()->WaitForCompact());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_GT(completed_batches.load(std::memory_order_relaxed), 0U);
+  ASSERT_GT(options.statistics->getTickerCount(
+                HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS),
+            0U);
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferRequiresKeyValueSeparation) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.blob_size = size_t(-1);
+  options.create_if_missing = true;
+
+  DB* unsupported_db = nullptr;
+  Status status =
+      DB::Open(options, dbname_ + "_without_separation", &unsupported_db);
+  ASSERT_TRUE(status.IsInvalidArgument());
+  ASSERT_EQ(nullptr, unsupported_db);
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferSupportsPipelinedWrites) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.enable_pipelined_write = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  std::atomic<bool> saw_parallel_write{false};
+  std::atomic<size_t> parallel_decisions{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::PipelinedWriteImpl:ParallelMemTableWrite", [&](void* arg) {
+        parallel_decisions.fetch_add(1, std::memory_order_relaxed);
+        if (*static_cast<bool*>(arg)) {
+          saw_parallel_write.store(true, std::memory_order_relaxed);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  constexpr int kThreadCount = 4;
+  constexpr int kWritesPerThread = 100;
+  std::vector<std::thread> threads;
+  for (int thread = 0; thread < kThreadCount; ++thread) {
+    threads.emplace_back([&]() {
+      for (int update = 0; update < kWritesPerThread; ++update) {
+        ASSERT_OK(Put("hot-key", std::string(4096, 'a' + update % 26)));
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_GT(parallel_decisions.load(std::memory_order_relaxed), 0U);
+  ASSERT_TRUE(saw_parallel_write.load(std::memory_order_relaxed));
+  ASSERT_EQ(4096U, Get("hot-key").size());
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(4096U, Get("hot-key").size());
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferFlushesWalDisabledWriteOnClose) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  const std::string value(4096, 'a');
+  ASSERT_OK(Put("hot-key", value, write_options));
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_TRUE(cfd->mem()->IsEmpty());
+  ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+
+  Reopen(options);
+  ASSERT_EQ(value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferSupportsConcurrentOverwrites) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  constexpr int kThreadCount = 4;
+  constexpr int kWritesPerThread = 100;
+  std::atomic<int> next_value{0};
+  std::vector<std::thread> threads;
+  for (int thread = 0; thread < kThreadCount; ++thread) {
+    threads.emplace_back([&]() {
+      for (int write = 0; write < kWritesPerThread; ++write) {
+        const int value_number =
+            next_value.fetch_add(1, std::memory_order_relaxed);
+        ASSERT_OK(Put("hot-key", std::string(4096, 'a' + value_number % 26)));
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(cfd->hot_region()->empty());
+  Reopen(options);
+  ASSERT_EQ(4096U, Get("hot-key").size());
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferSerializesConcurrentPutDelete) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  ASSERT_OK(Put("hot-key", std::string(4096, 'a')));
+
+  struct WriteResult {
+    SequenceNumber sequence;
+    bool deleted;
+    std::string value;
+  };
+
+  std::atomic<bool> saw_parallel_write{false};
+  std::atomic<size_t> parallel_decisions{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteImpl:ParallelMemTableWrite", [&](void* arg) {
+        parallel_decisions.fetch_add(1, std::memory_order_relaxed);
+        if (*static_cast<bool*>(arg)) {
+          saw_parallel_write.store(true, std::memory_order_relaxed);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  constexpr int kThreadCount = 8;
+  constexpr int kWritesPerThread = 100;
+  std::mutex results_mutex;
+  std::vector<WriteResult> results;
+  results.reserve(kThreadCount * kWritesPerThread);
+  std::vector<std::thread> threads;
+  for (int thread = 0; thread < kThreadCount; ++thread) {
+    threads.emplace_back([&, thread]() {
+      for (int write = 0; write < kWritesPerThread; ++write) {
+        const bool deleted = (thread + write) % 3 == 0;
+        const std::string value =
+            deleted ? std::string()
+                    : std::string(4096, static_cast<char>('a' + thread));
+        WriteBatch batch;
+        if (deleted) {
+          ASSERT_OK(batch.Delete("hot-key"));
+        } else {
+          ASSERT_OK(batch.Put("hot-key", value));
+        }
+
+        SequenceNumber sequence = 0;
+        ASSERT_OK(dbfull()->TEST_WriteWithSequence(WriteOptions(), &batch,
+                                                   &sequence));
+        std::lock_guard<std::mutex> lock(results_mutex);
+        results.push_back(WriteResult{sequence, deleted, value});
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(kThreadCount * kWritesPerThread, results.size());
+  const auto latest = std::max_element(
+      results.begin(), results.end(),
+      [](const WriteResult& left, const WriteResult& right) {
+        return left.sequence < right.sequence;
+      });
+  ASSERT_NE(results.end(), latest);
+  ASSERT_GT(parallel_decisions.load(std::memory_order_relaxed), 0U);
+  ASSERT_TRUE(saw_parallel_write.load(std::memory_order_relaxed));
+  ASSERT_EQ(latest->deleted ? "NOT_FOUND" : latest->value, Get("hot-key"));
+
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(latest->deleted ? "NOT_FOUND" : latest->value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferRecoversWalWithoutShutdownFlush) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.avoid_flush_during_shutdown = true;
+  Reopen(options);
+
+  const std::string value(4096, 'a');
+  ASSERT_OK(Put("hot-key", value));
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_TRUE(cfd->mem()->IsEmpty());
+  ASSERT_EQ(1U, cfd->hot_region()->entry_count());
+
+  Reopen(options);
+  ASSERT_EQ(value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferMaterializesBeforeMerge) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  options.max_successive_merges = 1;
+  Reopen(options);
+
+  const std::string value(4096, 'a');
+  ASSERT_OK(Put("hot-key", value));
+  ASSERT_OK(db_->Merge(WriteOptions(), "hot-key", "tail"));
+
+  const std::string merged = Get("hot-key");
+  ASSERT_NE(std::string::npos, merged.find("tail"));
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_TRUE(cfd->hot_region()->empty());
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_NE(std::string::npos, Get("hot-key").find("tail"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferSupportsSynchronousWalWrites) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  WriteOptions write_options;
+  write_options.sync = true;
+  const std::string value(4096, 'a');
+  ASSERT_OK(Put("hot-key", value, write_options));
+  ASSERT_EQ(value, Get("hot-key"));
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ(value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferFlushesResidentsInBatches) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 16U << 20;
+  options.write_buffer_size = 64U << 10;
+  options.max_write_buffer_number = 2;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  constexpr int kKeyCount = 768;
+  const std::string value(4096, 'v');
+  for (int key = 0; key < kKeyCount; ++key) {
+    ASSERT_OK(Put("hot-" + std::to_string(key), value));
+  }
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_EQ(kKeyCount, cfd->hot_region()->entry_count());
+  ASSERT_TRUE(cfd->mem()->IsEmpty());
+
+  std::atomic<int> batch_count{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::MaterializeHotKeysForFlush:Batch",
+      [&](void*) { batch_count.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_GE(batch_count.load(), 3);
+  ASSERT_TRUE(cfd->hot_region()->empty());
+  for (int key = 0; key < kKeyCount; ++key) {
+    ASSERT_EQ(value, Get("hot-" + std::to_string(key)));
+  }
+  Reopen(options);
+  for (int key = 0; key < kKeyCount; ++key) {
+    ASSERT_EQ(value, Get("hot-" + std::to_string(key)));
+  }
+}
 
 TEST_F(DBBasicTest, OpenWhenOpen) {
   Options options = CurrentOptions();

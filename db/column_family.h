@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/hot_region.h"
 #include "db/memtable_list.h"
 #include "db/table_cache.h"
 #include "db/table_properties_collector.h"
@@ -143,6 +144,9 @@ extern Status CheckCompressionSupported(const ColumnFamilyOptions& cf_options);
 extern Status CheckConcurrentWritesSupported(
     const ColumnFamilyOptions& cf_options);
 
+extern Status CheckHotKeyWriteBufferSupported(
+    const ColumnFamilyOptions& cf_options);
+
 extern Status CheckCFPathsSupported(const DBOptions& db_options,
                                     const ColumnFamilyOptions& cf_options);
 
@@ -204,8 +208,20 @@ class ColumnFamilyData {
   // thread-safe
   int NumberLevels() const { return ioptions_.num_levels; }
 
-  void SetLogNumber(uint64_t log_number) { log_number_ = log_number; }
-  uint64_t GetLogNumber() const { return log_number_; }
+  void SetLogNumber(uint64_t log_number) {
+    log_number_.store(log_number, std::memory_order_relaxed);
+  }
+  uint64_t GetLogNumber() const {
+    return log_number_.load(std::memory_order_relaxed);
+  }
+  void RetainLogNumber(uint64_t log_number) {
+    uint64_t current = GetLogNumber();
+    while (log_number < current &&
+           !log_number_.compare_exchange_weak(
+               current, log_number, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+  }
 
   void SetFlushReason(FlushReason flush_reason) {
     flush_reason_ = flush_reason;
@@ -259,6 +275,28 @@ class ColumnFamilyData {
 
   // calculate the oldest log needed for the durability of this column family
   uint64_t OldestLogToKeep();
+
+  HotRegion* hot_region() {
+    return hot_region_.get();
+  }
+
+  const HotRegion* hot_region() const {
+    return hot_region_.get();
+  }
+
+  bool IsHotKeyWriteBufferEnabled() const {
+    return hot_region_ != nullptr;
+  }
+
+  bool IsHotKeyBufferEligible(const Slice& key, const Slice& value) const {
+    if (hot_region_ == nullptr || !hot_region_->CanBuffer(value) ||
+        value.size() < mutable_cf_options_.blob_size) {
+      return false;
+    }
+    return static_cast<double>(key.size()) <=
+           static_cast<double>(value.size()) *
+               mutable_cf_options_.blob_large_key_ratio;
+  }
 
   // See Memtable constructor for explanation of earliest_seq param.
   MemTable* ConstructNewMemtable(const MutableCFOptions& mutable_cf_options,
@@ -382,6 +420,19 @@ class ColumnFamilyData {
   bool queued_for_garbage_collection() {
     return queued_for_garbage_collection_;
   }
+  bool TryScheduleHotRegionMaterialization() {
+    bool expected = false;
+    return hot_region_materialization_scheduled_.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel);
+  }
+  void ClearHotRegionMaterializationScheduled() {
+    hot_region_materialization_scheduled_.store(false,
+                                                std::memory_order_release);
+  }
+  bool hot_region_materialization_scheduled() const {
+    return hot_region_materialization_scheduled_.load(
+        std::memory_order_acquire);
+  }
 
   enum class WriteStallCause {
     kNone,
@@ -450,6 +501,8 @@ class ColumnFamilyData {
 
   std::unique_ptr<InternalStats> internal_stats_;
 
+  std::unique_ptr<HotRegion> hot_region_;
+
   WriteBufferManager* write_buffer_manager_;
 
   MemTable* mem_;
@@ -474,7 +527,7 @@ class ColumnFamilyData {
   // This is the earliest log file number that contains data from this
   // Column Family. All earlier log files must be ignored and not
   // recovered from
-  uint64_t log_number_;
+  std::atomic<uint64_t> log_number_;
 
   std::atomic<FlushReason> flush_reason_;
 
@@ -494,6 +547,7 @@ class ColumnFamilyData {
   bool queued_for_compaction_;
 
   bool queued_for_garbage_collection_;
+  std::atomic<bool> hot_region_materialization_scheduled_{false};
 
   uint64_t prev_compaction_needed_bytes_;
 

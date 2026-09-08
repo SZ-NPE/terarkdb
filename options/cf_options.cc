@@ -44,6 +44,14 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
       max_write_buffer_number_to_maintain(
           cf_options.max_write_buffer_number_to_maintain),
       enable_lazy_compaction(cf_options.enable_lazy_compaction),
+      enable_hot_key_write_buffer(cf_options.enable_hot_key_write_buffer),
+      hot_key_write_buffer_size(cf_options.hot_key_write_buffer_size),
+      hot_key_admission_threshold(cf_options.hot_key_admission_threshold),
+      hot_key_sketch_columns(cf_options.hot_key_sketch_columns),
+      hot_key_sketch_decay_interval(
+          cf_options.hot_key_sketch_decay_interval),
+      hot_key_max_buffered_value_size(
+          cf_options.hot_key_max_buffered_value_size),
       pin_table_properties_in_reader(cf_options.pin_table_properties_in_reader),
       inplace_update_support(cf_options.inplace_update_support),
       inplace_callback(cf_options.inplace_callback),

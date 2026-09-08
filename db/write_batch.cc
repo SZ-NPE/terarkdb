@@ -1009,9 +1009,11 @@ class MemTableInserter : public WriteBatch::Handler {
   const uint64_t recovering_log_number_;
   // log number that all Memtables inserted into should reference
   uint64_t log_number_ref_;
+  uint64_t current_wal_number_;
   DBImpl* db_;
   const bool concurrent_memtable_writes_;
   bool post_info_created_;
+  bool wrote_to_memtable_;
 
   bool* has_valid_writes_;
   // On some (!) platforms just default creating
@@ -1079,9 +1081,11 @@ class MemTableInserter : public WriteBatch::Handler {
         ignore_missing_column_families_(ignore_missing_column_families),
         recovering_log_number_(recovering_log_number),
         log_number_ref_(0),
+        current_wal_number_(0),
         db_(reinterpret_cast<DBImpl*>(db)),
         concurrent_memtable_writes_(concurrent_memtable_writes),
         post_info_created_(false),
+        wrote_to_memtable_(false),
         has_valid_writes_(has_valid_writes),
         rebuilding_trx_(nullptr),
         rebuilding_trx_seq_(0),
@@ -1131,7 +1135,15 @@ class MemTableInserter : public WriteBatch::Handler {
 
   void set_log_number_ref(uint64_t log) { log_number_ref_ = log; }
 
+  void set_current_wal_number(uint64_t wal_number) {
+    current_wal_number_ = wal_number;
+  }
+
   SequenceNumber sequence() const { return sequence_; }
+
+  bool wrote_to_memtable() const { return wrote_to_memtable_; }
+
+  void BeginWriteBatch() { wrote_to_memtable_ = false; }
 
   void PostProcess() {
     assert(concurrent_memtable_writes_);
@@ -1210,13 +1222,45 @@ class MemTableInserter : public WriteBatch::Handler {
 
     MemTable* mem = cf_mems_->GetMemTable();
     auto* moptions = mem->GetImmutableMemTableOptions();
+    ColumnFamilyData* cfd = cf_mems_->current();
+    HotRegion* hot_region = cfd == nullptr ? nullptr : cfd->hot_region();
+    const bool can_buffer =
+        recovering_log_number_ == 0 && value_type == kTypeValue &&
+        cfd != nullptr && hot_region != nullptr &&
+        cfd->IsHotKeyBufferEligible(key, value);
+    if (can_buffer) {
+      const auto result = hot_region->TryPut(
+          key, value, sequence_, mem->GetID(), false, current_wal_number_);
+      if (result != HotRegion::PutResult::kBypass) {
+        RecordTick(cfd->ioptions()->statistics,
+                   HOT_KEY_WRITE_BUFFER_COALESCED_WRITES);
+        if (result == HotRegion::PutResult::kUpdatedInPlace) {
+          RecordTick(cfd->ioptions()->statistics,
+                     HOT_KEY_WRITE_BUFFER_IN_PLACE_UPDATES);
+        }
+        if (db_ != nullptr && hot_region->HasPendingEvictions()) {
+          db_->ScheduleHotRegionMaterialization(cfd);
+        }
+        MaybeAdvanceSeq();
+        CheckMemtableFull();
+        return Status::OK();
+      }
+    }
+    wrote_to_memtable_ = true;
     // inplace_update_support is inconsistent with snapshots, and therefore with
     // any kind of transactions including the ones that use seq_per_batch
     assert(!seq_per_batch_ || !moptions->inplace_update_support);
     if (!moptions->inplace_update_support) {
-      bool mem_res =
-          mem->Add(sequence_, value_type, key, value,
-                   concurrent_memtable_writes_, get_post_process_info(mem));
+      auto add_to_memtable = [&]() {
+        return mem->Add(sequence_, value_type, key, value,
+                        concurrent_memtable_writes_,
+                        get_post_process_info(mem));
+      };
+      const bool mem_res =
+          recovering_log_number_ == 0 && hot_region != nullptr
+              ? hot_region->ApplyBypassMutation(
+                    key, sequence_, add_to_memtable)
+              : add_to_memtable();
       if (UNLIKELY(!mem_res)) {
         assert(seq_per_batch_);
         ret_status = Status::TryAgain("key+seq exists");
@@ -1310,6 +1354,54 @@ class MemTableInserter : public WriteBatch::Handler {
     return ret_status;
   }
 
+  Status DeleteCFImpl(uint32_t column_family_id, const Slice& key,
+                      ValueType delete_type) {
+    ColumnFamilyData* cfd = cf_mems_->current();
+    HotRegion* hot_region = cfd == nullptr ? nullptr : cfd->hot_region();
+    if (recovering_log_number_ == 0 && hot_region != nullptr &&
+        delete_type == kTypeDeletion) {
+      const auto result = hot_region->TryDelete(
+          key, delete_type, sequence_, cf_mems_->GetMemTable()->GetID(),
+          current_wal_number_);
+      if (result != HotRegion::PutResult::kBypass) {
+        RecordTick(cfd->ioptions()->statistics,
+                   HOT_KEY_WRITE_BUFFER_COALESCED_WRITES);
+        if (result == HotRegion::PutResult::kUpdatedInPlace) {
+          RecordTick(cfd->ioptions()->statistics,
+                     HOT_KEY_WRITE_BUFFER_IN_PLACE_UPDATES);
+        }
+        if (db_ != nullptr && hot_region->HasPendingEvictions()) {
+          db_->ScheduleHotRegionMaterialization(cfd);
+        }
+        MaybeAdvanceSeq();
+        CheckMemtableFull();
+        return Status::OK();
+      }
+    }
+    wrote_to_memtable_ = true;
+    if (recovering_log_number_ == 0 && hot_region != nullptr &&
+        delete_type == kTypeDeletion) {
+      Status status;
+      const bool mem_res = hot_region->ApplyBypassMutation(
+          key, sequence_, [&]() {
+            MemTable* mem = cf_mems_->GetMemTable();
+            return mem->Add(sequence_, delete_type, key, Slice(),
+                            concurrent_memtable_writes_,
+                            get_post_process_info(mem));
+          });
+      if (UNLIKELY(!mem_res)) {
+        assert(seq_per_batch_);
+        status = Status::TryAgain("key+seq exists");
+        const bool batch_boundary = true;
+        MaybeAdvanceSeq(batch_boundary);
+      }
+      MaybeAdvanceSeq();
+      CheckMemtableFull();
+      return status;
+    }
+    return DeleteImpl(column_family_id, key, Slice(), delete_type);
+  }
+
   virtual Status DeleteCF(uint32_t column_family_id,
                           const Slice& key) override {
     // optimize for non-recovery mode
@@ -1333,7 +1425,8 @@ class MemTableInserter : public WriteBatch::Handler {
       return seek_status;
     }
 
-    auto ret_status = DeleteImpl(column_family_id, key, Slice(), kTypeDeletion);
+    auto ret_status =
+        DeleteCFImpl(column_family_id, key, kTypeDeletion);
     // optimize for non-recovery mode
     if (UNLIKELY(!ret_status.IsTryAgain() && rebuilding_trx_ != nullptr)) {
       assert(!write_after_commit_);
@@ -1368,8 +1461,15 @@ class MemTableInserter : public WriteBatch::Handler {
       return seek_status;
     }
 
+    if (db_ != nullptr && recovering_log_number_ == 0) {
+      wrote_to_memtable_ = true;
+      seek_status = db_->MaterializeHotKey(cf_mems_->current(), key);
+      if (!seek_status.ok()) {
+        return seek_status;
+      }
+    }
     auto ret_status =
-        DeleteImpl(column_family_id, key, Slice(), kTypeSingleDeletion);
+        DeleteCFImpl(column_family_id, key, kTypeSingleDeletion);
     // optimize for non-recovery mode
     if (UNLIKELY(!ret_status.IsTryAgain() && rebuilding_trx_ != nullptr)) {
       assert(!write_after_commit_);
@@ -1408,6 +1508,7 @@ class MemTableInserter : public WriteBatch::Handler {
       return seek_status;
     }
     if (db_ != nullptr) {
+      wrote_to_memtable_ = true;
       auto cf_handle = cf_mems_->GetColumnFamilyHandle();
       if (cf_handle == nullptr) {
         cf_handle = db_->DefaultColumnFamily();
@@ -1418,6 +1519,12 @@ class MemTableInserter : public WriteBatch::Handler {
             std::string("DeleteRange not supported for table type ") +
             cfd->ioptions()->table_factory->Name() + " in CF " +
             cfd->GetName());
+      }
+      if (recovering_log_number_ == 0) {
+        seek_status = db_->MaterializeAllHotKeys(cfd);
+        if (!seek_status.ok()) {
+          return seek_status;
+        }
       }
     }
 
@@ -1459,6 +1566,13 @@ class MemTableInserter : public WriteBatch::Handler {
       return seek_status;
     }
 
+    if (db_ != nullptr && recovering_log_number_ == 0) {
+      wrote_to_memtable_ = true;
+      seek_status = db_->MaterializeHotKey(cf_mems_->current(), key);
+      if (!seek_status.ok()) {
+        return seek_status;
+      }
+    }
     Status ret_status;
     MemTable* mem = cf_mems_->GetMemTable();
     auto* moptions = mem->GetImmutableMemTableOptions();
@@ -1469,7 +1583,8 @@ class MemTableInserter : public WriteBatch::Handler {
     // DB mutex and cause deadlock, as DB mutex is already held.
     // So we disable merge in recovery
     if (moptions->max_successive_merges > 0 && db_ != nullptr &&
-        recovering_log_number_ == 0) {
+        recovering_log_number_ == 0 &&
+        cf_mems_->current()->hot_region() == nullptr) {
       LookupKey lkey(key, sequence_);
 
       // Count the number of successive merges at the head
@@ -1733,6 +1848,7 @@ Status WriteBatchInternal::InsertInto(
     if (w->CallbackFailed()) {
       continue;
     }
+    inserter.BeginWriteBatch();
     w->sequence = inserter.sequence();
     if (!w->ShouldWriteToMemtable()) {
       // In seq_per_batch_ mode this advances the seq by one.
@@ -1741,7 +1857,10 @@ Status WriteBatchInternal::InsertInto(
     }
     SetSequence(w->batch, inserter.sequence());
     inserter.set_log_number_ref(w->log_ref);
+    inserter.set_current_wal_number(w->disable_wal ? 0 : w->log_used);
     w->status = w->batch->Iterate(&inserter);
+    w->memtable_write_bytes =
+        inserter.wrote_to_memtable() ? ByteSize(w->batch) : 0;
     if (!w->status.ok()) {
       return w->status;
     }
@@ -1767,7 +1886,11 @@ Status WriteBatchInternal::InsertInto(
       seq_per_batch, batch_per_txn);
   SetSequence(writer->batch, sequence);
   inserter.set_log_number_ref(writer->log_ref);
+  inserter.set_current_wal_number(writer->disable_wal ? 0 : writer->log_used);
+  inserter.BeginWriteBatch();
   Status s = writer->batch->Iterate(&inserter);
+  writer->memtable_write_bytes =
+      inserter.wrote_to_memtable() ? ByteSize(writer->batch) : 0;
   assert(!seq_per_batch || batch_cnt != 0);
   assert(!seq_per_batch || inserter.sequence() - sequence == batch_cnt);
   if (concurrent_memtable_writes) {

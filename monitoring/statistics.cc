@@ -141,6 +141,14 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {GC_SKIP_GET_BY_FILE, "rocksdb.num.gc.skip_by_file_meta"},
     {READ_BLOB_VALID, "rocksdb.num.read.blob_valid"},
     {READ_BLOB_INVALID, "rocksdb.num.read.blob_invalid"},
+    {HOT_KEY_WRITE_BUFFER_COALESCED_WRITES,
+     "rocksdb.hot.key.write.buffer.coalesced.writes"},
+    {HOT_KEY_WRITE_BUFFER_IN_PLACE_UPDATES,
+     "rocksdb.hot.key.write.buffer.in.place.updates"},
+    {HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS,
+     "rocksdb.hot.key.write.buffer.materialized.keys"},
+    {HOT_KEY_WRITE_BUFFER_MATERIALIZED_BYTES,
+     "rocksdb.hot.key.write.buffer.materialized.bytes"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

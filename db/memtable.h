@@ -189,6 +189,12 @@ class MemTable {
            const Slice& value, bool allow_concurrent = false,
            MemTablePostProcessInfo* post_process_info = nullptr);
 
+  // Inserts a previously published hot-key mutation using its original
+  // sequence.
+  // REQUIRES: external synchronization to prevent simultaneous writes.
+  bool AddMaterializedMutation(SequenceNumber sequence, ValueType type,
+                               const Slice& key, const Slice& value);
+
   // If memtable contains a value for key, store it in *value and return true.
   // If memtable contains a deletion for key, store a NotFound() error
   // in *status and return true.

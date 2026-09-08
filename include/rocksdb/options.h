@@ -332,6 +332,26 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // 0 to 1
   double maintainer_job_ratio = 0.1;
 
+  // Enable HeatKV's in-memory overwrite coalescing for separated values.
+  // Repeated updates to an admitted hot key are collapsed into one value and
+  // materialized before the current MemTable becomes immutable.
+  bool enable_hot_key_write_buffer = false;
+
+  // Maximum approximate memory occupied by coalesced hot-key values.
+  size_t hot_key_write_buffer_size = 64U << 20;
+
+  // Number of observed overwrites before a key is admitted.
+  uint32_t hot_key_admission_threshold = 16;
+
+  // Number of columns in each Count-Min Sketch row. Must be a power of two.
+  uint32_t hot_key_sketch_columns = 1U << 20;
+
+  // Number of overwrite reports between Count-Min Sketch decay passes.
+  uint64_t hot_key_sketch_decay_interval = 1U << 20;
+
+  // Maximum value size admitted into the hot-key write buffer.
+  size_t hot_key_max_buffered_value_size = 1U << 20;
+
   // This is a factory that provides TableFactory objects.
   // Default: a block-based table factory that provides a default
   // implementation of TableBuilder and TableReader with default

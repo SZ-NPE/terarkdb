@@ -492,7 +492,19 @@ public enum TickerType {
 
     SKIP_GC_GET_BY_FILE((byte) 0x64),
 
-    TICKER_ENUM_MAX((byte) 0x65);
+    READ_BLOB_VALID((byte) 0x65),
+
+    READ_BLOB_INVALID((byte) 0x66),
+
+    HOT_KEY_WRITE_BUFFER_COALESCED_WRITES((byte) 0x67),
+
+    HOT_KEY_WRITE_BUFFER_IN_PLACE_UPDATES((byte) 0x68),
+
+    HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS((byte) 0x69),
+
+    HOT_KEY_WRITE_BUFFER_MATERIALIZED_BYTES((byte) 0x6A),
+
+    TICKER_ENUM_MAX((byte) 0x6B);
 
 
     private final byte value;

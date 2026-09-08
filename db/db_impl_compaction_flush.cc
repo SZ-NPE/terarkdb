@@ -1573,11 +1573,94 @@ void DBImpl::PrepareFlushReqVec(FlushRequestVec& req_vec, bool force_flush) {
   }
 }
 
+Status DBImpl::MaterializeHotKeysForFlush(ColumnFamilyData* cfd,
+                                          FlushReason flush_reason) {
+  mutex_.AssertHeld();
+  if (cfd == nullptr || cfd->hot_region() == nullptr ||
+      cfd->hot_region()->empty()) {
+    return Status::OK();
+  }
+
+  const size_t write_buffer_size =
+      cfd->GetLatestMutableCFOptions()->write_buffer_size;
+  const size_t batch_value_bytes =
+      std::max<size_t>(1U << 20, write_buffer_size / 2);
+  bool prepared_residents = false;
+
+  while (!cfd->hot_region()->empty()) {
+    Status status;
+    if (cfd->mem()->IsEmpty()) {
+      WriteLock publish_lock(&hot_key_publish_mutex_);
+      if (!prepared_residents) {
+        cfd->hot_region()->PrepareAllForMaterialization();
+        prepared_residents = true;
+      }
+      status = MaterializeEvictedHotKeys(cfd, batch_value_bytes);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+
+    if (cfd->mem()->IsEmpty()) {
+      // A reader can temporarily pin an LRU entry. Retry after releasing the
+      // DB mutex so the reader can finish and release its cache handle.
+      mutex_.Unlock();
+      env_->SleepForMicroseconds(100);
+      mutex_.Lock();
+      prepared_residents = false;
+      continue;
+    }
+
+    uint64_t flush_memtable_id = 0;
+    {
+      WriteContext context(immutable_db_options_.info_log.get());
+      status = SwitchMemtable(cfd, &context,
+                              false /* materialize_hot_key_evictions */);
+      if (!status.ok()) {
+        return status;
+      }
+
+      FlushRequestVec flush_req_vec;
+      flush_req_vec.emplace_back();
+      flush_req_vec.front().emplace_back(cfd, 0);
+      PrepareFlushReqVec(flush_req_vec, true /* force_flush */);
+      flush_memtable_id = flush_req_vec.front().front().second;
+      SchedulePendingFlush(flush_req_vec, flush_reason);
+      MaybeScheduleFlushOrCompaction();
+      mutex_.Unlock();
+    }
+
+    status = WaitForFlushMemTable(cfd, &flush_memtable_id, false);
+    mutex_.Lock();
+    if (!status.ok()) {
+      return status;
+    }
+    TEST_SYNC_POINT("DBImpl::MaterializeHotKeysForFlush:Batch");
+  }
+  return Status::OK();
+}
+
 Status DBImpl::FlushMemTable(
     const autovector<ColumnFamilyData*>& column_family_datas,
     const FlushOptions& flush_options, FlushReason flush_reason,
     bool writes_stopped) {
   Status s;
+  if (!writes_stopped &&
+      has_hot_key_write_buffer_.load(std::memory_order_relaxed)) {
+    InstrumentedMutexLock lock(&mutex_);
+    WriteThread::Writer writer;
+    write_thread_.EnterUnbatched(&writer, &mutex_);
+    for (auto* cfd : column_family_datas) {
+      s = MaterializeHotKeysForFlush(cfd, flush_reason);
+      if (!s.ok()) {
+        break;
+      }
+    }
+    write_thread_.ExitUnbatched(&writer);
+    if (!s.ok()) {
+      return s;
+    }
+  }
   if (!flush_options.allow_write_stall) {
     int num_cfs_to_flush = 0;
     for (auto cfd : column_family_datas) {
@@ -1606,6 +1689,21 @@ Status DBImpl::FlushMemTable(
     }
 
     ProcessAtomicFlushGroup(&cfds, &flush_req_vec);
+    {
+      WriteLock publish_lock(&hot_key_publish_mutex_);
+      for (auto* cfd : cfds) {
+        s = MaterializeAllHotKeys(cfd);
+        if (!s.ok()) {
+          break;
+        }
+      }
+    }
+    if (!s.ok()) {
+      if (!writes_stopped) {
+        write_thread_.ExitUnbatched(&w);
+      }
+      return s;
+    }
     for (auto cfd : cfds) {
       if (!cfd->mem()->IsEmpty() || !cached_recoverable_state_empty_.load()) {
         cfd->Ref();
@@ -2060,6 +2158,13 @@ void DBImpl::BGWorkFlush(void* db) {
   TEST_SYNC_POINT("DBImpl::BGWorkFlush:done");
 }
 
+void DBImpl::BGWorkHotRegion(void* arg) {
+  IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
+  std::unique_ptr<HotRegionArg> hot_region_arg(
+      static_cast<HotRegionArg*>(arg));
+  hot_region_arg->db->BackgroundCallHotRegion(hot_region_arg->cfd);
+}
+
 void DBImpl::BGWorkCompaction(void* arg) {
   CompactionArg ca = *(reinterpret_cast<CompactionArg*>(arg));
   delete reinterpret_cast<CompactionArg*>(arg);
@@ -2109,6 +2214,68 @@ void DBImpl::UnscheduleCallback(void* arg) {
     delete ca.prepicked_compaction;
   }
   TEST_SYNC_POINT("DBImpl::UnscheduleCallback");
+}
+
+void DBImpl::UnscheduleHotRegionCallback(void* arg) {
+  std::unique_ptr<HotRegionArg> hot_region_arg(
+      static_cast<HotRegionArg*>(arg));
+  ColumnFamilyData* cfd = hot_region_arg->cfd;
+  DBImpl* db = hot_region_arg->db;
+  db->mutex_.AssertHeld();
+  cfd->ClearHotRegionMaterializationScheduled();
+  const int previous =
+      db->bg_hot_region_scheduled_.fetch_sub(1, std::memory_order_relaxed);
+  assert(previous > 0);
+  if (cfd->Unref()) {
+    delete cfd;
+  }
+  db->bg_cv_.SignalAll();
+}
+
+void DBImpl::BackgroundCallHotRegion(ColumnFamilyData* cfd) {
+  constexpr size_t kBatchValueBytes = 4U << 20;
+  constexpr size_t kBatchEntries = 1024;
+  Status status;
+  bool reschedule = false;
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    WriteContext write_context(immutable_db_options_.info_log.get());
+    WriteThread::Writer writer;
+    if (!shutting_down_.load(std::memory_order_acquire) &&
+        !cfd->IsDropped()) {
+      write_thread_.EnterUnbatched(&writer, &mutex_);
+      {
+        WriteLock publish_lock(&hot_key_publish_mutex_);
+        status = MaterializeEvictedHotKeys(
+            cfd, kBatchValueBytes, kBatchEntries);
+      }
+      if (status.ok() && cfd->hot_region() != nullptr) {
+        reschedule = cfd->hot_region()->HasPendingEvictions();
+      }
+      if (status.ok() && cfd->mem()->ShouldScheduleFlush() &&
+          cfd->mem()->MarkFlushScheduled()) {
+        flush_scheduler_.ScheduleFlush(cfd);
+      }
+      if (status.ok() && !flush_scheduler_.Empty()) {
+        status = ScheduleFlushes(&write_context);
+      }
+      write_thread_.ExitUnbatched(&writer);
+    }
+
+    cfd->ClearHotRegionMaterializationScheduled();
+    const int previous =
+        bg_hot_region_scheduled_.fetch_sub(1, std::memory_order_relaxed);
+    assert(previous > 0);
+    if (reschedule &&
+        !shutting_down_.load(std::memory_order_acquire)) {
+      ScheduleHotRegionMaterialization(cfd);
+    }
+    if (cfd->Unref()) {
+      delete cfd;
+    }
+    TEST_SYNC_POINT("DBImpl::BackgroundCallHotRegion:Done");
+    bg_cv_.SignalAll();
+  }
 }
 
 Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,

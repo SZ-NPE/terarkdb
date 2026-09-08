@@ -11,6 +11,8 @@
 #include <stdint.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "db/log_format.h"
 #include "rocksdb/options.h"
@@ -114,6 +116,9 @@ class Reader {
   // TODO (yanqin) add support for retry policy, e.g. sleep, max retry limit,
   // etc.
   const bool retry_after_eof_;
+  std::vector<std::string> deduplicated_values_;
+
+  bool DecodeRecord(const Slice& input, std::string* scratch, Slice* output);
 
   // Extend record types with the following special values
   enum {

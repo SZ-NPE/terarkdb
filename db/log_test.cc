@@ -9,6 +9,10 @@
 
 #include "db/log_reader.h"
 #include "db/log_writer.h"
+#include "db/write_batch_internal.h"
+
+#include <cstring>
+
 #include "rocksdb/env.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/coding.h"
@@ -642,6 +646,60 @@ TEST_P(LogTest, Recycle) {
 }
 
 INSTANTIATE_TEST_CASE_P(bool, LogTest, ::testing::Values(0, 2));
+
+TEST(DeduplicatedLogTest, RoundTripsRepeatedBlocks) {
+  class MemorySource : public SequentialFile {
+   public:
+    explicit MemorySource(Slice* contents) : contents_(contents) {}
+
+    Status Read(size_t size, Slice* result, char* scratch) override {
+      const size_t bytes = std::min(size, contents_->size());
+      std::memcpy(scratch, contents_->data(), bytes);
+      *result = Slice(scratch, bytes);
+      contents_->remove_prefix(bytes);
+      return Status::OK();
+    }
+
+    Status Skip(uint64_t bytes) override {
+      contents_->remove_prefix(
+          std::min<size_t>(bytes, contents_->size()));
+      return Status::OK();
+    }
+
+   private:
+    Slice* contents_;
+  };
+
+  Slice contents;
+  std::unique_ptr<WritableFileWriter> destination(
+      test::GetWritableFileWriter(new test::StringSink(&contents), ""));
+  Writer writer(std::move(destination), 123, false, false, true);
+  const std::string value(128U << 10, 'x');
+  WriteBatch first;
+  WriteBatch second;
+  ASSERT_OK(first.Put("first", value));
+  ASSERT_OK(second.Put("second", value));
+  ASSERT_OK(writer.AddRecord(WriteBatchInternal::Contents(&first)));
+  ASSERT_OK(writer.AddRecord(WriteBatchInternal::Contents(&second)));
+  ASSERT_OK(writer.WriteBuffer());
+  ASSERT_LT(contents.size(), value.size() + value.size() / 4);
+
+  class Reporter : public Reader::Reporter {
+   public:
+    void Corruption(size_t, const Status& status) override {
+      ADD_FAILURE() << status.ToString();
+    }
+  } reporter;
+  std::unique_ptr<SequentialFileReader> source(test::GetSequentialFileReader(
+      new MemorySource(&contents), ""));
+  Reader reader(nullptr, std::move(source), &reporter, true, 123, false);
+  std::string scratch;
+  Slice record;
+  ASSERT_TRUE(reader.ReadRecord(&record, &scratch));
+  ASSERT_EQ(WriteBatchInternal::Contents(&first), record);
+  ASSERT_TRUE(reader.ReadRecord(&record, &scratch));
+  ASSERT_EQ(WriteBatchInternal::Contents(&second), record);
+}
 
 class RetriableLogTest : public ::testing::TestWithParam<int> {
  private:

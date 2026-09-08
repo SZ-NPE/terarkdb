@@ -154,6 +154,44 @@ Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options) {
   return Status::OK();
 }
 
+Status CheckHotKeyWriteBufferSupported(
+    const ColumnFamilyOptions& cf_options) {
+  if (!cf_options.enable_hot_key_write_buffer) {
+    return Status::OK();
+  }
+  if (cf_options.blob_size == size_t(-1)) {
+    return Status::InvalidArgument(
+        "hot-key write buffering requires key-value separation");
+  }
+  if (cf_options.inplace_update_support) {
+    return Status::InvalidArgument(
+        "hot-key write buffering is incompatible with in-place updates");
+  }
+  if (cf_options.hot_key_write_buffer_size == 0) {
+    return Status::InvalidArgument(
+        "hot_key_write_buffer_size must be greater than zero");
+  }
+  if (cf_options.hot_key_admission_threshold == 0) {
+    return Status::InvalidArgument(
+        "hot_key_admission_threshold must be greater than zero");
+  }
+  if (cf_options.hot_key_sketch_columns == 0 ||
+      (cf_options.hot_key_sketch_columns &
+       (cf_options.hot_key_sketch_columns - 1)) != 0) {
+    return Status::InvalidArgument(
+        "hot_key_sketch_columns must be a power of two");
+  }
+  if (cf_options.hot_key_sketch_decay_interval == 0) {
+    return Status::InvalidArgument(
+        "hot_key_sketch_decay_interval must be greater than zero");
+  }
+  if (cf_options.hot_key_max_buffered_value_size == 0) {
+    return Status::InvalidArgument(
+        "hot_key_max_buffered_value_size must be greater than zero");
+  }
+  return Status::OK();
+}
+
 Status CheckCFPathsSupported(const DBOptions& db_options,
                              const ColumnFamilyOptions& cf_options) {
   // More than one cf_paths are supported only in universal
@@ -449,6 +487,19 @@ ColumnFamilyData::ColumnFamilyData(
       last_memtable_id_(0) {
   Ref();
 
+  if (ioptions_.enable_hot_key_write_buffer) {
+    HotRegion::Options hot_region_options;
+    hot_region_options.capacity = ioptions_.hot_key_write_buffer_size;
+    hot_region_options.max_value_size =
+        ioptions_.hot_key_max_buffered_value_size;
+    hot_region_options.doorkeeper_bytes = 16U << 20;
+    hot_region_options.admission_threshold =
+        ioptions_.hot_key_admission_threshold;
+    hot_region_options.rotation_interval =
+        ioptions_.hot_key_sketch_decay_interval;
+    hot_region_.reset(new HotRegion(hot_region_options));
+  }
+
   // if _dummy_versions is nullptr, then this is a dummy column family.
   if (_dummy_versions != nullptr) {
     internal_stats_.reset(
@@ -516,6 +567,7 @@ ColumnFamilyData::~ColumnFamilyData() {
   assert(queued_for_flush_ == 0);
   assert(!queued_for_compaction_);
   assert(!queued_for_garbage_collection_);
+  assert(!hot_region_materialization_scheduled());
 
   if (super_version_ != nullptr) {
     // Release SuperVersion reference kept in ThreadLocalPtr.
@@ -566,6 +618,12 @@ ColumnFamilyOptions ColumnFamilyData::GetLatestCFOptions() const {
 
 uint64_t ColumnFamilyData::OldestLogToKeep() {
   auto current_log = GetLogNumber();
+  if (hot_region_ != nullptr) {
+    const uint64_t hot_key_log = hot_region_->OldestWalNumber();
+    if (hot_key_log > 0 && hot_key_log < current_log) {
+      current_log = hot_key_log;
+    }
+  }
 
   if (allow_2pc_) {
     autovector<MemTable*> empty_list;
