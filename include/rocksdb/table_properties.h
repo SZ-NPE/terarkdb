@@ -44,6 +44,7 @@ struct TablePropertiesNames {
   static const std::string kFilterSize;
   static const std::string kRawKeySize;
   static const std::string kRawValueSize;
+  static const std::string kSeparatedTotalSize;
   static const std::string kNumDataBlocks;
   static const std::string kNumEntries;
   static const std::string kDeletedKeys;
@@ -67,6 +68,7 @@ struct TablePropertiesNames {
   static const std::string kReadAmp;
   static const std::string kDependence;
   static const std::string kDependenceEntryCount;
+  static const std::string kDependenceSeparatedSize;
   static const std::string kInheritanceChain;
   static const std::string kInheritanceTree;
   static const std::string kEarliestTimeBeginCompact;
@@ -201,6 +203,8 @@ struct TablePropertiesBase {
   uint64_t creation_time = 0;
   // Timestamp of the earliest key. 0 means unknown.
   uint64_t oldest_key_time = 0;
+  // Total raw internal-key and value bytes referenced by value-index entries.
+  uint64_t separated_total_size = 0;
 
   // Name of the column family with which this SST file is associated.
   // If column family is unknown, `column_family_name` will be an empty string.

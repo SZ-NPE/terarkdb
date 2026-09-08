@@ -484,6 +484,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "target_blob_file_size=0;"
       "blob_file_defragment_size=0;"
       "max_dependence_blob_overlap=1024;"
+      "exact_garbage_ratio=true;"
       "maintainer_job_ratio=0.1;"
       "optimize_filters_for_hits=false;"
       "optimize_range_deletion=false;"
@@ -497,6 +498,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
                           kColumnFamilyOptionsBlacklist));
   EXPECT_EQ(new_options->ttl_gc_ratio, 3.000);
   EXPECT_EQ(new_options->ttl_max_scan_gap, 1);
+  EXPECT_TRUE(new_options->exact_garbage_ratio);
   options->~ColumnFamilyOptions();
   new_options->~ColumnFamilyOptions();
 

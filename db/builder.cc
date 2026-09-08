@@ -171,11 +171,11 @@ Status BuildTable(
       void* trans_to_separate_callback_args = nullptr;
 
       Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
-                             const Slice& meta, bool is_merge,
-                             bool is_index) override {
+                             const Slice& meta, uint32_t value_size,
+                             bool is_merge, bool is_index) override {
         return SeparateHelper::TransToSeparate(
-            internal_key, value, value.file_number(), meta, is_merge, is_index,
-            value_meta_extractor.get());
+            internal_key, value, value.file_number(), meta, value_size,
+            is_merge, is_index, value_meta_extractor.get());
       }
 
       Status TransToSeparate(const Slice& internal_key,
@@ -292,7 +292,7 @@ Status BuildTable(
       if (status.ok()) {
         blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
         status = SeparateHelper::TransToSeparate(
-            key, value, blob_meta->fd.GetNumber(), Slice(),
+            key, value, blob_meta->fd.GetNumber(), Slice(), 0,
             GetInternalKeyType(key) == kTypeMerge, false,
             separate_helper.value_meta_extractor.get());
       }
@@ -409,7 +409,8 @@ Status BuildTable(
                blob.fd.GetNumber() >
                    sst_meta()->prop.dependence.back().file_number);
         sst_meta()->prop.dependence.emplace_back(
-            Dependence{blob.fd.GetNumber(), blob.prop.num_entries});
+            Dependence{blob.fd.GetNumber(), blob.prop.num_entries,
+                       blob.prop.raw_key_size + blob.prop.raw_value_size});
       }
       auto shrinked_snapshots = sst_meta()->ShrinkSnapshot(snapshots);
       s = builder->Finish(&sst_meta()->prop, &shrinked_snapshots);

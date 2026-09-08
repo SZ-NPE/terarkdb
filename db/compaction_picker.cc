@@ -75,10 +75,16 @@ struct GarbageFileInfo {
   FileMetaData* f;
   double score;
   uint64_t estimate_size;
-  GarbageFileInfo(FileMetaData* _f) : f(_f), score(0.0), estimate_size(0) {
+  GarbageFileInfo(FileMetaData* _f, bool exact_garbage_ratio)
+      : f(_f), score(0.0), estimate_size(0) {
     if (f == nullptr) return;
-    score = std::min(
-        1.0, f->num_antiquation / std::max<double>(1, f->prop.num_entries));
+    if (exact_garbage_ratio && f->exact_garbage_ratio_available) {
+      uint64_t raw = f->prop.raw_key_size + f->prop.raw_value_size;
+      score = std::min(1.0, f->size_antiquated / std::max<double>(1, raw));
+    } else {
+      score = std::min(
+          1.0, f->num_antiquation / std::max<double>(1, f->prop.num_entries));
+    }
     estimate_size = static_cast<uint64_t>(f->fd.file_size * (1 - score));
   }
 };
@@ -869,14 +875,15 @@ Compaction* CompactionPicker::PickGarbageCollection(
   auto& hidden_files = vstorage->LevelFiles(-1);
   uint64_t idx = 0;
   // Find largest score blob
-  GarbageFileInfo dirtiest_blob{nullptr};
+  const bool exact_gc = mutable_cf_options.exact_garbage_ratio;
+  GarbageFileInfo dirtiest_blob{nullptr, exact_gc};
   for (; idx < hidden_files.size() && !hidden_files[idx]->is_gc_forbidden();
        ++idx) {
     FileMetaData* f = hidden_files[idx];
     if (!f->is_gc_permitted() || f->being_compacted) {
       continue;
     }
-    GarbageFileInfo info{f};
+    GarbageFileInfo info{f, exact_gc};
     // candidate_cmp is less comparator
     if (dirtiest_blob.f == nullptr || candidate_cmp(dirtiest_blob, info)) {
       dirtiest_blob = info;
@@ -896,6 +903,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   dirtiest_blob.f->set_gc_candidate();
   uint64_t total_estimate_size = dirtiest_blob.estimate_size;
   uint64_t num_antiquation = dirtiest_blob.f->num_antiquation;
+  uint64_t size_antiquated = dirtiest_blob.f->size_antiquated;
 
   // expand with neighbor blob
   std::vector<GarbageFileInfo> candidate_blob_vec;
@@ -939,7 +947,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   }
   auto push_candidate = [&](FileMetaData* f) {
     if (f->is_gc_permitted() && !f->being_compacted) {
-      GarbageFileInfo gc_blob(f);
+      GarbageFileInfo gc_blob(f, exact_gc);
       if (gc_blob.estimate_size <= fragment_size ||
           gc_blob.score >= mutable_cf_options.blob_gc_ratio ||
           gc_blob.f->marked_for_compaction) {
@@ -961,6 +969,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
     if (total_estimate_size + estimate_size < target_blob_file_size) {
       total_estimate_size += estimate_size;
       num_antiquation += f->num_antiquation;
+      size_antiquated += f->size_antiquated;
       f->set_gc_candidate();
       input.files.push_back(f);
     }
@@ -976,6 +985,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   params.inputs = std::move(inputs);
   params.output_level = -1;
   params.num_antiquation = num_antiquation;
+  params.size_antiquated = size_antiquated;
   params.max_compaction_bytes = LLONG_MAX;
   params.output_path_id = GetPathId(ioptions_, mutable_cf_options, 1);
   params.compression = GetCompressionType(
@@ -1970,8 +1980,16 @@ Compaction* CompactionPicker::PickCompositeCompaction(
       uint64_t file_size = f->fd.GetFileSize();
       assert(file_size > 0);
       total_file_size += file_size;
-      total_garbage += file_size * f->num_antiquation /
-                       std::max<uint64_t>(1, f->prop.num_entries);
+      if (mutable_cf_options.exact_garbage_ratio &&
+          f->exact_garbage_ratio_available) {
+        uint64_t raw = f->prop.raw_key_size + f->prop.raw_value_size;
+        total_garbage += static_cast<uint64_t>(
+            file_size * (f->size_antiquated / std::max<double>(1, raw)));
+      } else {
+        total_garbage += static_cast<uint64_t>(
+            file_size *
+            (f->num_antiquation / std::max<double>(1, f->prop.num_entries)));
+      }
     }
     p *= 1 + 1.0 * total_garbage / total_file_size;
     p += file_number_score(map_element);

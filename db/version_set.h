@@ -110,7 +110,7 @@ class VersionStorageInfo {
                     uint64_t entry_count = 0) const;
 
   uint64_t FileSizeWithBlob(const FileMetaData* f, bool recursive = true,
-                            double ratio = 1) const;
+                            double ratio = 1, bool exact_gc = false) const;
 
   void SetFinalized();
 
@@ -268,6 +268,8 @@ class VersionStorageInfo {
   int num_levels() const { return num_levels_; }
 
   double total_garbage_ratio() const { return total_garbage_ratio_; }
+  double entry_garbage_ratio() const { return entry_garbage_ratio_; }
+  double size_garbage_ratio() const { return size_garbage_ratio_; }
 
   bool blob_marked_for_compaction() const {
     return blob_marked_for_compaction_;
@@ -622,6 +624,7 @@ class VersionStorageInfo {
   uint64_t blob_num_entries_;
   uint64_t blob_num_deletions_;
   uint64_t blob_num_antiquation_;
+  uint64_t blob_antiquated_size_;
   uint64_t lsm_file_size_;
   uint64_t lsm_num_entries_;
   uint64_t lsm_num_deletions_;
@@ -631,6 +634,8 @@ class VersionStorageInfo {
 
   // Store quantity of files that needs gc.
   double total_garbage_ratio_;
+  double entry_garbage_ratio_;
+  double size_garbage_ratio_;
 
   bool finalized_;
 

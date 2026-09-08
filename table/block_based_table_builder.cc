@@ -398,6 +398,11 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
     return s;
   }
   const Slice& value = lazy_value.slice();
+  uint32_t separated_value_size = 0;
+  ValueType value_type = ExtractValueType(key);
+  if (value_type == kTypeValueIndex || value_type == kTypeMergeIndex) {
+    separated_value_size = SeparateHelper::DecodeValueSize(value);
+  }
   if (r->props.num_entries > 0 &&
       r->internal_comparator.Compare(key, Slice(r->last_key)) <= 0) {
     assert(r->internal_comparator.Compare(key, Slice(r->last_key)) > 0);
@@ -432,7 +437,7 @@ Status BlockBasedTableBuilder::Add(const Slice& key,
   r->props.num_entries++;
   r->props.raw_key_size += key.size();
   r->props.raw_value_size += value.size();
-  ValueType value_type = ExtractValueType(key);
+  r->props.separated_total_size += separated_value_size;
   if (value_type == kTypeDeletion || value_type == kTypeSingleDeletion) {
     r->props.num_deletions++;
   } else if (value_type == kTypeMerge) {

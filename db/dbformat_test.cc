@@ -50,6 +50,72 @@ static void TestKey(const std::string& key, uint64_t seq, ValueType vt) {
 
 class FormatTest : public testing::Test {};
 
+class TestValueExtractor : public ValueExtractor {
+ public:
+  Status Extract(const Slice& /*key*/, const Slice& value,
+                 std::string* output) const override {
+    *output = "meta:" + value.ToString();
+    return Status::OK();
+  }
+};
+
+TEST_F(FormatTest, ValueIndexSizeEncodeDecode) {
+  const uint64_t file_number = 0x0102030405060708ULL;
+  const uint32_t value_sizes[] = {0, 127, 128, 16384, port::kMaxUint32};
+  for (uint32_t value_size : value_sizes) {
+    std::string encoded =
+        SeparateHelper::EncodeValueIndex(file_number, value_size);
+    ASSERT_EQ(file_number, SeparateHelper::DecodeFileNumber(encoded));
+    ASSERT_EQ(value_size, SeparateHelper::DecodeValueSize(encoded));
+  }
+
+  std::string legacy;
+  PutFixed64(&legacy, file_number);
+  ASSERT_EQ(file_number, SeparateHelper::DecodeFileNumber(legacy));
+  ASSERT_EQ(0U, SeparateHelper::DecodeValueSize(legacy));
+}
+
+TEST_F(FormatTest, ValueIndexMetaFollowsSize) {
+  std::string encoded = SeparateHelper::EncodeValueIndex(7, 1024);
+  encoded.append("metadata");
+  ASSERT_EQ(1024U, SeparateHelper::DecodeValueSize(encoded));
+  ASSERT_EQ("metadata", SeparateHelper::DecodeValueMeta(encoded).ToString());
+}
+
+TEST_F(FormatTest, TransToSeparateEncodesValueSizeAndMeta) {
+  const std::string payload = "payload";
+  const std::string internal_key = IKey("key", 1, kTypeValue);
+  LazyBuffer value(Slice(payload), true);
+  TestValueExtractor extractor;
+  ASSERT_OK(SeparateHelper::TransToSeparate(
+      internal_key, value, 9, Slice(), 0, false, false, &extractor));
+  ASSERT_EQ(9U, SeparateHelper::DecodeFileNumber(value.slice()));
+  ASSERT_EQ(internal_key.size() + payload.size(),
+            SeparateHelper::DecodeValueSize(value.slice()));
+  ASSERT_EQ("meta:payload",
+            SeparateHelper::DecodeValueMeta(value.slice()).ToString());
+}
+
+TEST_F(FormatTest, TransToSeparateEncodesAndPreservesValueSize) {
+  const std::string payload(300, 'v');
+  const std::string internal_key = IKey("key", 1, kTypeValue);
+  LazyBuffer value(Slice(payload), true);
+  ASSERT_OK(SeparateHelper::TransToSeparate(
+      internal_key, value, 9, Slice(), 0, false, false, nullptr));
+  ASSERT_EQ(9U, SeparateHelper::DecodeFileNumber(value.slice()));
+  const uint32_t separated_record_size =
+      static_cast<uint32_t>(internal_key.size() + payload.size());
+  ASSERT_EQ(separated_record_size,
+            SeparateHelper::DecodeValueSize(value.slice()));
+
+  LazyBuffer rewritten_index(value.slice(), true, 9);
+  ASSERT_OK(SeparateHelper::TransToSeparate(
+      IKey("key", 1, kTypeValueIndex), rewritten_index, 9, Slice(),
+      SeparateHelper::DecodeValueSize(value.slice()), false, true, nullptr));
+  ASSERT_EQ(separated_record_size,
+            SeparateHelper::DecodeValueSize(rewritten_index.slice()));
+}
+
 TEST_F(FormatTest, InternalKey_EncodeDecode) {
   const char* keys[] = {"", "k", "hello", "longggggggggggggggggggggg"};
   const uint64_t seq[] = {1,

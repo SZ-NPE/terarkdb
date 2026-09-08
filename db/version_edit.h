@@ -136,6 +136,8 @@ struct FileMetaData {
   // These values can mutate, but they can only be read or written from
   // single-threaded LogAndApply thread
   uint64_t num_antiquation;  // the number of out-dated entries.
+  uint64_t size_antiquated;  // the number of out-dated bytes.
+  bool exact_garbage_ratio_available;
 
   int refs;  // Reference count
 
@@ -154,6 +156,8 @@ struct FileMetaData {
       : table_reader_handle(nullptr),
         compensated_file_size(0),
         num_antiquation(0),
+        size_antiquated(0),
+        exact_garbage_ratio_available(true),
         refs(0),
         being_compacted(false),
         need_upgrade(false),
@@ -334,6 +338,7 @@ class VersionEdit {
     f.fd.smallest_seqno = smallest_seqno;
     f.fd.largest_seqno = largest_seqno;
     f.num_antiquation = 0;
+    f.size_antiquated = 0;
     f.marked_for_compaction = marked_for_compaction;
     f.prop = prop;
     new_files_.emplace_back(level, std::move(f));

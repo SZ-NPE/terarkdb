@@ -179,6 +179,7 @@ class CompactionIterator {
   // current output.
   LazyBuffer value_;
   std::string value_meta_;
+  uint32_t separated_record_size_ = 0;
   // The status is OK unless compaction iterator encounters a merge operand
   // while not having a merge operator defined.
   Status status_;

@@ -19,6 +19,7 @@
 #include "cache/lru_cache.h"
 #include "db/dbformat.h"
 #include "db/memtable.h"
+#include "db/version_edit.h"
 #include "db/write_batch_internal.h"
 #include "memtable/stl_wrappers.h"
 #include "monitoring/statistics.h"
@@ -255,7 +256,8 @@ class TableConstructor : public Constructor {
                             int level = -1)
       : Constructor(cmp),
         convert_to_internal_key_(convert_to_internal_key),
-        level_(level) {}
+        level_(level),
+        has_property_cache_(false) {}
   ~TableConstructor() { Reset(); }
 
   virtual Status FinishImpl(const Options& options,
@@ -292,7 +294,8 @@ class TableConstructor : public Constructor {
         EXPECT_TRUE(builder->Add(kv.first, LazyBuffer(kv.second)).ok());
       }
     }
-    Status s = builder->Finish(nullptr, nullptr);
+    Status s = builder->Finish(has_property_cache_ ? &property_cache_ : nullptr,
+                               nullptr);
     file_writer_->Flush();
     EXPECT_TRUE(s.ok()) << s.ToString();
 
@@ -345,6 +348,11 @@ class TableConstructor : public Constructor {
 
   virtual TableReader* GetTableReader() { return table_reader_.get(); }
 
+  void SetTablePropertyCache(const TablePropertyCache& property_cache) {
+    property_cache_ = property_cache;
+    has_property_cache_ = true;
+  }
+
   virtual bool AnywayDeleteIterator() const override {
     return convert_to_internal_key_;
   }
@@ -371,6 +379,8 @@ class TableConstructor : public Constructor {
   std::unique_ptr<TableReader> table_reader_;
   bool convert_to_internal_key_;
   int level_;
+  TablePropertyCache property_cache_;
+  bool has_property_cache_;
 
   TableConstructor();
 
@@ -1093,6 +1103,55 @@ TEST_P(BlockBasedTableTest, BasicBlockBasedTableProperties) {
   Slice content = block_builder.Finish();
   ASSERT_EQ(content.size() + kBlockTrailerSize + diff_internal_user_bytes,
             props.data_size);
+  c.ResetTableReader();
+}
+
+TEST_P(BlockBasedTableTest, SeparatedValueSizeProperty) {
+  TableConstructor c(BytewiseComparator());
+  InternalKey key("key", kMaxSequenceNumber, kTypeValueIndex);
+  c.Add(key.Encode().ToString(), SeparateHelper::EncodeValueIndex(7, 12345));
+
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  Options options;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  ImmutableCFOptions ioptions(options);
+  MutableCFOptions moptions(options);
+
+  c.Finish(options, ioptions, moptions, table_options,
+           GetPlainInternalComparator(options.comparator), &keys, &kvmap);
+
+  const auto& props = *c.GetTableReader()->GetTableProperties();
+  ASSERT_EQ(12345U, props.separated_total_size);
+  c.ResetTableReader();
+}
+
+TEST_P(BlockBasedTableTest, DependenceSeparatedSizeProperty) {
+  TableConstructor c(BytewiseComparator(), true);
+  c.Add("key", "value");
+  TablePropertyCache property_cache;
+  property_cache.dependence.emplace_back(Dependence{7, 3, 12345});
+  c.SetTablePropertyCache(property_cache);
+
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  Options options;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  ImmutableCFOptions ioptions(options);
+  MutableCFOptions moptions(options);
+
+  c.Finish(options, ioptions, moptions, table_options,
+           GetPlainInternalComparator(options.comparator), &keys, &kvmap);
+
+  const auto& dependence = c.GetTableReader()->GetTableProperties()->dependence;
+  ASSERT_EQ(1U, dependence.size());
+  ASSERT_EQ(7U, dependence[0].file_number);
+  ASSERT_EQ(3U, dependence[0].entry_count);
+  ASSERT_EQ(12345U, dependence[0].separated_total_size);
   c.ResetTableReader();
 }
 

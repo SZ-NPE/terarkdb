@@ -230,6 +230,15 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
                           f.prop.raw_value_size);
       PutVarint64(&encode_property_cache, f.prop.earliest_time_begin_compact);
       PutVarint64(&encode_property_cache, f.prop.latest_time_end_compact);
+      bool write_separated_total_size = true;
+      TEST_SYNC_POINT_CALLBACK(
+          "VersionEdit::EncodeTo:PropertyCache:WriteSeparatedTotalSize",
+          &write_separated_total_size);
+      if (write_separated_total_size) {
+        for (auto& dependence : f.prop.dependence) {
+          PutVarint64(&encode_property_cache, dependence.separated_total_size);
+        }
+      }
       PutLengthPrefixedSlice(dst, encode_property_cache);
     }
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
@@ -355,7 +364,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &file_number)) {
                 return error_msg;
               }
-              f.prop.dependence.emplace_back(Dependence{file_number, 0});
+              f.prop.dependence.emplace_back(Dependence{file_number, 0, 0});
             }
             if (!field.empty()) {
               if (!GetVarint64(&field, &f.prop.num_entries)) {
@@ -406,6 +415,13 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &f.prop.earliest_time_begin_compact) ||
                   !GetVarint64(&field, &f.prop.latest_time_end_compact)) {
                 return error_msg;
+              }
+            }
+            if (!field.empty()) {
+              for (auto& dependence : f.prop.dependence) {
+                if (!GetVarint64(&field, &dependence.separated_total_size)) {
+                  return error_msg;
+                }
               }
             }
             if (f.prop.num_entries > 0 || f.prop.raw_key_size > 0 ||

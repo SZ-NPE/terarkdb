@@ -406,6 +406,9 @@ struct CompactionJob::SubcompactionState {
             if (find != score_map.end()) {
               global_score = find->second;
             }
+            if (b->ref_bytes == 0) {
+              continue;
+            }
             target_range_blob_heap.push(TargetRangeBlobItem{
                 b->file_number, b->ref_bytes, global_score / b->ref_bytes});
           }
@@ -542,7 +545,13 @@ struct CompactionJob::SubcompactionState {
       }
       return Status::OK();
     };
-    chash_map<uint64_t, std::pair<FileMetaData*, uint64_t>> blob_map;
+    struct ReferencedBlob {
+      FileMetaData* meta;
+      uint64_t entry_count;
+      uint64_t separated_total_size;
+      bool exact_size_available;
+    };
+    chash_map<uint64_t, ReferencedBlob> blob_map;
     // collect and sort blob_map of sst
     for (auto& fn : input_sst) {
       auto find = dependence_map.find(fn);
@@ -571,20 +580,36 @@ struct CompactionJob::SubcompactionState {
         if (find == dependence_map.end() || find->second->is_gc_forbidden()) {
           continue;
         }
-        auto ib =
-            blob_map.emplace(find->second->fd.GetNumber(),
-                             std::make_pair(find->second, pair.entry_count));
+        auto ib = blob_map.emplace(
+            find->second->fd.GetNumber(),
+            ReferencedBlob{
+                find->second, pair.entry_count, pair.separated_total_size,
+                pair.entry_count == 0 || pair.separated_total_size != 0});
         if (!ib.second) {
-          ib.first->second.second += pair.entry_count;
+          ib.first->second.entry_count += pair.entry_count;
+          ib.first->second.separated_total_size += pair.separated_total_size;
+          ib.first->second.exact_size_available &=
+              pair.entry_count == 0 || pair.separated_total_size != 0;
         }
       }
     }
     output->blobs.reserve(blob_map.size());
+    const bool exact_gc = compaction->mutable_cf_options()->exact_garbage_ratio;
     for (auto& pair : blob_map) {
-      auto meta = pair.second.first;
+      auto meta = pair.second.meta;
       uint64_t total_bytes = meta->fd.GetFileSize();
-      uint64_t ref_bytes =
-          total_bytes * pair.second.second / meta->prop.num_entries;
+      uint64_t ref_bytes = 0;
+      uint64_t raw_data_size =
+          meta->prop.raw_key_size + meta->prop.raw_value_size;
+      if (exact_gc && pair.second.exact_size_available && raw_data_size != 0) {
+        ref_bytes = static_cast<uint64_t>(
+            total_bytes * (pair.second.separated_total_size /
+                           static_cast<double>(raw_data_size)));
+      } else if (meta->prop.num_entries != 0) {
+        ref_bytes = static_cast<uint64_t>(
+            total_bytes * (pair.second.entry_count /
+                           static_cast<double>(meta->prop.num_entries)));
+      }
       output->blobs.emplace_back(BlobRefInfo{pair.first, meta, ref_bytes});
     }
     std::sort(output->blobs.begin(), output->blobs.end(),
@@ -1588,11 +1613,11 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     void* trans_to_separate_callback_args = nullptr;
 
     Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
-                           const Slice& meta, bool is_merge,
-                           bool is_index) override {
+                           const Slice& meta, uint32_t value_size,
+                           bool is_merge, bool is_index) override {
       return SeparateHelper::TransToSeparate(
-          internal_key, value, value.file_number(), meta, is_merge, is_index,
-          value_meta_extractor.get());
+          internal_key, value, value.file_number(), meta, value_size, is_merge,
+          is_index, value_meta_extractor.get());
     }
 
     Status TransToSeparate(const Slice& key, LazyBuffer& value) override {
@@ -1640,7 +1665,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     if (s.ok()) {
       blob_meta->UpdateBoundaries(key, GetInternalKeySeqno(key));
       s = SeparateHelper::TransToSeparate(
-          key, value, blob_meta->fd.GetNumber(), Slice(),
+          key, value, blob_meta->fd.GetNumber(), Slice(), 0,
           GetInternalKeyType(key) == kTypeMerge, false,
           separate_helper.value_meta_extractor.get());
     }
@@ -1765,7 +1790,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (!sub_compact->compaction->partial_compaction()) {
     dict_sample_data.reserve(kSampleBytes);
   }
-  std::unordered_map<uint64_t, uint64_t> dependence;
+  // file_number -> {entry_count, separated_total_size}
+  std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> dependence;
 
   size_t yield_count = 0;
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid()) {
@@ -1776,9 +1802,12 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     if (c_iter->ikey().type == kTypeValueIndex ||
         c_iter->ikey().type == kTypeMergeIndex) {
       assert(value.file_number() != uint64_t(-1));
-      auto ib = dependence.emplace(value.file_number(), 1);
+      uint32_t value_size = SeparateHelper::DecodeValueSize(value.slice());
+      auto ib = dependence.emplace(value.file_number(),
+                                   std::make_pair(1, value_size));
       if (!ib.second) {
-        ++ib.first->second;
+        ++ib.first->second.first;
+        ib.first->second.second += value_size;
       }
     }
 
@@ -2228,16 +2257,23 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     auto& inputs = *sub_compact->compaction->inputs();
     assert(inputs.size() == 1 && inputs.front().level == -1);
     auto& files = inputs.front().files;
+    uint64_t total_file_size = 0;
+    for (auto& file : files) {
+      total_file_size += file->prop.raw_key_size + file->prop.raw_value_size;
+    }
     ROCKS_LOG_INFO(
         db_options_.info_log,
         "[%s] [JOB %d] Table #%" PRIu64 " GC: %" PRIu64
         " inputs from %zd files. %" PRIu64
-        " clear, %.2f%% estimation: [ %" PRIu64 " garbage type, %" PRIu64
-        " get not found, %" PRIu64
+        " clear, %.2f%% entry estimation, %.2f%% size estimation: [ %" PRIu64
+        " garbage type, %" PRIu64 " get not found, %" PRIu64
         " file number mismatch ], inheritance tree: %zd -> %zd",
         cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
         files.size(), counter.input - meta.prop.num_entries,
-        sub_compact->compaction->num_antiquation() * 100. / counter.input,
+        sub_compact->compaction->num_antiquation() * 100. /
+            std::max<uint64_t>(1, counter.input),
+        sub_compact->compaction->size_antiquated() * 100.0 /
+            std::max<uint64_t>(1, total_file_size),
         counter.garbage_type, counter.get_not_found,
         counter.file_number_mismatch,
         meta.prop.inheritance.size() + inheritance_tree_pruge_count,
@@ -2320,7 +2356,8 @@ Status CompactionJob::FinishCompactionOutputFile(
     const Status& input_status, SubcompactionState* sub_compact,
     CompactionRangeDelAggregator* range_del_agg,
     CompactionIterationStats* range_del_out_stats,
-    const std::unordered_map<uint64_t, uint64_t>& dependence,
+    const std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>>&
+        dependence,
     const Slice* next_table_min_key /* = nullptr */) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_SYNC_FILE);
@@ -2437,7 +2474,8 @@ Status CompactionJob::FinishCompactionOutputFile(
                                       : 0;
     meta->prop.num_entries = sub_compact->builder->NumEntries();
     for (auto& pair : dependence) {
-      meta->prop.dependence.emplace_back(Dependence{pair.first, pair.second});
+      meta->prop.dependence.emplace_back(
+          Dependence{pair.first, pair.second.first, pair.second.second});
     }
     std::sort(meta->prop.dependence.begin(), meta->prop.dependence.end(),
               TERARK_CMP(file_number, <));

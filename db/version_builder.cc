@@ -126,6 +126,8 @@ struct VersionBuilderContextImpl : VersionBuilder::Context {
     int level;
     FileMetaData* f;
     double entry_depended;
+    uint64_t size_depended;
+    bool exact_size_available;
   };
   struct InheritanceItem {
     size_t depended : 1;
@@ -255,7 +257,8 @@ class VersionBuilder::Rep {
     auto& dependence_map_ = context_->dependence_map;
     uint64_t file_number = f->fd.GetNumber();
     auto ib = dependence_map_.emplace(
-        file_number, DependenceItem{file_number, 0, 0, false, level, f, 0});
+        file_number,
+        DependenceItem{file_number, 0, 0, false, level, f, 0, 0, true});
     f->Ref();
     if (ib.second) {
       PutInheritance(&ib.first->second, ib.first.pos());
@@ -308,6 +311,14 @@ class VersionBuilder::Rep {
         item->is_estimation |= is_estimation;
         assert(is_map || dependence.entry_count > 0);
         item->entry_depended += dependence.entry_count * ratio;
+        // entry_count is ratio-scaled for recursive map SSTs. The byte count
+        // already describes this SST's exact references and must not be
+        // scaled again.
+        item->size_depended += dependence.separated_total_size;
+        if (dependence.entry_count != 0 &&
+            dependence.separated_total_size == 0) {
+          item->exact_size_available = false;
+        }
       }
       item->dependence_version = dependence_version;
       if (is_map) {
@@ -379,6 +390,21 @@ class VersionBuilder::Rep {
           uint64_t entry_depended = std::max<uint64_t>(1, item.entry_depended);
           entry_depended = std::min(item.f->prop.num_entries, entry_depended);
           uint64_t num_antiquation = item.f->prop.num_entries - entry_depended;
+          uint64_t raw_data_size =
+              item.f->prop.raw_key_size + item.f->prop.raw_value_size;
+          uint64_t size_antiquated;
+          if (!item.exact_size_available) {
+            // Old value indexes and MANIFEST records do not contain byte
+            // counts. Preserve their entry-based garbage ratio.
+            size_antiquated = static_cast<uint64_t>(
+                raw_data_size *
+                (num_antiquation /
+                 std::max<double>(1, item.f->prop.num_entries)));
+          } else {
+            uint64_t size_depended =
+                std::min(raw_data_size, item.size_depended);
+            size_antiquated = raw_data_size - size_depended;
+          }
           switch (item.f->gc_status) {
             case FileMetaData::kGarbageCollectionForbidden:
               if (item.gc_forbidden_version == dependence_version) {
@@ -412,6 +438,8 @@ class VersionBuilder::Rep {
               break;
           }
           item.f->num_antiquation = num_antiquation;
+          item.f->size_antiquated = size_antiquated;
+          item.f->exact_garbage_ratio_available = item.exact_size_available;
         }
         ++it;
       } else {
@@ -615,6 +643,8 @@ class VersionBuilder::Rep {
       for (auto& pair : context_->dependence_map) {
         pair.second.is_estimation = false;
         pair.second.entry_depended = 0;
+        pair.second.size_depended = 0;
+        pair.second.exact_size_available = true;
       }
       for (auto& pair : context_->inheritance_counter) {
         pair.second.depended = 0;
@@ -913,8 +943,10 @@ void VersionBuilderDebugger::Verify(VersionBuilder::Rep* rep,
   };
   auto verify = [rep](VersionStorageInfo* l,
                       VersionStorageInfo* r) -> std::string {
-    auto eq = TERARK_EQUAL_P(fd.GetNumber(), num_antiquation, gc_status);
-    auto lt = TERARK_CMP_P(fd.GetNumber(), <, num_antiquation, <);
+    auto eq = TERARK_EQUAL_P(fd.GetNumber(), num_antiquation, size_antiquated,
+                             gc_status);
+    auto lt =
+        TERARK_CMP_P(fd.GetNumber(), <, num_antiquation, <, size_antiquated, <);
     /*
     auto eq = [](FileMetaData* fl, FileMetaData* fr) {
       return fl->fd.GetNumber() == fr->fd.GetNumber() &&

@@ -83,6 +83,24 @@ enum CompressionType : unsigned char {
 
 enum WriteBufferFlushPri : unsigned char { kFlushOldest, kFlushLargest };
 
+enum ExactGarbageRatioModeEnum : unsigned char {
+  kExactGCDisabled = 0,
+  kExactGCEnabled = 1,
+};
+
+struct ExactGarbageRatioMode {
+  ExactGarbageRatioModeEnum mode;
+
+  ExactGarbageRatioMode(bool enable)
+      : mode(enable ? kExactGCEnabled : kExactGCDisabled) {}
+  ExactGarbageRatioMode(ExactGarbageRatioModeEnum value) : mode(value) {}
+
+  operator bool() const { return mode != kExactGCDisabled; }
+  bool operator==(const ExactGarbageRatioMode& rhs) const {
+    return mode == rhs.mode;
+  }
+};
+
 // Sst purpose
 enum SstPurpose {
   kEssenceSst,  // Actual data storage sst
@@ -327,6 +345,10 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Max dependence blob overlap
   // 0 to unlimited
   size_t max_dependence_blob_overlap = 1024;
+
+  // Calculate separated-value garbage ratio using exact referenced bytes.
+  // Disabled keeps the legacy entry-count ratio.
+  ExactGarbageRatioMode exact_garbage_ratio = kExactGCDisabled;
 
   // Maintainer job ratio
   // 0 to 1

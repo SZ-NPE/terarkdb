@@ -174,6 +174,7 @@ struct MutableCFOptions {
         target_blob_file_size(0),
         blob_file_defragment_size(0),
         max_dependence_blob_overlap(0),
+        exact_garbage_ratio(kExactGCDisabled),
         maintainer_job_ratio(0),
         soft_pending_compaction_bytes_limit(0),
         hard_pending_compaction_bytes_limit(0),
@@ -235,6 +236,7 @@ struct MutableCFOptions {
   uint64_t target_blob_file_size;
   uint64_t blob_file_defragment_size;
   size_t max_dependence_blob_overlap;
+  ExactGarbageRatioMode exact_garbage_ratio;
   double maintainer_job_ratio;
   uint64_t soft_pending_compaction_bytes_limit;
   uint64_t hard_pending_compaction_bytes_limit;

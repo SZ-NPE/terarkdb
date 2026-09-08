@@ -277,6 +277,8 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    blob_file_defragment_size);
   ROCKS_LOG_HEADER(log, "            Options.max_dependence_blob_overlap: %zu",
                    max_dependence_blob_overlap);
+  ROCKS_LOG_HEADER(log, "                  Options.exact_garbage_ratio: %d",
+                   static_cast<int>(exact_garbage_ratio.mode));
   ROCKS_LOG_HEADER(log, "                   Options.maintainer_job_ratio: %f",
                    maintainer_job_ratio);
   ROCKS_LOG_HEADER(log, "                           Options.ttl_gc_ratio: %f",

@@ -20,7 +20,7 @@ TablePropertyCache GetPropCache(
     uint8_t purpose, std::initializer_list<uint64_t> dependence = {},
     std::initializer_list<uint64_t> inheritance = {}) {
   std::vector<Dependence> dep;
-  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1});
+  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, d});
   return TablePropertyCache{0, 0, 1, 1, 0, purpose, 0, 0, dep, inheritance};
 }
 }  // namespace
@@ -100,6 +100,32 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   ASSERT_EQ(1U, new_files[1].second.prop.dependence[0].file_number);
   ASSERT_EQ(2U, new_files[2].second.prop.dependence[0].file_number);
   ASSERT_EQ(3U, new_files[2].second.prop.dependence[1].file_number);
+  ASSERT_EQ(1U, new_files[1].second.prop.dependence[0].separated_total_size);
+  ASSERT_EQ(2U, new_files[2].second.prop.dependence[0].separated_total_size);
+  ASSERT_EQ(3U, new_files[2].second.prop.dependence[1].separated_total_size);
+}
+
+TEST_F(VersionEditTest, DecodeLegacyDependenceWithoutSeparatedSize) {
+  VersionEdit edit;
+  edit.AddFile(1, 301, 0, 100, InternalKey("foo", 10, kTypeValue),
+               InternalKey("zoo", 9, kTypeValue), 9, 10, false,
+               GetPropCache(1, {7U}, {}));
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEdit::EncodeTo:PropertyCache:WriteSeparatedTotalSize",
+      [](void* arg) { *static_cast<bool*>(arg) = false; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  VersionEdit parsed;
+  ASSERT_OK(parsed.DecodeFrom(encoded));
+  ASSERT_EQ(1U, parsed.GetNewFiles()[0].second.prop.dependence.size());
+  ASSERT_EQ(
+      0U,
+      parsed.GetNewFiles()[0].second.prop.dependence[0].separated_total_size);
 }
 
 TEST_F(VersionEditTest, ForwardCompatibleNewFile4) {

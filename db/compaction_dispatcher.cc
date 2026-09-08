@@ -272,11 +272,11 @@ class WorkerSeparateHelper : public SeparateHelper, public LazyBufferState {
 
   using SeparateHelper::TransToSeparate;
   Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
-                         const Slice& meta, bool is_merge,
+                         const Slice& meta, uint32_t value_size, bool is_merge,
                          bool is_index) override {
     return SeparateHelper::TransToSeparate(
-        internal_key, value, value.file_number(), meta, is_merge, is_index,
-        value_meta_extractor_.get());
+        internal_key, value, value.file_number(), meta, value_size, is_merge,
+        is_index, value_meta_extractor_.get());
   }
 
   LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
@@ -935,7 +935,8 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
           builder->NeedCompact() ? FileMetaData::kMarkedFromTableBuilder : 0;
       meta.prop.num_entries = builder->NumEntries();
       for (auto& pair : dependence) {
-        meta.prop.dependence.emplace_back(Dependence{pair.first, pair.second});
+        meta.prop.dependence.emplace_back(
+            Dependence{pair.first, pair.second, 0});
       }
       terark::sort_a(meta.prop.dependence, TERARK_CMP(file_number, <));
       auto shrinked_snapshots = meta.ShrinkSnapshot(context.existing_snapshots);

@@ -788,6 +788,25 @@ class SeparateHelper {
  public:
   virtual ~SeparateHelper() = default;
 
+  static std::string EncodeValueIndex(uint64_t file_number,
+                                      uint32_t value_size) {
+    std::string value_index;
+    PutFixed64(&value_index, file_number);
+    PutVarint32(&value_index, value_size);
+    return value_index;
+  }
+
+  static uint32_t DecodeValueSize(const Slice& slice) {
+    assert(slice.size() >= sizeof(uint64_t));
+    if (slice.size() == sizeof(uint64_t)) {
+      return 0;
+    }
+    Slice input(slice.data() + sizeof(uint64_t),
+                slice.size() - sizeof(uint64_t));
+    uint32_t value_size = 0;
+    return GetVarint32(&input, &value_size) ? value_size : 0;
+  }
+
   static Slice EncodeFileNumber(uint64_t& file_number) {
     if (!port::kLittleEndian) {
       file_number = EndianTransform(file_number, sizeof file_number);
@@ -805,21 +824,31 @@ class SeparateHelper {
   }
   static Slice DecodeValueMeta(const Slice& slice) {
     assert(slice.size() >= sizeof(uint64_t));
-    return Slice(slice.data() + sizeof(uint64_t),
-                 slice.size() - sizeof(uint64_t));
+    if (slice.size() == sizeof(uint64_t)) {
+      return Slice();
+    }
+    const char* begin = slice.data() + sizeof(uint64_t);
+    uint32_t value_size = 0;
+    const char* meta =
+        GetVarint32Ptr(begin, slice.data() + slice.size(), &value_size);
+    if (meta == nullptr) {
+      return Slice();
+    }
+    return Slice(meta, slice.data() + slice.size() - meta);
   }
 
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
                                 uint64_t file_number, const Slice& meta,
-                                bool is_merge, bool is_index,
+                                uint32_t value_size, bool is_merge,
+                                bool is_index,
                                 const ValueExtractor* value_meta_extractor);
 
   virtual Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
-                                 const Slice& meta, bool is_merge,
-                                 bool is_index) {
+                                 const Slice& meta, uint32_t value_size,
+                                 bool is_merge, bool is_index) {
     assert(value.file_number() != uint64_t(-1));
     return TransToSeparate(internal_key, value, value.file_number(), meta,
-                           is_merge, is_index, nullptr);
+                           value_size, is_merge, is_index, nullptr);
   }
 
   virtual Status TransToSeparate(const Slice& /*internal_key*/,

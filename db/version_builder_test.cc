@@ -118,7 +118,7 @@ TablePropertyCache GetPropCache(
     uint8_t purpose, std::initializer_list<uint64_t> dependence = {},
     std::initializer_list<uint64_t> inheritance = {}) {
   std::vector<Dependence> dep;
-  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1});
+  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, 0});
   TablePropertyCache ret;
   ret.purpose = purpose;
   ret.dependence = dep;
@@ -161,6 +161,109 @@ TEST_F(VersionBuilderTest, ApplyAndSaveTo) {
   ASSERT_EQ(300U, new_vstorage.NumLevelBytes(3));
   ASSERT_TRUE(VerifyDependFiles(
       &new_vstorage, {1U, 66U, 88U, 6U, 7U, 8U, 26U, 27U, 28U, 29U, 666}));
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, ExactGarbageRatioUsesReferencedBytes) {
+  TablePropertyCache blob_prop;
+  blob_prop.raw_value_size = 400;
+  Add(-1, 100U, "100", "199", 400U, 0, 100, 100, 4, 0, 0, 100, blob_prop);
+
+  TablePropertyCache sst_prop;
+  sst_prop.dependence.emplace_back(Dependence{100U, 2U, 100U});
+  Add(0, 200U, "100", "199", 100U, 0, 100, 100, 2, 0, 0, 100, sst_prop);
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto blob = new_vstorage.dependence_map().at(100U);
+  ASSERT_EQ(2U, blob->num_antiquation);
+  ASSERT_EQ(300U, blob->size_antiquated);
+  ASSERT_EQ(300U, new_vstorage.FileSizeWithBlob(new_vstorage.LevelFiles(0)[0],
+                                                true, 1, false));
+  ASSERT_EQ(200U, new_vstorage.FileSizeWithBlob(new_vstorage.LevelFiles(0)[0],
+                                                true, 1, true));
+
+  new_vstorage.UpdateNumNonEmptyLevels();
+  new_vstorage.CalculateBaseBytes(ioptions_, mutable_cf_options_);
+  mutable_cf_options_.exact_garbage_ratio = kExactGCDisabled;
+  new_vstorage.ComputeCompactionScore(ioptions_, mutable_cf_options_);
+  ASSERT_EQ(0.5, new_vstorage.entry_garbage_ratio());
+  ASSERT_EQ(0.75, new_vstorage.size_garbage_ratio());
+  ASSERT_EQ(0.5, new_vstorage.total_garbage_ratio());
+
+  mutable_cf_options_.exact_garbage_ratio = kExactGCEnabled;
+  new_vstorage.ComputeCompactionScore(ioptions_, mutable_cf_options_);
+  ASSERT_EQ(0.75, new_vstorage.total_garbage_ratio());
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, ExactGarbageRatioIncludesBlobKeys) {
+  TablePropertyCache blob_prop;
+  blob_prop.raw_key_size = 40;
+  blob_prop.raw_value_size = 400;
+  Add(-1, 100U, "100", "199", 440U, 0, 100, 100, 4, 0, 0, 100, blob_prop);
+
+  TablePropertyCache sst_prop;
+  sst_prop.dependence.emplace_back(Dependence{100U, 4U, 440U});
+  Add(0, 200U, "100", "199", 100U, 0, 100, 100, 4, 0, 0, 100, sst_prop);
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto blob = new_vstorage.dependence_map().at(100U);
+  ASSERT_EQ(0U, blob->num_antiquation);
+  ASSERT_EQ(0U, blob->size_antiquated);
+  ASSERT_TRUE(blob->exact_garbage_ratio_available);
+
+  new_vstorage.UpdateNumNonEmptyLevels();
+  new_vstorage.CalculateBaseBytes(ioptions_, mutable_cf_options_);
+  mutable_cf_options_.exact_garbage_ratio = kExactGCEnabled;
+  new_vstorage.ComputeCompactionScore(ioptions_, mutable_cf_options_);
+  ASSERT_EQ(0.0, new_vstorage.size_garbage_ratio());
+  ASSERT_EQ(0.0, new_vstorage.total_garbage_ratio());
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, ExactGarbageRatioFallsBackForLegacyDependence) {
+  TablePropertyCache blob_prop;
+  blob_prop.raw_value_size = 400;
+  Add(-1, 100U, "100", "199", 400U, 0, 100, 100, 4, 0, 0, 100, blob_prop);
+
+  TablePropertyCache sst_prop;
+  sst_prop.dependence.emplace_back(Dependence{100U, 2U, 0U});
+  Add(0, 200U, "100", "199", 100U, 0, 100, 100, 2, 0, 0, 100, sst_prop);
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto blob = new_vstorage.dependence_map().at(100U);
+  ASSERT_EQ(2U, blob->num_antiquation);
+  ASSERT_EQ(200U, blob->size_antiquated);
+  ASSERT_FALSE(blob->exact_garbage_ratio_available);
+
+  new_vstorage.UpdateNumNonEmptyLevels();
+  new_vstorage.CalculateBaseBytes(ioptions_, mutable_cf_options_);
+  mutable_cf_options_.exact_garbage_ratio = kExactGCEnabled;
+  new_vstorage.ComputeCompactionScore(ioptions_, mutable_cf_options_);
+  ASSERT_EQ(0.5, new_vstorage.entry_garbage_ratio());
+  ASSERT_EQ(0.5, new_vstorage.size_garbage_ratio());
+  ASSERT_EQ(0.5, new_vstorage.total_garbage_ratio());
 
   UnrefFilesInVersion(&new_vstorage);
 }
@@ -444,7 +547,7 @@ TEST_F(VersionBuilderTest, HugeLSM) {
     TablePropertyCache prop;
     for (uint32_t j = 0; j < kFilesBlobDependence; ++j) {
       prop.dependence.emplace_back(Dependence{
-          (_rand.Uniform(kFilesBlobCount) * kFilesBlobInheritance) + 1, 1});
+          (_rand.Uniform(kFilesBlobCount) * kFilesBlobInheritance) + 1, 1, 0});
     }
     std::sort(prop.dependence.begin(), prop.dependence.end(),
               [](const Dependence& l, const Dependence& r) {

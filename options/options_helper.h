@@ -81,6 +81,7 @@ enum class OptionType {
   kLRUCacheOptions,
   kEntropyAlgo,
   kWriteBufferFlushPri,
+  kExactGarbageRatioMode,
   kValueExtractorFactory,
   kTtlExtractorFactory,
   kUnknown
@@ -182,6 +183,8 @@ struct OptionsHelper {
       compaction_pri_string_map;
   static std::unordered_map<std::string, WriteBufferFlushPri>
       write_buffer_flush_pri_string_map;
+  static std::unordered_map<std::string, ExactGarbageRatioMode>
+      exact_garbage_ratio_mode_string_map;
   static std::unordered_map<std::string, WALRecoveryMode>
       wal_recovery_mode_string_map;
   static std::unordered_map<std::string, DBOptions::AccessHint>
@@ -227,6 +230,8 @@ static auto& compaction_pri_string_map =
     OptionsHelper::compaction_pri_string_map;
 static auto& write_buffer_flush_pri_string_map =
     OptionsHelper::write_buffer_flush_pri_string_map;
+static auto& exact_garbage_ratio_mode_string_map =
+    OptionsHelper::exact_garbage_ratio_mode_string_map;
 static auto& wal_recovery_mode_string_map =
     OptionsHelper::wal_recovery_mode_string_map;
 static auto& access_hint_string_map = OptionsHelper::access_hint_string_map;

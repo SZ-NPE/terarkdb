@@ -158,6 +158,7 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
 TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTestKeyValueSep) {
   Options options = CurrentOptions();
   options.blob_size = 512;
+  options.exact_garbage_ratio = kExactGCEnabled;
   options.level0_file_num_compaction_trigger = 4;
   auto factory = std::make_shared<TerarkPropertiesCollectorFactory>();
   options.table_properties_collector_factories.push_back(factory);
@@ -165,10 +166,14 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTestKeyValueSep) {
 
   std::string value(4096, 0);
   Status s;
+  uint64_t expected_separated_total_size = 0;
   for (int i = 0; i < 10; i++) {
     auto key = std::to_string(i);
     s = db_->Put(WriteOptions(), key, value);
     ASSERT_TRUE(s.ok());
+    expected_separated_total_size +=
+        InternalKey(key, kMaxSequenceNumber, kTypeValue).Encode().size() +
+        value.size();
   }
   s = db_->Flush(FlushOptions());
   ASSERT_TRUE(s.ok());
@@ -180,6 +185,7 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTestKeyValueSep) {
   ASSERT_TRUE(s.ok());
 
   size_t size = 0;
+  uint64_t separated_total_size = 0;
   ASSERT_FALSE(collection.empty());
   for (auto& pair : collection) {
     auto props = pair.second;
@@ -187,8 +193,10 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTestKeyValueSep) {
     auto it = user_props.find("terark");
     ASSERT_TRUE(it != user_props.end());
     size += std::stoi(it->second);
+    separated_total_size += props->separated_total_size;
   }
   ASSERT_TRUE(size > 0);
+  ASSERT_EQ(expected_separated_total_size, separated_total_size);
 }
 
 TablePropertiesCollection

@@ -21,6 +21,7 @@ typedef uint64_t SequenceNumber;
 struct Dependence {
   uint64_t file_number;
   uint64_t entry_count;
+  uint64_t separated_total_size;
 };
 
 // User-oriented representation of internal key types.

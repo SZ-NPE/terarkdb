@@ -200,27 +200,37 @@ void IterKey::EnlargeBuffer(size_t key_size) {
 
 Status SeparateHelper::TransToSeparate(
     const Slice& internal_key, LazyBuffer& value, uint64_t file_number,
-    const Slice& meta, bool is_merge, bool is_index,
+    const Slice& meta, uint32_t value_size, bool is_merge, bool is_index,
     const ValueExtractor* value_meta_extractor) {
   assert(file_number != uint64_t(-1));
-  if (value_meta_extractor == nullptr || is_merge) {
-    value.reset(EncodeFileNumber(file_number), true, file_number);
-    return Status::OK();
-  }
-  if (is_index) {
-    Slice parts[] = {EncodeFileNumber(file_number), meta};
-    value.reset(SliceParts(parts, 2), file_number);
-    return Status::OK();
-  } else {
+  if (!is_index) {
     auto s = value.fetch();
     if (!s.ok()) {
       return s;
     }
+    if (internal_key.size() > port::kMaxUint32 ||
+        value.size() > port::kMaxUint32 - internal_key.size()) {
+      return Status::InvalidArgument(
+          "Separated key-value record exceeds uint32 size limit");
+    }
+    const size_t separated_record_size = internal_key.size() + value.size();
+    value_size = static_cast<uint32_t>(separated_record_size);
+  }
+  std::string value_index = EncodeValueIndex(file_number, value_size);
+  if (value_meta_extractor == nullptr || is_merge) {
+    value.reset(Slice(value_index), true, file_number);
+    return Status::OK();
+  }
+  if (is_index) {
+    Slice parts[] = {value_index, meta};
+    value.reset(SliceParts(parts, 2), file_number);
+    return Status::OK();
+  } else {
     std::string value_meta;
-    s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
-                                      value.slice(), &value_meta);
+    auto s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
+                                           value.slice(), &value_meta);
     if (s.ok()) {
-      Slice parts[] = {EncodeFileNumber(file_number), value_meta};
+      Slice parts[] = {value_index, value_meta};
       value.reset(SliceParts(parts, 2), file_number);
     }
     return s;

@@ -176,6 +176,7 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
       mutable_cf_options.blob_file_defragment_size;
   cf_opts.max_dependence_blob_overlap =
       mutable_cf_options.max_dependence_blob_overlap;
+  cf_opts.exact_garbage_ratio = mutable_cf_options.exact_garbage_ratio;
   cf_opts.maintainer_job_ratio = mutable_cf_options.maintainer_job_ratio;
   cf_opts.optimize_filters_for_hits =
       mutable_cf_options.optimize_filters_for_hits;
@@ -237,6 +238,10 @@ std::map<CompactionPri, std::string> OptionsHelper::compaction_pri_to_string = {
 std::map<WriteBufferFlushPri, std::string>
     OptionsHelper::write_buffer_flush_pri_to_string = {
         {kFlushOldest, "kFlushOldest"}, {kFlushLargest, "kFlushLargest"}};
+
+std::unordered_map<std::string, ExactGarbageRatioMode>
+    OptionsHelper::exact_garbage_ratio_mode_string_map = {
+        {"false", kExactGCDisabled}, {"true", kExactGCEnabled}};
 
 std::map<CompactionStopStyle, std::string>
     OptionsHelper::compaction_stop_style_to_string = {
@@ -581,6 +586,10 @@ bool ParseOptionHelper(char* opt_address, const OptionType& opt_type,
       return ParseEnum<WriteBufferFlushPri>(
           write_buffer_flush_pri_string_map, value,
           reinterpret_cast<WriteBufferFlushPri*>(opt_address));
+    case OptionType::kExactGarbageRatioMode:
+      return ParseEnum<ExactGarbageRatioMode>(
+          exact_garbage_ratio_mode_string_map, value,
+          reinterpret_cast<ExactGarbageRatioMode*>(opt_address));
     case OptionType::kValueExtractorFactory:
       return ParseValueExtractorFactory(
           value,
@@ -773,6 +782,10 @@ bool SerializeSingleOptionHelper(const char* opt_address,
       return SerializeEnum<WriteBufferFlushPri>(
           write_buffer_flush_pri_string_map,
           *reinterpret_cast<const WriteBufferFlushPri*>(opt_address), value);
+    case OptionType::kExactGarbageRatioMode:
+      return SerializeEnum<ExactGarbageRatioMode>(
+          exact_garbage_ratio_mode_string_map,
+          *reinterpret_cast<const ExactGarbageRatioMode*>(opt_address), value);
     case OptionType::kValueExtractorFactory: {
       const auto* value_extractor_factory_ptr =
           reinterpret_cast<const std::shared_ptr<const ValueExtractorFactory>*>(
@@ -1947,6 +1960,10 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::max_dependence_blob_overlap),
           OptionType::kSizeT, OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, max_dependence_blob_overlap)}},
+        {"exact_garbage_ratio",
+         {offset_of(&ColumnFamilyOptions::exact_garbage_ratio),
+          OptionType::kExactGarbageRatioMode, OptionVerificationType::kNormal,
+          true, offsetof(struct MutableCFOptions, exact_garbage_ratio)}},
         {"maintainer_job_ratio",
          {offset_of(&ColumnFamilyOptions::maintainer_job_ratio),
           OptionType::kDouble, OptionVerificationType::kNormal, true,

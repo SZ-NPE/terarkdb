@@ -954,15 +954,23 @@ double Version::GetCompactionLoad() const {
 }
 
 double Version::GetGarbageCollectionLoad() const {
-  double sum = 0, antiquated = 0;
+  double entry_count = 0, total_size = 0, antiquated_entry = 0,
+         antiquated_size = 0;
+  bool exact_size_available = true;
   for (auto f : storage_info_.LevelFiles(-1)) {
     if (!f->is_gc_permitted() || f->being_compacted) {
       continue;
     }
-    sum += f->prop.num_entries;
-    antiquated += f->num_antiquation;
+    entry_count += f->prop.num_entries;
+    total_size += f->prop.raw_key_size + f->prop.raw_value_size;
+    antiquated_entry += f->num_antiquation;
+    antiquated_size += f->size_antiquated;
+    exact_size_available &= f->exact_garbage_ratio_available;
   }
-  return sum > 0 ? antiquated / sum : sum;
+  const bool exact_gc = mutable_cf_options_.exact_garbage_ratio;
+  return exact_gc && exact_size_available
+             ? antiquated_size / std::max<double>(1, total_size)
+             : antiquated_entry / std::max<double>(1, entry_count);
 }
 
 void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
@@ -1234,11 +1242,14 @@ VersionStorageInfo::VersionStorageInfo(
       blob_num_entries_(0),
       blob_num_deletions_(0),
       blob_num_antiquation_(0),
+      blob_antiquated_size_(0),
       lsm_file_size_(0),
       lsm_num_entries_(0),
       lsm_num_deletions_(0),
       estimated_compaction_needed_bytes_(0),
       total_garbage_ratio_(0),
+      entry_garbage_ratio_(0),
+      size_garbage_ratio_(0),
       finalized_(false),
       is_pick_compaction_fail(false),
       is_pick_garbage_collection_fail(false),
@@ -1539,6 +1550,7 @@ void VersionStorageInfo::UpdateAccumulatedStats(FileMetaData* file_meta) {
     blob_num_entries_ += file_meta->prop.num_entries;
     blob_num_deletions_ += file_meta->prop.num_deletions;
     blob_num_antiquation_ += file_meta->num_antiquation;
+    blob_antiquated_size_ += file_meta->size_antiquated;
   }
 }
 
@@ -1848,8 +1860,11 @@ void VersionStorageInfo::ComputeCompactionScore(
 
   // Calculate total_garbage_ratio_ as criterion for NeedsGarbageCollection().
   uint64_t num_antiquation = 0;
+  uint64_t size_antiquation = 0;
   uint64_t num_entries = 0;
+  uint64_t raw_data_size = 0;
   bool marked = false;
+  bool exact_size_available = true;
   for (auto& f : LevelFiles(-1)) {
     if (!f->is_gc_permitted()) {
       continue;
@@ -1857,10 +1872,18 @@ void VersionStorageInfo::ComputeCompactionScore(
     // if a file being_compacted, gc_status must be kGarbageCollectionCandidate
     marked |= f->marked_for_compaction;
     num_antiquation += f->num_antiquation;
+    size_antiquation += f->size_antiquated;
     num_entries += f->prop.num_entries;
+    raw_data_size += f->prop.raw_key_size + f->prop.raw_value_size;
+    exact_size_available &= f->exact_garbage_ratio_available;
   }
   blob_marked_for_compaction_ = marked;
-  total_garbage_ratio_ = num_antiquation / std::max<double>(1, num_entries);
+  entry_garbage_ratio_ = num_antiquation / std::max<double>(1, num_entries);
+  size_garbage_ratio_ = size_antiquation / std::max<double>(1, raw_data_size);
+  total_garbage_ratio_ =
+      mutable_cf_options.exact_garbage_ratio && exact_size_available
+          ? size_garbage_ratio_
+          : entry_garbage_ratio_;
 
   is_pick_compaction_fail = false;
   ComputeFilesMarkedForCompaction();
@@ -1988,10 +2011,10 @@ uint64_t VersionStorageInfo::FileSize(const FileMetaData* f,
 }
 
 uint64_t VersionStorageInfo::FileSizeWithBlob(const FileMetaData* f,
-                                              bool recursive,
-                                              double ratio) const {
+                                              bool recursive, double ratio,
+                                              bool exact_gc) const {
   uint64_t file_size = f->fd.GetFileSize();
-  if (recursive || f->prop.is_map_sst()) {
+  if ((!exact_gc && recursive) || f->prop.is_map_sst()) {
     for (auto& dependence : f->prop.dependence) {
       auto find = dependence_map_.find(dependence.file_number);
       if (find == dependence_map_.end()) {
@@ -2002,8 +2025,34 @@ uint64_t VersionStorageInfo::FileSizeWithBlob(const FileMetaData* f,
           find->second->prop.num_entries == 0
               ? ratio
               : ratio * dependence.entry_count / find->second->prop.num_entries;
-      file_size +=
-          FileSizeWithBlob(find->second, f->prop.is_map_sst(), new_ratio);
+      file_size += FileSizeWithBlob(find->second, f->prop.is_map_sst(),
+                                    new_ratio, exact_gc);
+    }
+  } else if (exact_gc && recursive) {
+    for (auto& dependence : f->prop.dependence) {
+      auto find = dependence_map_.find(dependence.file_number);
+      if (find == dependence_map_.end()) {
+        continue;
+      }
+      uint64_t blob_raw_size =
+          find->second->prop.raw_key_size + find->second->prop.raw_value_size;
+      if (!find->second->exact_garbage_ratio_available ||
+          dependence.separated_total_size == 0 || blob_raw_size == 0) {
+        double new_ratio = find->second->prop.num_entries == 0
+                               ? ratio
+                               : ratio * dependence.entry_count /
+                                     find->second->prop.num_entries;
+        file_size += FileSizeWithBlob(find->second, false, new_ratio, false);
+        continue;
+      }
+      double new_ratio =
+          ratio * dependence.separated_total_size / blob_raw_size;
+      uint64_t metadata_size =
+          find->second->fd.GetFileSize() > blob_raw_size
+              ? find->second->fd.GetFileSize() - blob_raw_size
+              : 0;
+      file_size += dependence.separated_total_size +
+                   static_cast<uint64_t>(metadata_size * new_ratio);
     }
   }
   return uint64_t(ratio * file_size);
@@ -4544,6 +4593,7 @@ uint64_t VersionSet::ApproximateSize(Version* v, const FdWithKeyRange& f,
                                      const FileMetaData* file_meta,
                                      uint64_t entry_count) {
     uint64_t result = 0;
+    bool exact_gc = v->GetMutableCFOptions().exact_garbage_ratio;
     double ratio = file_meta->prop.num_entries == 0
                        ? 1
                        : double(entry_count) / file_meta->prop.num_entries;
@@ -4552,7 +4602,7 @@ uint64_t VersionSet::ApproximateSize(Version* v, const FdWithKeyRange& f,
       auto& icomp = v->cfd_->internal_comparator();
       if (icomp.Compare(file_meta->largest.Encode(), key) <= 0) {
         // Entire file is before "key", so just add the file size
-        result = vstorage->FileSizeWithBlob(file_meta, true, ratio);
+        result = vstorage->FileSizeWithBlob(file_meta, true, ratio, exact_gc);
       } else if (icomp.Compare(file_meta->smallest.Encode(), key) > 0) {
         // Entire file is after "key", so ignore
         result = 0;
@@ -4575,8 +4625,9 @@ uint64_t VersionSet::ApproximateSize(Version* v, const FdWithKeyRange& f,
           }
         }
         if (result > 0) {
-          result = uint64_t(double(result) / file_meta->fd.GetFileSize() *
-                            vstorage->FileSizeWithBlob(file_meta, true, ratio));
+          result = uint64_t(
+              double(result) / file_meta->fd.GetFileSize() *
+              vstorage->FileSizeWithBlob(file_meta, true, ratio, exact_gc));
         }
       }
     } else {
