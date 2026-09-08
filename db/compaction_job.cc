@@ -1502,6 +1502,59 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
 
   vstorage->LogLSMState(stream);
 
+  if (status.ok() &&
+      compact_->compaction->compaction_type() == kGarbageCollection) {
+    uint64_t gc_num_entries = 0;
+    uint64_t gc_total_size = 0;
+    bool exact_size_available = true;
+    for (size_t level = 0;
+         level < compact_->compaction->num_input_levels(); ++level) {
+      for (const auto* file : *compact_->compaction->inputs(level)) {
+        gc_num_entries += file->prop.num_entries;
+        gc_total_size += file->prop.raw_key_size + file->prop.raw_value_size;
+        exact_size_available &= file->exact_garbage_ratio_available;
+      }
+    }
+    const uint64_t gc_written_bytes =
+        compaction_stats_.bytes_written + compaction_stats_.bytes_blob_written;
+    const uint64_t gc_input_bytes =
+        compaction_stats_.bytes_read_non_output_levels +
+        compaction_stats_.bytes_read_output_level;
+    const uint64_t gc_reclaimed_bytes =
+        gc_input_bytes > gc_written_bytes ? gc_input_bytes - gc_written_bytes
+                                          : 0;
+    auto gc_stream = event_logger_->LogToBuffer(log_buffer_);
+    gc_stream << "job" << job_id_ << "event"
+              << "garbage_collection_finished" << "num_antiquation"
+              << compact_->compaction->num_antiquation() << "num_entries"
+              << gc_num_entries << "size_antiquated"
+              << compact_->compaction->size_antiquated() << "total_size"
+              << gc_total_size << "entry_garbage_ratio"
+              << compact_->compaction->num_antiquation() /
+                     std::max<double>(1, gc_num_entries)
+              << "size_garbage_ratio"
+              << compact_->compaction->size_antiquated() /
+                     std::max<double>(1, gc_total_size)
+              << "exact_size_available" << exact_size_available
+              << "input_bytes" << gc_input_bytes << "written_bytes"
+              << gc_written_bytes;
+    if (measure_io_stats_ && compaction_job_stats_ != nullptr) {
+      auto gc_io_stream = event_logger_->LogToBuffer(log_buffer_);
+      gc_io_stream << "job" << job_id_ << "event"
+                   << "garbage_collection_io_stats" << "duration_micros"
+                   << compaction_stats_.micros << "file_read_nanos"
+                   << compaction_job_stats_->file_read_nanos
+                   << "file_write_nanos"
+                   << compaction_job_stats_->file_write_nanos
+                   << "file_range_sync_nanos"
+                   << compaction_job_stats_->file_range_sync_nanos
+                   << "file_fsync_nanos"
+                   << compaction_job_stats_->file_fsync_nanos
+                   << "file_prepare_write_nanos"
+                   << compaction_job_stats_->file_prepare_write_nanos;
+    }
+  }
+
   CleanupCompaction();
   return status;
 }
@@ -1542,6 +1595,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   // I/O measurement variables
   PerfLevel prev_perf_level = PerfLevel::kEnableTime;
   const uint64_t kRecordStatsEvery = 1000;
+  uint64_t prev_read_nanos = 0;
   uint64_t prev_write_nanos = 0;
   uint64_t prev_fsync_nanos = 0;
   uint64_t prev_range_sync_nanos = 0;
@@ -1549,6 +1603,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   if (measure_io_stats_) {
     prev_perf_level = GetPerfLevel();
     SetPerfLevel(PerfLevel::kEnableTime);
+    prev_read_nanos = IOSTATS(read_nanos);
     prev_write_nanos = IOSTATS(write_nanos);
     prev_fsync_nanos = IOSTATS(fsync_nanos);
     prev_range_sync_nanos = IOSTATS(range_sync_nanos);
@@ -2043,6 +2098,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   }
 
   if (measure_io_stats_) {
+    sub_compact->compaction_job_stats.file_read_nanos +=
+        IOSTATS(read_nanos) - prev_read_nanos;
     sub_compact->compaction_job_stats.file_write_nanos +=
         IOSTATS(write_nanos) - prev_write_nanos;
     sub_compact->compaction_job_stats.file_fsync_nanos +=
@@ -2079,6 +2136,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
 
   // I/O measurement variables
   PerfLevel prev_perf_level = PerfLevel::kEnableTime;
+  uint64_t prev_read_nanos = 0;
   uint64_t prev_write_nanos = 0;
   uint64_t prev_fsync_nanos = 0;
   uint64_t prev_range_sync_nanos = 0;
@@ -2086,6 +2144,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   if (measure_io_stats_) {
     prev_perf_level = GetPerfLevel();
     SetPerfLevel(PerfLevel::kEnableTime);
+    prev_read_nanos = IOSTATS(read_nanos);
     prev_write_nanos = IOSTATS(write_nanos);
     prev_fsync_nanos = IOSTATS(fsync_nanos);
     prev_range_sync_nanos = IOSTATS(range_sync_nanos);
@@ -2298,6 +2357,8 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   }
 
   if (measure_io_stats_) {
+    sub_compact->compaction_job_stats.file_read_nanos +=
+        IOSTATS(read_nanos) - prev_read_nanos;
     sub_compact->compaction_job_stats.file_write_nanos +=
         IOSTATS(write_nanos) - prev_write_nanos;
     sub_compact->compaction_job_stats.file_fsync_nanos +=

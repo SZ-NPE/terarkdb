@@ -196,6 +196,11 @@ TEST_F(VersionBuilderTest, ExactGarbageRatioUsesReferencedBytes) {
   ASSERT_EQ(0.5, new_vstorage.entry_garbage_ratio());
   ASSERT_EQ(0.75, new_vstorage.size_garbage_ratio());
   ASSERT_EQ(0.5, new_vstorage.total_garbage_ratio());
+  ASSERT_EQ(2U, new_vstorage.gc_num_antiquation());
+  ASSERT_EQ(4U, new_vstorage.gc_num_entries());
+  ASSERT_EQ(300U, new_vstorage.gc_size_antiquated());
+  ASSERT_EQ(400U, new_vstorage.gc_raw_data_size());
+  ASSERT_TRUE(new_vstorage.gc_exact_size_available());
 
   mutable_cf_options_.exact_garbage_ratio = kExactGCEnabled;
   new_vstorage.ComputeCompactionScore(ioptions_, mutable_cf_options_);

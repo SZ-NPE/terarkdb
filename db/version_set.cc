@@ -1243,6 +1243,8 @@ VersionStorageInfo::VersionStorageInfo(
       blob_num_deletions_(0),
       blob_num_antiquation_(0),
       blob_antiquated_size_(0),
+      blob_raw_data_size_(0),
+      blob_exact_size_available_(true),
       lsm_file_size_(0),
       lsm_num_entries_(0),
       lsm_num_deletions_(0),
@@ -1551,6 +1553,9 @@ void VersionStorageInfo::UpdateAccumulatedStats(FileMetaData* file_meta) {
     blob_num_deletions_ += file_meta->prop.num_deletions;
     blob_num_antiquation_ += file_meta->num_antiquation;
     blob_antiquated_size_ += file_meta->size_antiquated;
+    blob_raw_data_size_ +=
+        file_meta->prop.raw_key_size + file_meta->prop.raw_value_size;
+    blob_exact_size_available_ &= file_meta->exact_garbage_ratio_available;
   }
 }
 

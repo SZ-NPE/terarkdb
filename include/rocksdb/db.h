@@ -708,6 +708,11 @@ class DB {
     // "rocksdb.options-statistics" - returns multi-line string
     //      of options.statistics
     static const std::string kOptionsStatistics;
+
+    //  "rocksdb.separated-value-gc-stats" - returns one CSV row containing
+    //      current separated-value garbage counters and both entry- and
+    //      byte-based garbage ratios. Intended for low-frequency sampling.
+    static const std::string kSeparatedValueGcStats;
   };
 #endif /* ROCKSDB_LITE */
 

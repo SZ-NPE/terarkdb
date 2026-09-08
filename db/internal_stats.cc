@@ -253,6 +253,8 @@ static const std::string min_obsolete_sst_number_to_keep_str =
 static const std::string base_level_str = "base-level";
 static const std::string total_sst_files_size = "total-sst-files-size";
 static const std::string live_sst_files_size = "live-sst-files-size";
+static const std::string separated_value_gc_stats =
+    "separated-value-gc-stats";
 static const std::string estimate_pending_comp_bytes =
     "estimate-pending-compaction-bytes";
 static const std::string aggregated_table_properties =
@@ -334,6 +336,8 @@ const std::string DB::Properties::kTotalSstFilesSize =
     rocksdb_prefix + total_sst_files_size;
 const std::string DB::Properties::kLiveSstFilesSize =
     rocksdb_prefix + live_sst_files_size;
+const std::string DB::Properties::kSeparatedValueGcStats =
+    rocksdb_prefix + separated_value_gc_stats;
 const std::string DB::Properties::kBaseLevel = rocksdb_prefix + base_level_str;
 const std::string DB::Properties::kEstimatePendingCompactionBytes =
     rocksdb_prefix + estimate_pending_comp_bytes;
@@ -458,6 +462,9 @@ const std::unordered_map<std::string, DBPropertyInfo>
           nullptr}},
         {DB::Properties::kLiveSstFilesSize,
          {false, nullptr, &InternalStats::HandleLiveSstFilesSize, nullptr,
+          nullptr}},
+        {DB::Properties::kSeparatedValueGcStats,
+         {false, &InternalStats::HandleSeparatedValueGcStats, nullptr, nullptr,
           nullptr}},
         {DB::Properties::kEstimatePendingCompactionBytes,
          {false, nullptr, &InternalStats::HandleEstimatePendingCompactionBytes,
@@ -602,6 +609,25 @@ bool InternalStats::HandleCFStats(std::string* value, Slice /*suffix*/) {
 bool InternalStats::HandleCFStatsNoFileHistogram(std::string* value,
                                                  Slice /*suffix*/) {
   DumpCFStatsNoFileHistogram(value);
+  return true;
+}
+
+bool InternalStats::HandleSeparatedValueGcStats(std::string* value,
+                                                Slice /*suffix*/) {
+  const auto* vstorage = cfd_->current()->storage_info();
+  char buf[512];
+  const uint64_t num_antiquation = vstorage->gc_num_antiquation();
+  const uint64_t num_entries = vstorage->gc_num_entries();
+  const uint64_t size_antiquated = vstorage->gc_size_antiquated();
+  const uint64_t raw_data_size = vstorage->gc_raw_data_size();
+  snprintf(buf, sizeof(buf),
+           "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+           ",%.17g,%.17g,%d",
+           num_antiquation, num_entries, size_antiquated, raw_data_size,
+           num_antiquation / std::max<double>(1, num_entries),
+           size_antiquated / std::max<double>(1, raw_data_size),
+           vstorage->gc_exact_size_available() ? 1 : 0);
+  *value = buf;
   return true;
 }
 

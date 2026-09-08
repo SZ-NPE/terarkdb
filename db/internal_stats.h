@@ -495,6 +495,7 @@ class InternalStats {
   bool HandleCFMapStats(std::map<std::string, std::string>* compaction_stats);
   bool HandleCFStats(std::string* value, Slice suffix);
   bool HandleCFStatsNoFileHistogram(std::string* value, Slice suffix);
+  bool HandleSeparatedValueGcStats(std::string* value, Slice suffix);
   bool HandleCFFileHistogram(std::string* value, Slice suffix);
   bool HandleDBStats(std::string* value, Slice suffix);
   bool HandleSsTables(std::string* value, Slice suffix);

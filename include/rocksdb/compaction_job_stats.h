@@ -66,6 +66,9 @@ struct CompactionJobStats {
   // Following counters are only populated if
   // options.report_bg_io_stats = true;
 
+  // Time spent on file reads.
+  uint64_t file_read_nanos;
+
   // Time spent on file's Append() call.
   uint64_t file_write_nanos;
 

@@ -270,6 +270,11 @@ class VersionStorageInfo {
   double total_garbage_ratio() const { return total_garbage_ratio_; }
   double entry_garbage_ratio() const { return entry_garbage_ratio_; }
   double size_garbage_ratio() const { return size_garbage_ratio_; }
+  uint64_t gc_num_antiquation() const { return blob_num_antiquation_; }
+  uint64_t gc_num_entries() const { return blob_num_entries_; }
+  uint64_t gc_size_antiquated() const { return blob_antiquated_size_; }
+  uint64_t gc_raw_data_size() const { return blob_raw_data_size_; }
+  bool gc_exact_size_available() const { return blob_exact_size_available_; }
 
   bool blob_marked_for_compaction() const {
     return blob_marked_for_compaction_;
@@ -625,6 +630,8 @@ class VersionStorageInfo {
   uint64_t blob_num_deletions_;
   uint64_t blob_num_antiquation_;
   uint64_t blob_antiquated_size_;
+  uint64_t blob_raw_data_size_;
+  bool blob_exact_size_available_;
   uint64_t lsm_file_size_;
   uint64_t lsm_num_entries_;
   uint64_t lsm_num_deletions_;

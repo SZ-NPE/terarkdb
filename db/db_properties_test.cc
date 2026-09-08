@@ -109,6 +109,13 @@ TEST_F(DBPropertiesTest, CurrentVersionNumber) {
   ASSERT_GT(v3, v2);
 }
 
+TEST_F(DBPropertiesTest, EmptySeparatedValueGcStats) {
+  std::string stats;
+  ASSERT_TRUE(dbfull()->GetProperty("rocksdb.separated-value-gc-stats",
+                                    &stats));
+  ASSERT_EQ("0,0,0,0,0,0,1", stats);
+}
+
 TEST_F(DBPropertiesTest, GetAggregatedIntPropertyTest) {
   const int kKeySize = 100;
   const int kValueSize = 500;
