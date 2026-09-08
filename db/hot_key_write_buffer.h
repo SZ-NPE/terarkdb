@@ -36,7 +36,6 @@ class HotKeyWriteBuffer {
   struct Options {
     size_t capacity = 64U << 20;
     size_t max_value_size = 1U << 20;
-    size_t max_interned_value_bytes = 64U << 20;
     size_t max_pending_memory = 16U << 20;
     size_t max_pending_entry_memory = 8U << 20;
   };
@@ -130,45 +129,13 @@ class HotKeyWriteBuffer {
   size_t memory_usage() const {
     return cache_->GetUsage() +
            membership_counters_.size() * sizeof(membership_counters_[0]) +
-           pending_memory_usage_.load(std::memory_order_relaxed) +
-           interned_value_bytes_.load(std::memory_order_relaxed);
-  }
-
-  size_t resident_cache_usage() const { return cache_->GetUsage(); }
-
-  size_t interned_value_count() const {
-    return interned_value_count_.load(std::memory_order_relaxed);
-  }
-
-  size_t interned_value_bytes() const {
-    return interned_value_bytes_.load(std::memory_order_relaxed);
-  }
-
-  size_t max_interned_value_bytes() const {
-    return max_interned_value_bytes_;
+           pending_memory_usage_.load(std::memory_order_relaxed);
   }
 
   const char* cache_name() const { return cache_->Name(); }
 
  private:
   struct Entry;
-
-  struct ValueReference {
-    ValueReference() = default;
-    explicit ValueReference(const std::string* interned_value)
-        : value(interned_value) {}
-
-    const std::string* value = nullptr;
-
-    bool interned() const { return value != nullptr; }
-  };
-
-  struct ValuePoolShard {
-    port::Mutex mutex;
-    std::unordered_map<
-        uint64_t, std::vector<std::unique_ptr<const std::string>>>
-        values;
-  };
 
   struct PendingShard {
     mutable port::Mutex mutex;
@@ -204,21 +171,16 @@ class HotKeyWriteBuffer {
 
     void CopyTo(BufferedWrite* write);
     void CopyToUnlocked(BufferedWrite* write);
-    Slice value_slice() const {
-      return interned_value == nullptr ? Slice(owned_value)
-                                       : Slice(*interned_value);
-    }
-    bool CanUpdateMutationInPlace(const Slice& new_value, ValueType new_type,
-                                  const ValueReference& reference) const;
-    void UpdateMutation(const Slice& new_value, ValueType new_type,
-                        ValueReference reference);
+    Slice value_slice() const { return Slice(value); }
+    bool CanUpdateMutationInPlace(const Slice& new_value,
+                                  ValueType new_type) const;
+    void UpdateMutation(const Slice& new_value, ValueType new_type);
     size_t CalculateCharge() const;
 
     HotKeyWriteBuffer* owner;
     mutable SpinMutex mutex;
     std::string key;
-    std::string owned_value;
-    const std::string* interned_value = nullptr;
+    std::string value;
     ValueType type = kTypeValue;
     SequenceNumber sequence = 0;
     uint64_t memtable_id = 0;
@@ -248,8 +210,6 @@ class HotKeyWriteBuffer {
                                        size_t entry_charge) const;
   void UpdateMaxResidentCharge(size_t shard_index, size_t charge);
   port::Mutex* KeyMutex(const Slice& key);
-  ValueReference InternValue(const Slice& value);
-  bool ReserveInternedValueBytes(size_t charge);
   bool RebindEntryIfNeeded(Entry* entry, uint64_t memtable_id);
   void RebindEntryToCurrentMemtable(Entry* entry);
   WalReference* RegisterWalReference(uint64_t wal_number);
@@ -270,18 +230,14 @@ class HotKeyWriteBuffer {
                                      uint32_t pending_hash) const;
   bool RemovePending(const Slice& key, const std::shared_ptr<Entry>& entry,
                      SequenceNumber expected_sequence);
-  size_t PendingCharge(const Entry& entry) const;
-  size_t PendingReservation(size_t resident_charge) const;
   void OnEntryDeleted(Entry* entry);
   void AppendSnapshot(Entry* entry);
 
   std::shared_ptr<Cache> cache_;
   const size_t resident_capacity_;
   const size_t max_value_size_;
-  const size_t max_interned_value_bytes_;
   const size_t max_pending_memory_;
   const size_t max_pending_entry_memory_;
-  const uint64_t instance_id_;
   const int resident_shard_bits_;
   const size_t resident_shard_count_;
   const size_t resident_shard_capacity_;
@@ -290,9 +246,6 @@ class HotKeyWriteBuffer {
   std::array<std::mutex, 64> insertion_mutexes_;
   std::array<std::atomic<size_t>, 64> resident_shard_usage_{};
   std::array<std::atomic<size_t>, 64> max_resident_charge_{};
-  std::array<ValuePoolShard, 64> value_pool_;
-  std::atomic<size_t> interned_value_count_{0};
-  std::atomic<size_t> interned_value_bytes_{0};
   std::atomic<size_t> resident_entry_count_{0};
   std::atomic<size_t> pending_entry_count_{0};
   std::atomic<size_t> pending_memory_usage_{0};

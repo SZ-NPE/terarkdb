@@ -342,7 +342,6 @@ MAIN_SOURCES =                                                          \
   db/heap_test.cc                                                       \
   db/hot_region_test.cc                                                 \
   db/hot_key_write_buffer_test.cc                                      \
-  db/key_hotness_tracker_test.cc                                       \
   db/listener_test.cc                                                   \
   db/log_test.cc                                                        \
   db/lru_cache_test.cc                                                  \

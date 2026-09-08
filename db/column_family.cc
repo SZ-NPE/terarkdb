@@ -175,6 +175,10 @@ Status CheckHotKeyWriteBufferSupported(
     return Status::InvalidArgument(
         "hot_key_admission_threshold must be greater than zero");
   }
+  if (cf_options.hot_key_admission_threshold > 16) {
+    return Status::InvalidArgument(
+        "hot_key_admission_threshold must not exceed 16");
+  }
   if (cf_options.hot_key_sketch_columns == 0 ||
       (cf_options.hot_key_sketch_columns &
        (cf_options.hot_key_sketch_columns - 1)) != 0) {
@@ -492,7 +496,7 @@ ColumnFamilyData::ColumnFamilyData(
     hot_region_options.capacity = ioptions_.hot_key_write_buffer_size;
     hot_region_options.max_value_size =
         ioptions_.hot_key_max_buffered_value_size;
-    hot_region_options.doorkeeper_bytes = 16U << 20;
+    hot_region_options.doorkeeper_slots = ioptions_.hot_key_sketch_columns;
     hot_region_options.admission_threshold =
         ioptions_.hot_key_admission_threshold;
     hot_region_options.rotation_interval =

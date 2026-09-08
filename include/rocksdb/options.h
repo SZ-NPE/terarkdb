@@ -365,10 +365,11 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Number of observed overwrites before a key is admitted.
   uint32_t hot_key_admission_threshold = 16;
 
-  // Number of columns in each Count-Min Sketch row. Must be a power of two.
+  // Number of counters in the rotating hot-key admission table.
+  // Must be a power of two.
   uint32_t hot_key_sketch_columns = 1U << 20;
 
-  // Number of overwrite reports between Count-Min Sketch decay passes.
+  // Number of overwrite reports in one admission window.
   uint64_t hot_key_sketch_decay_interval = 1U << 20;
 
   // Maximum value size admitted into the hot-key write buffer.

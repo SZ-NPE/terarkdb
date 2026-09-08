@@ -13,28 +13,14 @@ namespace TERARKDB_NAMESPACE {
 
 namespace {
 
-constexpr size_t kMinDoorkeeperBytes = 16U << 20;
-constexpr size_t kMaxDoorkeeperBytes = 32U << 20;
-constexpr size_t kMaxValuePoolBytes = 64U << 20;
 constexpr size_t kMaxPendingBytes = 16U << 20;
-
-std::atomic<uint64_t> next_doorkeeper_instance_id{1};
-
-struct ReportBatch {
-  uint64_t instance_id = 0;
-  uint64_t next = 0;
-  uint64_t end = 0;
-};
-
-thread_local ReportBatch report_batch;
+constexpr size_t kDoorkeeperSlotsPerWord = 6;
 
 HotKeyWriteBuffer::Options MakeWriteBufferOptions(
-    size_t resident_capacity, size_t value_pool_capacity,
-    size_t pending_capacity, size_t max_value_size) {
+    size_t resident_capacity, size_t pending_capacity, size_t max_value_size) {
   HotKeyWriteBuffer::Options buffer_options;
   buffer_options.capacity = resident_capacity;
   buffer_options.max_value_size = max_value_size;
-  buffer_options.max_interned_value_bytes = value_pool_capacity;
   buffer_options.max_pending_memory = pending_capacity;
   buffer_options.max_pending_entry_memory =
       std::max<size_t>(1, pending_capacity / 2);
@@ -46,20 +32,16 @@ HotKeyWriteBuffer::Options MakeWriteBufferOptions(
 HotRegion::HotRegion(const Options& options)
     : capacity_(std::max<size_t>(1, options.capacity)),
       doorkeeper_bytes_(
-          CalculateDoorkeeperBytes(capacity_, options.doorkeeper_bytes)),
-      value_pool_capacity_(
-          CalculateValuePoolBytes(capacity_, doorkeeper_bytes_)),
-      pending_capacity_(CalculatePendingBytes(
-          capacity_, doorkeeper_bytes_, value_pool_capacity_)),
+          CalculateDoorkeeperBytes(capacity_, options.doorkeeper_slots)),
+      pending_capacity_(
+          CalculatePendingBytes(capacity_, doorkeeper_bytes_)),
       resident_capacity_(
           std::max<size_t>(1, capacity_ - doorkeeper_bytes_ -
-                                 value_pool_capacity_ -
                                  pending_capacity_)),
       doorkeeper_(doorkeeper_bytes_, options.admission_threshold,
                   options.rotation_interval),
       write_buffer_(MakeWriteBufferOptions(
-          resident_capacity_, value_pool_capacity_, pending_capacity_,
-          options.max_value_size)) {}
+          resident_capacity_, pending_capacity_, options.max_value_size)) {}
 
 HotRegion::RotatingDoorkeeper::RotatingDoorkeeper(
     size_t memory_bytes, uint32_t admission_threshold,
@@ -67,12 +49,7 @@ HotRegion::RotatingDoorkeeper::RotatingDoorkeeper(
     : words_(std::max<size_t>(1, memory_bytes / sizeof(words_[0]))),
       admission_threshold_(
           std::min<uint32_t>(16, std::max<uint32_t>(1, admission_threshold))),
-      rotation_interval_(std::max<uint64_t>(1, rotation_interval)),
-      report_batch_size_(rotation_interval_ < kReportBatchSize
-                             ? rotation_interval_
-                             : kReportBatchSize),
-      instance_id_(
-          next_doorkeeper_instance_id.fetch_add(1, std::memory_order_relaxed)) {
+      rotation_interval_(std::max<uint64_t>(1, rotation_interval)) {
   for (auto& word : words_) {
     word.store(0, std::memory_order_relaxed);
   }
@@ -123,19 +100,13 @@ bool HotRegion::RotatingDoorkeeper::RecordAndShouldAdmit(
     return true;
   }
 
-  if (report_batch.instance_id != instance_id_ ||
-      report_batch.next == report_batch.end) {
-    const uint64_t first =
-        reports_.fetch_add(report_batch_size_, std::memory_order_relaxed) + 1;
-    report_batch = {instance_id_, first, first + report_batch_size_};
-  }
-  const uint64_t report = report_batch.next++;
+  const uint64_t report = reports_.fetch_add(1, std::memory_order_relaxed);
   const uint16_t generation =
       static_cast<uint16_t>(report / rotation_interval_);
   const uint32_t hash = Hash(key.data(), key.size(), 0x85ebca6bU);
-  const size_t slot = hash % kSlotsPerWord;
+  const size_t slot = hash % kDoorkeeperSlotsPerWord;
   std::atomic<uint64_t>& target =
-      words_[(hash / kSlotsPerWord) % words_.size()];
+      words_[(hash / kDoorkeeperSlotsPerWord) % words_.size()];
 
   uint64_t observed = target.load(std::memory_order_relaxed);
   while (true) {
@@ -154,31 +125,19 @@ bool HotRegion::RotatingDoorkeeper::RecordAndShouldAdmit(
 }
 
 size_t HotRegion::CalculateDoorkeeperBytes(size_t capacity,
-                                           size_t requested_bytes) {
-  if (capacity < kMinDoorkeeperBytes * 4) {
-    return std::max<size_t>(1, capacity / 32);
-  }
-  const size_t requested =
-      std::min(kMaxDoorkeeperBytes,
-               std::max(kMinDoorkeeperBytes, requested_bytes));
-  return std::min(requested, capacity / 8);
-}
-
-size_t HotRegion::CalculateValuePoolBytes(size_t capacity,
-                                          size_t doorkeeper_bytes) {
-  const size_t available = capacity - doorkeeper_bytes;
-  if (capacity < kMinDoorkeeperBytes * 4) {
-    return available / 3;
-  }
-  return std::min(kMaxValuePoolBytes, available / 8);
+                                           size_t requested_slots) {
+  const size_t requested_words =
+      (std::max<size_t>(1, requested_slots) + kDoorkeeperSlotsPerWord - 1) /
+      kDoorkeeperSlotsPerWord;
+  const size_t requested_bytes =
+      requested_words * sizeof(std::atomic<uint64_t>);
+  return std::min(requested_bytes, std::max<size_t>(1, capacity / 8));
 }
 
 size_t HotRegion::CalculatePendingBytes(size_t capacity,
-                                        size_t doorkeeper_bytes,
-                                        size_t value_pool_bytes) {
-  const size_t available =
-      capacity - doorkeeper_bytes - value_pool_bytes;
-  if (capacity < kMinDoorkeeperBytes * 4) {
+                                        size_t doorkeeper_bytes) {
+  const size_t available = capacity - doorkeeper_bytes;
+  if (available < kMaxPendingBytes * 4) {
     return available / 2;
   }
   return std::min(kMaxPendingBytes, available / 8);
@@ -193,10 +152,6 @@ bool HotRegion::Lookup(const Slice& key, SequenceNumber snapshot,
 
 bool HotRegion::CanBuffer(const Slice& value) const {
   return write_buffer_.CanBuffer(value);
-}
-
-bool HotRegion::IsKeyMaybePresent(const Slice& key) const {
-  return write_buffer_.IsKeyMaybePresent(key);
 }
 
 HotRegion::PutResult HotRegion::TryPut(const Slice& key, const Slice& value,

@@ -23,7 +23,7 @@ class HotRegion {
   struct Options {
     size_t capacity = 64U << 20;
     size_t max_value_size = 1U << 20;
-    size_t doorkeeper_bytes = 16U << 20;
+    size_t doorkeeper_slots = 1U << 20;
     uint32_t admission_threshold = 16;
     uint64_t rotation_interval = 1U << 20;
   };
@@ -44,7 +44,6 @@ class HotRegion {
               ValueType* type = nullptr) const;
 
   bool CanBuffer(const Slice& value) const;
-  bool IsKeyMaybePresent(const Slice& key) const;
 
   PutResult TryPut(const Slice& key, const Slice& value,
                    SequenceNumber sequence, uint64_t memtable_id,
@@ -79,7 +78,6 @@ class HotRegion {
   size_t capacity() const { return capacity_; }
   size_t doorkeeper_memory_usage() const;
   size_t resident_capacity() const { return resident_capacity_; }
-  size_t value_pool_capacity() const { return value_pool_capacity_; }
   size_t pending_capacity() const { return pending_capacity_; }
 
  private:
@@ -98,8 +96,6 @@ class HotRegion {
     static constexpr uint64_t kCurrentMask = 0xffffffULL;
     static constexpr uint64_t kPreviousMask = 0xffffffULL << 24;
     static constexpr uint64_t kGenerationMask = 0xffffULL << 48;
-    static constexpr size_t kSlotsPerWord = 6;
-    static constexpr uint64_t kReportBatchSize = 4096;
 
     static uint16_t Generation(uint64_t word);
     static uint64_t Normalize(uint64_t word, uint16_t generation);
@@ -111,22 +107,16 @@ class HotRegion {
     std::vector<std::atomic<uint64_t>> words_;
     const uint32_t admission_threshold_;
     const uint64_t rotation_interval_;
-    const uint64_t report_batch_size_;
-    const uint64_t instance_id_;
     std::atomic<uint64_t> reports_{0};
   };
 
   static size_t CalculateDoorkeeperBytes(size_t capacity,
-                                         size_t requested_bytes);
-  static size_t CalculateValuePoolBytes(size_t capacity,
-                                        size_t doorkeeper_bytes);
+                                         size_t requested_slots);
   static size_t CalculatePendingBytes(size_t capacity,
-                                      size_t doorkeeper_bytes,
-                                      size_t value_pool_bytes);
+                                      size_t doorkeeper_bytes);
 
   const size_t capacity_;
   const size_t doorkeeper_bytes_;
-  const size_t value_pool_capacity_;
   const size_t pending_capacity_;
   const size_t resident_capacity_;
   RotatingDoorkeeper doorkeeper_;

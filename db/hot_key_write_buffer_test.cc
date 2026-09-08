@@ -18,7 +18,6 @@ HotKeyWriteBuffer::Options MakeWriteBufferOptions(size_t capacity = 1024) {
   HotKeyWriteBuffer::Options options;
   options.capacity = capacity;
   options.max_value_size = 512;
-  options.max_interned_value_bytes = capacity / 8;
   options.max_pending_memory = capacity;
   return options;
 }
@@ -196,7 +195,7 @@ TEST(HotKeyWriteBufferTest, LargerValueReplacesEntryWithoutMaterializingOld) {
   HotKeyWriteBuffer buffer(MakeWriteBufferOptions(1U << 20));
   ASSERT_EQ(HotKeyWriteBuffer::PutResult::kInserted,
             buffer.TryPut("key", "small", 1, 7, true));
-  ASSERT_EQ(HotKeyWriteBuffer::PutResult::kUpdatedInPlace,
+  ASSERT_EQ(HotKeyWriteBuffer::PutResult::kReplaced,
             buffer.TryPut("key", std::string(64, 'x'), 2, 7, false));
   EXPECT_FALSE(buffer.HasPendingEvictions());
 
@@ -287,7 +286,6 @@ TEST(HotKeyWriteBufferTest, UpdatesEvictingEntryBeforeMaterialization) {
 TEST(HotKeyWriteBufferTest, PreparesResidentsWithinPendingBudget) {
   auto options = MakeWriteBufferOptions(4U << 20);
   options.max_value_size = 4096;
-  options.max_interned_value_bytes = 0;
   options.max_pending_memory = 64U << 10;
   options.max_pending_entry_memory = 32U << 10;
   HotKeyWriteBuffer buffer(options);
@@ -322,7 +320,6 @@ TEST(HotKeyWriteBufferTest, PreparesResidentsWithinPendingBudget) {
 TEST(HotKeyWriteBufferTest, EvictsAcrossShardsWithoutGlobalSerialization) {
   auto options = MakeWriteBufferOptions(1U << 20);
   options.max_value_size = 1024;
-  options.max_interned_value_bytes = 0;
   options.max_pending_memory = 1U << 20;
   options.max_pending_entry_memory = 512U << 10;
   HotKeyWriteBuffer buffer(options);
@@ -405,50 +402,26 @@ TEST(HotKeyWriteBufferTest, RebindsMemtableAndTracksOldestWal) {
   EXPECT_EQ(0U, buffer.OldestWalNumber());
 }
 
-TEST(HotKeyWriteBufferTest, SharesRepeatedValuesInBoundedPool) {
+TEST(HotKeyWriteBufferTest, ChargesRepeatedValuesPerEntry) {
   auto options = MakeWriteBufferOptions(1U << 20);
   options.max_value_size = 4096;
   HotKeyWriteBuffer buffer(options);
   const std::string shared_value(4096, 'a');
-  for (SequenceNumber sequence = 1; sequence <= 100; ++sequence) {
+  constexpr SequenceNumber kEntryCount = 100;
+  for (SequenceNumber sequence = 1; sequence <= kEntryCount; ++sequence) {
     ASSERT_EQ(
         HotKeyWriteBuffer::PutResult::kInserted,
         buffer.TryPut("key-" + std::to_string(sequence), shared_value,
                       sequence, 7, true));
   }
 
-  EXPECT_EQ(100U, buffer.entry_count());
-  EXPECT_EQ(1U, buffer.interned_value_count());
-  EXPECT_LE(buffer.interned_value_bytes(),
-            buffer.max_interned_value_bytes());
-  EXPECT_LT(buffer.memory_usage(), shared_value.size() * 100);
+  EXPECT_EQ(kEntryCount, buffer.entry_count());
+  EXPECT_GT(buffer.memory_usage(), shared_value.size() * kEntryCount);
 
   std::string value;
   ASSERT_TRUE(buffer.Lookup("key-42", kMaxSequenceNumber, 7, &value,
                             nullptr));
   EXPECT_EQ(shared_value, value);
-}
-
-TEST(HotKeyWriteBufferTest, FallsBackWhenValuePoolIsFull) {
-  auto options = MakeWriteBufferOptions(64U << 10);
-  options.max_value_size = 1024;
-  HotKeyWriteBuffer buffer(options);
-  for (SequenceNumber sequence = 1; sequence <= 32; ++sequence) {
-    const std::string value(1024, static_cast<char>(sequence));
-    ASSERT_EQ(
-        HotKeyWriteBuffer::PutResult::kInserted,
-        buffer.TryPut("key-" + std::to_string(sequence), value, sequence, 7,
-                      true));
-  }
-
-  EXPECT_LE(buffer.interned_value_bytes(),
-            buffer.max_interned_value_bytes());
-  EXPECT_LT(buffer.interned_value_count(), 32U);
-
-  std::string value;
-  ASSERT_TRUE(buffer.Lookup("key-32", kMaxSequenceNumber, 7, &value,
-                            nullptr));
-  EXPECT_EQ(std::string(1024, static_cast<char>(32)), value);
 }
 
 }  // namespace TERARKDB_NAMESPACE

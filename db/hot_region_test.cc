@@ -5,7 +5,9 @@
 
 #include "db/hot_region.h"
 
+#include <atomic>
 #include <limits>
+#include <thread>
 
 #include "rocksdb/terark_namespace.h"
 #include "util/testharness.h"
@@ -16,7 +18,7 @@ TEST(HotRegionTest, PreservesAdmissionAndOverwriteSemantics) {
   HotRegion::Options options;
   options.capacity = 1U << 20;
   options.max_value_size = 4096;
-  options.doorkeeper_bytes = 16U << 10;
+  options.doorkeeper_slots = 16U << 10;
   options.admission_threshold = 2;
   options.rotation_interval = std::numeric_limits<uint64_t>::max();
   HotRegion region(options);
@@ -40,7 +42,7 @@ TEST(HotRegionTest, RotatesAdmissionHistory) {
   HotRegion::Options options;
   options.capacity = 1U << 20;
   options.max_value_size = 4096;
-  options.doorkeeper_bytes = 16U << 10;
+  options.doorkeeper_slots = 16U << 10;
   options.admission_threshold = 2;
   options.rotation_interval = 2;
   HotRegion region(options);
@@ -64,12 +66,38 @@ TEST(HotRegionTest, RotatesAdmissionHistory) {
             region.TryPut("expired", "value", 8, 1, false));
 }
 
+TEST(HotRegionTest, CountsReportsWithoutPerThreadWindowSkips) {
+  HotRegion::Options options;
+  options.capacity = 1U << 20;
+  options.max_value_size = 4096;
+  options.doorkeeper_slots = 16U << 10;
+  options.admission_threshold = 3;
+  options.rotation_interval = 4;
+  HotRegion region(options);
+
+  EXPECT_EQ(HotRegion::PutResult::kBypass,
+            region.TryPut("hot", "first", 1, 1, false));
+  HotRegion::PutResult second = HotRegion::PutResult::kInserted;
+  std::thread second_writer([&]() {
+    second = region.TryPut("hot", "second", 2, 1, false);
+  });
+  second_writer.join();
+  EXPECT_EQ(HotRegion::PutResult::kBypass, second);
+
+  HotRegion::PutResult third = HotRegion::PutResult::kBypass;
+  std::thread third_writer([&]() {
+    third = region.TryPut("hot", "third", 3, 1, false);
+  });
+  third_writer.join();
+  EXPECT_EQ(HotRegion::PutResult::kInserted, third);
+}
+
 TEST(HotRegionTest, KeepsAllComponentsWithinCapacity) {
   constexpr size_t kCapacity = 1U << 20;
   HotRegion::Options options;
   options.capacity = kCapacity;
   options.max_value_size = 4096;
-  options.doorkeeper_bytes = 16U << 10;
+  options.doorkeeper_slots = 16U << 10;
   options.admission_threshold = 1;
   options.rotation_interval = 1U << 20;
   HotRegion region(options);
@@ -81,9 +109,11 @@ TEST(HotRegionTest, KeepsAllComponentsWithinCapacity) {
     ASSERT_LE(region.memory_usage(), region.capacity());
   }
 
-  EXPECT_LE(region.doorkeeper_memory_usage(), 32U << 20);
+  const size_t expected_doorkeeper_bytes =
+      ((options.doorkeeper_slots + 5) / 6) *
+      sizeof(std::atomic<uint64_t>);
+  EXPECT_EQ(expected_doorkeeper_bytes, region.doorkeeper_memory_usage());
   EXPECT_EQ(kCapacity, region.doorkeeper_memory_usage() +
-                           region.value_pool_capacity() +
                            region.pending_capacity() +
                            region.resident_capacity());
 }

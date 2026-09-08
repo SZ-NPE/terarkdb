@@ -394,6 +394,37 @@ TEST_F(DBBasicTest, HotKeyWriteBufferRequiresKeyValueSeparation) {
   ASSERT_EQ(nullptr, unsupported_db);
 }
 
+TEST_F(DBBasicTest, HotKeyWriteBufferRejectsUnsupportedAdmissionThreshold) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 17;
+  options.blob_size = 512;
+  options.create_if_missing = true;
+
+  DB* unsupported_db = nullptr;
+  Status status =
+      DB::Open(options, dbname_ + "_invalid_hot_threshold", &unsupported_db);
+  ASSERT_TRUE(status.IsInvalidArgument());
+  ASSERT_EQ(nullptr, unsupported_db);
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferUsesConfiguredAdmissionTableSize) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_sketch_columns = 32768;
+  options.blob_size = 512;
+  Reopen(options);
+
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  const size_t expected_bytes =
+      ((options.hot_key_sketch_columns + 5) / 6) *
+      sizeof(std::atomic<uint64_t>);
+  ASSERT_EQ(expected_bytes,
+            cfd->hot_region()->doorkeeper_memory_usage());
+}
+
 TEST_F(DBBasicTest, HotKeyWriteBufferSupportsPipelinedWrites) {
   Options options = CurrentOptions();
   options.enable_hot_key_write_buffer = true;

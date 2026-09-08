@@ -18,37 +18,7 @@ namespace TERARKDB_NAMESPACE {
 
 namespace {
 
-constexpr size_t kRecentValueCacheSize = 1024;
 constexpr size_t kMaxMembershipFilterBytes = 8U << 20;
-
-std::atomic<uint64_t> next_value_pool_instance_id{1};
-
-struct RecentValue {
-  uint64_t instance_id = 0;
-  uint64_t fingerprint = 0;
-  const std::string* value = nullptr;
-};
-
-thread_local std::array<RecentValue, kRecentValueCacheSize>
-    recent_value_cache;
-
-size_t InternedValueCharge(const Slice& value) {
-  return sizeof(std::string) + sizeof(std::unique_ptr<const std::string>) +
-         value.size() + 64;
-}
-
-uint64_t ValueFingerprint(const Slice& value) {
-  const size_t last = value.size() - 1;
-  uint64_t fingerprint = value.size();
-  fingerprint = fingerprint * 257 + static_cast<uint8_t>(value[0]);
-  fingerprint =
-      fingerprint * 257 + static_cast<uint8_t>(value[value.size() / 4]);
-  fingerprint =
-      fingerprint * 257 + static_cast<uint8_t>(value[value.size() / 2]);
-  fingerprint =
-      fingerprint * 257 + static_cast<uint8_t>(value[3 * value.size() / 4]);
-  return fingerprint * 257 + static_cast<uint8_t>(value[last]);
-}
 
 }  // namespace
 
@@ -67,7 +37,7 @@ HotKeyWriteBuffer::Entry::Entry(HotKeyWriteBuffer* entry_owner,
       type(entry_type),
       sequence(entry_sequence),
       memtable_id(entry_memtable_id) {
-  UpdateMutation(entry_value, entry_type, owner->InternValue(entry_value));
+  UpdateMutation(entry_value, entry_type);
   charge = CalculateCharge();
   wal_reference = owner->RegisterWalReference(entry_wal_number);
 }
@@ -95,38 +65,25 @@ void HotKeyWriteBuffer::Entry::CopyToUnlocked(BufferedWrite* write) {
 }
 
 bool HotKeyWriteBuffer::Entry::CanUpdateMutationInPlace(
-    const Slice& new_value, ValueType new_type,
-    const ValueReference& reference) const {
+    const Slice& new_value, ValueType new_type) const {
   if (new_type != kTypeValue) {
     return true;
   }
-  if (reference.interned()) {
-    return true;
-  }
-  return interned_value == nullptr &&
-         new_value.size() <= owned_value.capacity();
+  return new_value.size() <= value.capacity();
 }
 
 void HotKeyWriteBuffer::Entry::UpdateMutation(
-    const Slice& new_value, ValueType new_type, ValueReference reference) {
+    const Slice& new_value, ValueType new_type) {
   type = new_type;
   if (new_type != kTypeValue) {
-    interned_value = nullptr;
-    owned_value.clear();
+    value.clear();
     return;
   }
-  if (reference.interned()) {
-    interned_value = reference.value;
-    std::string().swap(owned_value);
-    return;
-  }
-  interned_value = nullptr;
-  owned_value.assign(new_value.data(), new_value.size());
+  value.assign(new_value.data(), new_value.size());
 }
 
 size_t HotKeyWriteBuffer::Entry::CalculateCharge() const {
-  return sizeof(Entry) + key.size() +
-         (interned_value == nullptr ? owned_value.capacity() : 0) +
+  return sizeof(Entry) + key.size() + value.capacity() +
          sizeof(std::pair<const uint32_t, std::shared_ptr<Entry>>) +
          64;
 }
@@ -139,15 +96,12 @@ HotKeyWriteBuffer::HotKeyWriteBuffer(const Options& options)
           true)),
       resident_capacity_(CalculateResidentCacheCapacity(options.capacity)),
       max_value_size_(std::max<size_t>(1, options.max_value_size)),
-      max_interned_value_bytes_(options.max_interned_value_bytes),
       max_pending_memory_(
           std::max<size_t>(1, options.max_pending_memory)),
       max_pending_entry_memory_(
           std::max<size_t>(
               1, std::min(options.max_pending_entry_memory,
                           max_pending_memory_ / 2))),
-      instance_id_(
-          next_value_pool_instance_id.fetch_add(1, std::memory_order_relaxed)),
       resident_shard_bits_(GetDefaultCacheShardBits(resident_capacity_)),
       resident_shard_count_(1U << resident_shard_bits_),
       resident_shard_capacity_(
@@ -271,9 +225,7 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
       if (sequence <= resident->sequence) {
         result = PutResult::kSuperseded;
       } else {
-        ValueReference value_reference = InternValue(value);
-        if (!resident->CanUpdateMutationInPlace(
-                value, type, value_reference)) {
+        if (!resident->CanUpdateMutationInPlace(value, type)) {
           if (!allow_replacement) {
             *requires_key_lock = true;
           } else {
@@ -289,8 +241,7 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
             replace_entry = true;
           }
         } else {
-          resident->UpdateMutation(
-              value, type, std::move(value_reference));
+          resident->UpdateMutation(value, type);
           resident->sequence = sequence;
           resident->wal_reference =
               UpdateWalReference(resident->wal_reference, wal_number);
@@ -776,63 +727,6 @@ port::Mutex* HotKeyWriteBuffer::KeyMutex(const Slice& key) {
   return &key_mutexes_[hash & (key_mutexes_.size() - 1)];
 }
 
-HotKeyWriteBuffer::ValueReference HotKeyWriteBuffer::InternValue(
-    const Slice& value) {
-  if (max_interned_value_bytes_ == 0 || value.empty()) {
-    return {};
-  }
-
-  const uint64_t hash = ValueFingerprint(value);
-  RecentValue& recent =
-      recent_value_cache[hash & (recent_value_cache.size() - 1)];
-  if (recent.instance_id == instance_id_ &&
-      recent.fingerprint == hash && recent.value != nullptr &&
-      recent.value->size() == value.size() &&
-      std::memcmp(recent.value->data(), value.data(), value.size()) == 0) {
-    return ValueReference(recent.value);
-  }
-
-  ValuePoolShard& shard = value_pool_[hash & (value_pool_.size() - 1)];
-  MutexLock lock(&shard.mutex);
-  auto values = shard.values.find(hash);
-  if (values != shard.values.end()) {
-    for (const auto& candidate : values->second) {
-      if (candidate->size() == value.size() &&
-          std::memcmp(candidate->data(), value.data(), value.size()) == 0) {
-        recent = {instance_id_, hash, candidate.get()};
-        return ValueReference(candidate.get());
-      }
-    }
-  }
-
-  const size_t charge = InternedValueCharge(value);
-  if (!ReserveInternedValueBytes(charge)) {
-    return {};
-  }
-
-  std::unique_ptr<const std::string> interned(
-      new std::string(value.data(), value.size()));
-  const std::string* interned_value = interned.get();
-  shard.values[hash].push_back(std::move(interned));
-  interned_value_count_.fetch_add(1, std::memory_order_relaxed);
-  recent = {instance_id_, hash, interned_value};
-  return ValueReference(interned_value);
-}
-
-bool HotKeyWriteBuffer::ReserveInternedValueBytes(size_t charge) {
-  size_t current =
-      interned_value_bytes_.load(std::memory_order_relaxed);
-  while (current <= max_interned_value_bytes_ &&
-         charge <= max_interned_value_bytes_ - current) {
-    if (interned_value_bytes_.compare_exchange_weak(
-            current, current + charge, std::memory_order_relaxed,
-            std::memory_order_relaxed)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 bool HotKeyWriteBuffer::RebindEntryIfNeeded(Entry* entry,
                                             uint64_t memtable_id) {
   const uint64_t current_memtable_id =
@@ -901,7 +795,7 @@ HotKeyWriteBuffer::WalReference* HotKeyWriteBuffer::UpdateWalReference(
 }
 
 bool HotKeyWriteBuffer::InsertEntry(std::unique_ptr<Entry> entry) {
-  if (PendingReservation(entry->charge) > max_pending_entry_memory_) {
+  if (entry->charge > max_pending_entry_memory_) {
     return false;
   }
   const size_t insertion_shard = InsertionShardIndex(entry->key);
@@ -956,12 +850,11 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryUpdatePending(
     return PutResult::kSuperseded;
   }
   const size_t previous_charge = entry->charge;
-  ValueReference value_reference = InternValue(value);
-  if (!entry->CanUpdateMutationInPlace(value, type, value_reference)) {
+  if (!entry->CanUpdateMutationInPlace(value, type)) {
     *found = false;
     return PutResult::kBypass;
   }
-  entry->UpdateMutation(value, type, std::move(value_reference));
+  entry->UpdateMutation(value, type);
   entry->sequence = sequence;
   entry->wal_reference =
       UpdateWalReference(entry->wal_reference, wal_number);
@@ -1021,21 +914,13 @@ bool HotKeyWriteBuffer::RemovePending(
       return false;
     }
   }
-  pending_memory_usage_.fetch_sub(PendingCharge(*entry),
+  pending_memory_usage_.fetch_sub(entry->charge,
                                   std::memory_order_relaxed);
   pending_entry_count_.fetch_sub(1, std::memory_order_relaxed);
-  ReleasePendingReservation(PendingCharge(*entry));
+  ReleasePendingReservation(entry->charge);
   MarkKeyAbsent(entry->key);
   shard.entries.erase(current);
   return true;
-}
-
-size_t HotKeyWriteBuffer::PendingCharge(const Entry& entry) const {
-  return entry.charge;
-}
-
-size_t HotKeyWriteBuffer::PendingReservation(size_t resident_charge) const {
-  return resident_charge;
 }
 
 void HotKeyWriteBuffer::OnEntryDeleted(Entry* entry) {
@@ -1069,7 +954,7 @@ void HotKeyWriteBuffer::OnEntryDeleted(Entry* entry) {
           pending_shards_[pending_hash & (kPendingShardCount - 1)];
       MutexLock lock(&shard.mutex);
       std::shared_ptr<Entry> pending(entry);
-      const size_t pending_charge = PendingReservation(entry->charge);
+      const size_t pending_charge = entry->charge;
       assert(pending_memory_usage_.load(std::memory_order_relaxed) +
                  pending_reserved_memory_.load(std::memory_order_relaxed) +
                  pending_charge <=
