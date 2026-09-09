@@ -1009,9 +1009,11 @@ class MemTableInserter : public WriteBatch::Handler {
   const uint64_t recovering_log_number_;
   // log number that all Memtables inserted into should reference
   uint64_t log_number_ref_;
-  uint64_t current_wal_number_;
   DBImpl* db_;
   const bool concurrent_memtable_writes_;
+  bool route_to_hot_region_ = false;
+  bool bypass_hot_region_ = false;
+  uint64_t current_hot_wal_number_ = 0;
   bool post_info_created_;
   bool wrote_to_memtable_;
 
@@ -1081,7 +1083,6 @@ class MemTableInserter : public WriteBatch::Handler {
         ignore_missing_column_families_(ignore_missing_column_families),
         recovering_log_number_(recovering_log_number),
         log_number_ref_(0),
-        current_wal_number_(0),
         db_(reinterpret_cast<DBImpl*>(db)),
         concurrent_memtable_writes_(concurrent_memtable_writes),
         post_info_created_(false),
@@ -1135,8 +1136,11 @@ class MemTableInserter : public WriteBatch::Handler {
 
   void set_log_number_ref(uint64_t log) { log_number_ref_ = log; }
 
-  void set_current_wal_number(uint64_t wal_number) {
-    current_wal_number_ = wal_number;
+  void SetHotRegionRoute(bool route_to_hot_region, bool bypass_hot_region,
+                         uint64_t hot_wal_number) {
+    route_to_hot_region_ = route_to_hot_region;
+    bypass_hot_region_ = bypass_hot_region;
+    current_hot_wal_number_ = hot_wal_number;
   }
 
   SequenceNumber sequence() const { return sequence_; }
@@ -1225,12 +1229,14 @@ class MemTableInserter : public WriteBatch::Handler {
     ColumnFamilyData* cfd = cf_mems_->current();
     HotRegion* hot_region = cfd == nullptr ? nullptr : cfd->hot_region();
     const bool can_buffer =
-        recovering_log_number_ == 0 && value_type == kTypeValue &&
+        recovering_log_number_ == 0 && !bypass_hot_region_ &&
+        value_type == kTypeValue &&
         cfd != nullptr && hot_region != nullptr &&
         cfd->IsHotKeyBufferEligible(key, value);
     if (can_buffer) {
       const auto result = hot_region->TryPut(
-          key, value, sequence_, mem->GetID(), false, current_wal_number_);
+          key, value, sequence_, mem->GetID(), false,
+          current_hot_wal_number_, nullptr, route_to_hot_region_);
       if (result != HotRegion::PutResult::kBypass) {
         RecordTick(cfd->ioptions()->statistics,
                    HOT_KEY_WRITE_BUFFER_COALESCED_WRITES);
@@ -1252,6 +1258,10 @@ class MemTableInserter : public WriteBatch::Handler {
     assert(!seq_per_batch_ || !moptions->inplace_update_support);
     if (!moptions->inplace_update_support) {
       auto add_to_memtable = [&]() {
+        if (bypass_hot_region_ && current_hot_wal_number_ > 0) {
+          return mem->AddMaterializedMutation(
+              sequence_, value_type, key, value);
+        }
         return mem->Add(sequence_, value_type, key, value,
                         concurrent_memtable_writes_,
                         get_post_process_info(mem));
@@ -1316,6 +1326,9 @@ class MemTableInserter : public WriteBatch::Handler {
         }
       }
     }
+    if (!ret_status.IsTryAgain()) {
+      mem->RetainHotWalNumber(current_hot_wal_number_);
+    }
     // optimize for non-recovery mode
     if (UNLIKELY(!ret_status.IsTryAgain() && rebuilding_trx_ != nullptr)) {
       assert(!write_after_commit_);
@@ -1340,14 +1353,20 @@ class MemTableInserter : public WriteBatch::Handler {
                     const Slice& value, ValueType delete_type) {
     Status ret_status;
     MemTable* mem = cf_mems_->GetMemTable();
-    bool mem_res =
-        mem->Add(sequence_, delete_type, key, value,
-                 concurrent_memtable_writes_, get_post_process_info(mem));
+    const bool mem_res =
+        bypass_hot_region_ && current_hot_wal_number_ > 0
+            ? mem->AddMaterializedMutation(
+                  sequence_, delete_type, key, value)
+            : mem->Add(sequence_, delete_type, key, value,
+                       concurrent_memtable_writes_,
+                       get_post_process_info(mem));
     if (UNLIKELY(!mem_res)) {
       assert(seq_per_batch_);
       ret_status = Status::TryAgain("key+seq exists");
       const bool BATCH_BOUNDRY = true;
       MaybeAdvanceSeq(BATCH_BOUNDRY);
+    } else if (current_hot_wal_number_ > 0) {
+      mem->RetainHotWalNumber(current_hot_wal_number_);
     }
     MaybeAdvanceSeq();
     CheckMemtableFull();
@@ -1358,11 +1377,12 @@ class MemTableInserter : public WriteBatch::Handler {
                       ValueType delete_type) {
     ColumnFamilyData* cfd = cf_mems_->current();
     HotRegion* hot_region = cfd == nullptr ? nullptr : cfd->hot_region();
-    if (recovering_log_number_ == 0 && hot_region != nullptr &&
+    if (recovering_log_number_ == 0 && !bypass_hot_region_ &&
+        hot_region != nullptr &&
         delete_type == kTypeDeletion) {
       const auto result = hot_region->TryDelete(
           key, delete_type, sequence_, cf_mems_->GetMemTable()->GetID(),
-          current_wal_number_);
+          current_hot_wal_number_);
       if (result != HotRegion::PutResult::kBypass) {
         RecordTick(cfd->ioptions()->statistics,
                    HOT_KEY_WRITE_BUFFER_COALESCED_WRITES);
@@ -1385,6 +1405,10 @@ class MemTableInserter : public WriteBatch::Handler {
       const bool mem_res = hot_region->ApplyBypassMutation(
           key, sequence_, [&]() {
             MemTable* mem = cf_mems_->GetMemTable();
+            if (bypass_hot_region_ && current_hot_wal_number_ > 0) {
+              return mem->AddMaterializedMutation(
+                  sequence_, delete_type, key, Slice());
+            }
             return mem->Add(sequence_, delete_type, key, Slice(),
                             concurrent_memtable_writes_,
                             get_post_process_info(mem));
@@ -1394,6 +1418,9 @@ class MemTableInserter : public WriteBatch::Handler {
         status = Status::TryAgain("key+seq exists");
         const bool batch_boundary = true;
         MaybeAdvanceSeq(batch_boundary);
+      } else {
+        cf_mems_->GetMemTable()->RetainHotWalNumber(
+            current_hot_wal_number_);
       }
       MaybeAdvanceSeq();
       CheckMemtableFull();
@@ -1857,7 +1884,9 @@ Status WriteBatchInternal::InsertInto(
     }
     SetSequence(w->batch, inserter.sequence());
     inserter.set_log_number_ref(w->log_ref);
-    inserter.set_current_wal_number(w->disable_wal ? 0 : w->log_used);
+    inserter.SetHotRegionRoute(
+        w->route_to_hot_region, !w->route_to_hot_region,
+        w->route_to_hot_region && !w->disable_wal ? w->log_used : 0);
     w->status = w->batch->Iterate(&inserter);
     w->memtable_write_bytes =
         inserter.wrote_to_memtable() ? ByteSize(w->batch) : 0;
@@ -1886,7 +1915,10 @@ Status WriteBatchInternal::InsertInto(
       seq_per_batch, batch_per_txn);
   SetSequence(writer->batch, sequence);
   inserter.set_log_number_ref(writer->log_ref);
-  inserter.set_current_wal_number(writer->disable_wal ? 0 : writer->log_used);
+  inserter.SetHotRegionRoute(
+      writer->route_to_hot_region, !writer->route_to_hot_region,
+      writer->route_to_hot_region && !writer->disable_wal ? writer->log_used
+                                                          : 0);
   inserter.BeginWriteBatch();
   Status s = writer->batch->Iterate(&inserter);
   writer->memtable_write_bytes =
@@ -1904,11 +1936,14 @@ Status WriteBatchInternal::InsertInto(
     FlushScheduler* flush_scheduler, bool ignore_missing_column_families,
     uint64_t log_number, DB* db, bool concurrent_memtable_writes,
     SequenceNumber* next_seq, bool* has_valid_writes, bool seq_per_batch,
-    bool batch_per_txn) {
+    bool batch_per_txn, bool route_to_hot_region, bool bypass_hot_region,
+    uint64_t hot_wal_number) {
   MemTableInserter inserter(Sequence(batch), memtables, flush_scheduler,
                             ignore_missing_column_families, log_number, db,
                             concurrent_memtable_writes, has_valid_writes,
                             seq_per_batch, batch_per_txn);
+  inserter.SetHotRegionRoute(route_to_hot_region, bypass_hot_region,
+                            hot_wal_number);
   Status s = batch->Iterate(&inserter);
   if (next_seq != nullptr) {
     *next_seq = inserter.sequence();

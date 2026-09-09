@@ -27,6 +27,7 @@
 #include "db/external_sst_file_ingestion_job.h"
 #include "db/flush_job.h"
 #include "db/flush_scheduler.h"
+#include "db/hot_wal.h"
 #include "db/internal_stats.h"
 #include "db/log_writer.h"
 #include "db/logs_with_prep_tracker.h"
@@ -126,6 +127,7 @@ class DBImpl : public DB {
   Status MaterializeAllHotKeys();
   Status MaterializeHotKeysForFlush(ColumnFamilyData* cfd,
                                     FlushReason flush_reason);
+  bool ShouldRouteToHotWal(WriteBatch* batch);
 
   using DB::Get;
   virtual Status Get(const ReadOptions& options,
@@ -913,13 +915,15 @@ class DBImpl : public DB {
                    uint64_t* log_used = nullptr, uint64_t log_ref = 0,
                    bool disable_memtable = false, uint64_t* seq_used = nullptr,
                    size_t batch_cnt = 0,
-                   PreReleaseCallback* pre_release_callback = nullptr);
+                   PreReleaseCallback* pre_release_callback = nullptr,
+                   bool route_to_hot_region = false);
 
   Status PipelinedWriteImpl(const WriteOptions& options, WriteBatch* updates,
                             WriteCallback* callback = nullptr,
                             uint64_t* log_used = nullptr, uint64_t log_ref = 0,
                             bool disable_memtable = false,
-                            uint64_t* seq_used = nullptr);
+                            uint64_t* seq_used = nullptr,
+                            bool route_to_hot_region = false);
 
   // batch_cnt is expected to be non-zero in seq_per_batch mode and indicates
   // the number of sub-patches. A sub-patch is a subset of the write batch that
@@ -1120,6 +1124,9 @@ class DBImpl : public DB {
   // REQUIRES: log_numbers are sorted in ascending order
   Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
                          SequenceNumber* next_sequence, bool read_only);
+  Status OpenHotWal(bool writable);
+  Status RecoverHotWalFiles(SequenceNumber* next_sequence, bool read_only);
+  Status PurgeObsoleteHotWal();
 
   // The following two methods are used to flush a memtable to
   // storage. The first one is used at database RecoveryTime (when the
@@ -1205,6 +1212,11 @@ class DBImpl : public DB {
                     log::Writer* log_writer, uint64_t* log_used,
                     bool need_log_sync, bool need_log_dir_sync,
                     SequenceNumber sequence);
+  Status WriteToHotWal(const WriteThread::WriteGroup& write_group,
+                       uint64_t* log_used, bool need_log_sync,
+                       SequenceNumber sequence);
+  void ReleaseHotWalReferences(
+      const WriteThread::WriteGroup& write_group);
 
   Status ConcurrentWriteToWAL(const WriteThread::WriteGroup& write_group,
                               uint64_t* log_used, SequenceNumber* last_sequence,
@@ -1456,6 +1468,7 @@ class DBImpl : public DB {
   //  - it follows that the items with getting_synced=true can be safely read
   //  from the same thread that has set getting_synced=true
   std::deque<LogWriterNumber> logs_;
+  std::unique_ptr<HotWal> hot_wal_;
   // Signaled when getting_synced becomes false for some of the logs_.
   InstrumentedCondVar log_sync_cv_;
   // This is the app-level state that is written to the WAL but will be used

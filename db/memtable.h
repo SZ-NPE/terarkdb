@@ -337,6 +337,22 @@ class MemTable {
   // operations on the same MemTable.
   void SetNextLogNumber(uint64_t num) { mem_next_logfile_number_ = num; }
 
+  void RetainHotWalNumber(uint64_t number) {
+    if (number == 0) {
+      return;
+    }
+    uint64_t current = min_hot_wal_number_.load(std::memory_order_relaxed);
+    while ((current == 0 || number < current) &&
+           !min_hot_wal_number_.compare_exchange_weak(
+               current, number, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+  }
+
+  uint64_t GetMinHotWalNumber() const {
+    return min_hot_wal_number_.load(std::memory_order_relaxed);
+  }
+
   // if this memtable contains data from a committed
   // two phase transaction we must take note of the
   // log which contains that data so we can know
@@ -466,6 +482,9 @@ class MemTable {
   // the earliest log containing a prepared section
   // which has been inserted into this memtable.
   std::atomic<uint64_t> min_prep_log_referenced_;
+
+  // The earliest Hot WAL segment containing a mutation in this memtable.
+  std::atomic<uint64_t> min_hot_wal_number_{0};
 
   // rw locks for inplace updates
   std::vector<port::RWMutex> locks_;

@@ -367,17 +367,17 @@ TEST(HotKeyWriteBufferTest, EvictsAcrossShardsWithoutGlobalSerialization) {
   EXPECT_TRUE(buffer.empty());
 }
 
-TEST(HotKeyWriteBufferTest, RebindsMemtableAndTracksOldestWal) {
+TEST(HotKeyWriteBufferTest, RebindsMemtableAndTracksOldestHotWal) {
   HotKeyWriteBuffer buffer(MakeWriteBufferOptions(1U << 20));
   ASSERT_EQ(HotKeyWriteBuffer::PutResult::kInserted,
             buffer.TryPut("first", "value", 1, 7, true, 11));
-  ASSERT_EQ(11U, buffer.OldestWalNumber());
+  ASSERT_EQ(11U, buffer.OldestHotWalNumber());
   ASSERT_EQ(HotKeyWriteBuffer::PutResult::kUpdatedInPlace,
             buffer.TryPut("first", "new", 2, 7, false, 12));
-  ASSERT_EQ(12U, buffer.OldestWalNumber());
+  ASSERT_EQ(12U, buffer.OldestHotWalNumber());
   ASSERT_EQ(HotKeyWriteBuffer::PutResult::kInserted,
             buffer.TryPut("second", "value", 3, 7, true, 10));
-  ASSERT_EQ(10U, buffer.OldestWalNumber());
+  ASSERT_EQ(10U, buffer.OldestHotWalNumber());
 
   buffer.RebindMemtable(8, 4);
   std::string value;
@@ -396,10 +396,10 @@ TEST(HotKeyWriteBufferTest, RebindsMemtableAndTracksOldestWal) {
   EXPECT_EQ(4U, sequence);
 
   ASSERT_TRUE(buffer.Remove("second", nullptr));
-  EXPECT_EQ(13U, buffer.OldestWalNumber());
+  EXPECT_EQ(13U, buffer.OldestHotWalNumber());
   buffer.RebindMemtable(9, 6);
   ASSERT_TRUE(buffer.Remove("first", nullptr));
-  EXPECT_EQ(0U, buffer.OldestWalNumber());
+  EXPECT_EQ(0U, buffer.OldestHotWalNumber());
 }
 
 TEST(HotKeyWriteBufferTest, ChargesRepeatedValuesPerEntry) {

@@ -260,6 +260,17 @@ class MemTableList {
   uint64_t PrecomputeMinLogContainingPrepSection(
       const autovector<MemTable*>& memtables_to_flush);
 
+  uint64_t GetMinHotWalNumber() const {
+    uint64_t result = 0;
+    for (const MemTable* memtable : current_->memlist_) {
+      const uint64_t number = memtable->GetMinHotWalNumber();
+      if (number > 0 && (result == 0 || number < result)) {
+        result = number;
+      }
+    }
+    return result;
+  }
+
   uint64_t GetEarliestMemTableID() const {
     auto& memlist = current_->memlist_;
     if (memlist.empty()) {

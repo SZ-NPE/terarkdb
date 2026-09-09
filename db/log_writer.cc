@@ -11,10 +11,6 @@
 
 #include <stdint.h>
 
-#include <cstring>
-
-#include "db/dbformat.h"
-#include "db/write_batch_internal.h"
 #include "rocksdb/env.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/coding.h"
@@ -24,36 +20,13 @@
 namespace TERARKDB_NAMESPACE {
 namespace log {
 
-namespace {
-
-constexpr char kDeduplicatedRecordMagic[] = "HKDED01";
-constexpr size_t kMaxDeduplicatedValues = 4096;
-
-uint64_t ValueFingerprint(const Slice& value) {
-  const size_t last = value.size() - 1;
-  uint64_t fingerprint = value.size();
-  fingerprint = fingerprint * 257 + static_cast<uint8_t>(value[0]);
-  fingerprint =
-      fingerprint * 257 + static_cast<uint8_t>(value[value.size() / 4]);
-  fingerprint =
-      fingerprint * 257 + static_cast<uint8_t>(value[value.size() / 2]);
-  fingerprint =
-      fingerprint * 257 + static_cast<uint8_t>(value[3 * value.size() / 4]);
-  fingerprint = fingerprint * 257 + static_cast<uint8_t>(value[last]);
-  return fingerprint;
-}
-
-}  // namespace
-
 Writer::Writer(std::unique_ptr<WritableFileWriter>&& dest, uint64_t log_number,
-               bool recycle_log_files, bool manual_flush,
-               bool deduplicate_record_blocks)
+               bool recycle_log_files, bool manual_flush)
     : dest_(std::move(dest)),
       block_offset_(0),
       log_number_(log_number),
       recycle_log_files_(recycle_log_files),
-      manual_flush_(manual_flush),
-      deduplicate_record_blocks_(deduplicate_record_blocks) {
+      manual_flush_(manual_flush) {
   for (int i = 0; i <= kMaxRecordType; i++) {
     char t = static_cast<char>(i);
     type_crc_[i] = crc32c::Value(&t, 1);
@@ -69,103 +42,9 @@ Status Writer::WriteBuffer() { return dest_->Flush(); }
 
 Status Writer::Frozen() { return dest_->Frozen(); }
 
-Slice Writer::EncodeRecord(const Slice& record, std::string* encoded) {
-  if (!deduplicate_record_blocks_ ||
-      record.size() <= WriteBatchInternal::kHeader) {
-    return record;
-  }
-
-  Slice input(record);
-  input.remove_prefix(WriteBatchInternal::kHeader);
-  while (!input.empty()) {
-    const char tag = input[0];
-    input.remove_prefix(1);
-    if (tag == kTypeColumnFamilyValue) {
-      uint32_t column_family = 0;
-      if (!GetVarint32(&input, &column_family)) {
-        return record;
-      }
-    } else if (tag != kTypeValue) {
-      return record;
-    }
-    Slice key;
-    Slice value;
-    if (!GetLengthPrefixedSlice(&input, &key) ||
-        !GetLengthPrefixedSlice(&input, &value) || value.empty()) {
-      return record;
-    }
-  }
-
-  input = record;
-  const Slice header(input.data(), WriteBatchInternal::kHeader);
-  input.remove_prefix(WriteBatchInternal::kHeader);
-  encoded->assign(kDeduplicatedRecordMagic,
-                  sizeof(kDeduplicatedRecordMagic) - 1);
-  PutFixed32(encoded, static_cast<uint32_t>(record.size()));
-  encoded->append(header.data(), header.size());
-  while (!input.empty()) {
-    const char tag = input[0];
-    input.remove_prefix(1);
-    uint32_t column_family = 0;
-    if (tag == kTypeColumnFamilyValue) {
-      if (!GetVarint32(&input, &column_family)) {
-        return record;
-      }
-    } else if (tag != kTypeValue) {
-      return record;
-    }
-    Slice key;
-    Slice value;
-    if (!GetLengthPrefixedSlice(&input, &key) ||
-        !GetLengthPrefixedSlice(&input, &value) || value.empty()) {
-      return record;
-    }
-
-    encoded->push_back(tag);
-    if (tag == kTypeColumnFamilyValue) {
-      PutVarint32(encoded, column_family);
-    }
-    PutLengthPrefixedSlice(encoded, key);
-
-    const uint64_t hash = ValueFingerprint(value);
-    uint32_t value_index = 0;
-    bool found = false;
-    const auto candidates = deduplication_index_.find(hash);
-    if (candidates != deduplication_index_.end()) {
-      for (const uint32_t candidate : candidates->second) {
-        const std::string& existing = deduplicated_values_[candidate];
-        if (existing.size() == value.size() &&
-            std::memcmp(existing.data(), value.data(), value.size()) == 0) {
-          value_index = candidate;
-          found = true;
-          break;
-        }
-      }
-    }
-
-    if (found) {
-      encoded->push_back(1);
-      PutVarint32(encoded, value_index);
-    } else {
-      encoded->push_back(0);
-      PutLengthPrefixedSlice(encoded, value);
-      if (deduplicated_values_.size() < kMaxDeduplicatedValues) {
-        const uint32_t new_index =
-            static_cast<uint32_t>(deduplicated_values_.size());
-        deduplicated_values_.emplace_back(value.data(), value.size());
-        deduplication_index_[hash].push_back(new_index);
-      }
-    }
-  }
-
-  return Slice(*encoded);
-}
-
 Status Writer::AddRecord(const Slice& slice) {
-  std::string encoded;
-  const Slice record = EncodeRecord(slice, &encoded);
-  const char* ptr = record.data();
-  size_t left = record.size();
+  const char* ptr = slice.data();
+  size_t left = slice.size();
 
   // Header size varies depending on whether we are recycling or not.
   const int header_size =

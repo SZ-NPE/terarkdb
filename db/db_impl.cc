@@ -797,6 +797,13 @@ Status DBImpl::CloseHelper() {
     }
   }
   logs_.clear();
+  if (hot_wal_ != nullptr) {
+    Status s = hot_wal_->Close();
+    if (!s.ok() && ret.ok()) {
+      ret = s;
+    }
+    hot_wal_.reset();
+  }
 
   // Table cache may have table handles holding blocks from the block cache.
   // We need to release them before the block cache is destroyed. The block
@@ -1688,26 +1695,31 @@ int DBImpl::FindMinimumEmptyLevelFitting(
 }
 
 Status DBImpl::FlushWAL(bool sync) {
+  Status status;
   if (manual_wal_flush_) {
     // We need to lock log_write_mutex_ since logs_ might change concurrently
     InstrumentedMutexLock wl(&log_write_mutex_);
     log::Writer* cur_log_writer = logs_.back().writer;
-    auto s = cur_log_writer->WriteBuffer();
-    if (!s.ok()) {
+    status = cur_log_writer->WriteBuffer();
+    if (!status.ok()) {
       ROCKS_LOG_ERROR(immutable_db_options_.info_log, "WAL flush error %s",
-                      s.ToString().c_str());
+                      status.ToString().c_str());
       // In case there is a fs error we should set it globally to prevent the
       // future writes
-      WriteStatusCheck(s);
+      WriteStatusCheck(status);
       // whether sync or not, we should abort the rest of function upon error
-      return s;
+      return status;
     }
-    if (!sync) {
-      ROCKS_LOG_DEBUG(immutable_db_options_.info_log, "FlushWAL sync=false");
-      return s;
+  }
+  if (hot_wal_ != nullptr) {
+    status = hot_wal_->Flush(false);
+    if (!status.ok()) {
+      WriteStatusCheck(status);
+      return status;
     }
   }
   if (!sync) {
+    ROCKS_LOG_DEBUG(immutable_db_options_.info_log, "FlushWAL sync=false");
     return Status::OK();
   }
   // sync = true
@@ -1774,6 +1786,9 @@ Status DBImpl::SyncWAL() {
   }
   TEST_SYNC_POINT("DBImpl::SyncWAL:BeforeMarkLogsSynced:2");
 
+  if (status.ok() && hot_wal_ != nullptr) {
+    status = hot_wal_->Flush(true);
+  }
   return status;
 }
 
@@ -2748,20 +2763,27 @@ autovector<Status> DBImpl::CreateColumnFamilyImpl(
         assert(cfd != nullptr);
         if (cfd->IsHotKeyWriteBufferEnabled()) {
           has_hot_key_write_buffer_.store(true, std::memory_order_relaxed);
+          if (hot_wal_ == nullptr) {
+            s[i] = OpenHotWal(true);
+          }
         }
-        InstallSuperVersionAndScheduleWork(cfd, &sv_context,
-                                           *cfd->GetLatestMutableCFOptions());
+        if (s[i].ok()) {
+          InstallSuperVersionAndScheduleWork(
+              cfd, &sv_context, *cfd->GetLatestMutableCFOptions());
+        }
 
-        if (!cfd->mem()->IsSnapshotSupported()) {
+        if (s[i].ok() && !cfd->mem()->IsSnapshotSupported()) {
           is_snapshot_supported_ = false;
         }
 
-        cfd->set_initialized();
+        if (s[i].ok()) {
+          cfd->set_initialized();
 
-        *handle[i] = new ColumnFamilyHandleImpl(cfd, this, &mutex_);
-        ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                       "Created column family [%s] (ID %u)",
-                       column_family_name[i]->c_str(), (unsigned)cfd->GetID());
+          *handle[i] = new ColumnFamilyHandleImpl(cfd, this, &mutex_);
+          ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                         "Created column family [%s] (ID %u)",
+                         column_family_name[i]->c_str(), (unsigned)cfd->GetID());
+        }
       } else {
         ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                         "Creating column family [%s] FAILED -- %s",
@@ -4330,6 +4352,10 @@ Status DestroyDB(const std::string& dbname, const Options& options,
   const std::string lockname = LockFileName(dbname);
   Status result = env->LockFile(lockname, &lock);
   if (result.ok()) {
+    Status hot_wal_status = DestroyHotWal(env, soptions.wal_dir);
+    if (!hot_wal_status.ok()) {
+      result = hot_wal_status;
+    }
     uint64_t number;
     FileType type;
     InfoLogPrefix info_log_prefix(!soptions.db_log_dir.empty(), dbname);

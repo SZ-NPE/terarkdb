@@ -41,6 +41,26 @@ uint64_t DBImpl::MinObsoleteSstNumberToKeep() {
   return std::numeric_limits<uint64_t>::max();
 }
 
+Status DBImpl::PurgeObsoleteHotWal() {
+  mutex_.AssertHeld();
+  if (hot_wal_ == nullptr) {
+    return Status::OK();
+  }
+  return hot_wal_->PurgeObsolete([this]() {
+    uint64_t oldest = 0;
+    for (auto* cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd->IsDropped()) {
+        continue;
+      }
+      const uint64_t candidate = cfd->OldestHotWalToKeep();
+      if (candidate > 0 && (oldest == 0 || candidate < oldest)) {
+        oldest = candidate;
+      }
+    }
+    return oldest;
+  });
+}
+
 namespace {
 bool CompareCandidateFile(const JobContext::CandidateFileInfo& first,
                           const JobContext::CandidateFileInfo& second) {
@@ -299,6 +319,12 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
     delete_obsolete_files_lock_ = false;
   }
   logs_to_free_.clear();
+  Status hot_wal_status = PurgeObsoleteHotWal();
+  if (!hot_wal_status.ok()) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "Failed to purge obsolete Hot WAL segments: %s",
+                   hot_wal_status.ToString().c_str());
+  }
 }
 
 // Delete obsolete files and log status and information of file deletion

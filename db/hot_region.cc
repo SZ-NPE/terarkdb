@@ -154,11 +154,27 @@ bool HotRegion::CanBuffer(const Slice& value) const {
   return write_buffer_.CanBuffer(value);
 }
 
+bool HotRegion::ShouldRoutePutToHotWal(const Slice& key, const Slice& value,
+                                       uint64_t memtable_id) {
+  if (!CanBuffer(value)) {
+    return false;
+  }
+  return write_buffer_.Contains(key, memtable_id) ||
+         doorkeeper_.RecordAndShouldAdmit(key);
+}
+
+bool HotRegion::ShouldRouteDeleteToHotWal(const Slice& key,
+                                          uint64_t memtable_id) const {
+  return write_buffer_.Contains(key, memtable_id);
+}
+
 HotRegion::PutResult HotRegion::TryPut(const Slice& key, const Slice& value,
                                        SequenceNumber sequence,
                                        uint64_t memtable_id,
                                        bool admit_new_key, uint64_t wal_number,
-                                       bool* found_in_region) {
+                                       bool* found_in_region,
+                                       bool pre_admitted) {
+  admit_new_key = admit_new_key || pre_admitted;
   if (!admit_new_key && !write_buffer_.IsKeyMaybePresent(key)) {
     if (!doorkeeper_.RecordAndShouldAdmit(key)) {
       return PutResult::kBypass;
@@ -209,8 +225,8 @@ void HotRegion::RebindMemtable(uint64_t memtable_id,
   write_buffer_.RebindMemtable(memtable_id, sequence);
 }
 
-uint64_t HotRegion::OldestWalNumber() const {
-  return write_buffer_.OldestWalNumber();
+uint64_t HotRegion::OldestHotWalNumber() const {
+  return write_buffer_.OldestHotWalNumber();
 }
 
 std::vector<HotRegion::BufferedWrite> HotRegion::GetAll() {

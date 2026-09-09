@@ -596,6 +596,7 @@ set(SOURCES
         db/flush_job.cc
         db/flush_scheduler.cc
         db/forward_iterator.cc
+        db/hot_wal.cc
         db/hot_region.cc
         db/hot_key_write_buffer.cc
         db/internal_stats.cc

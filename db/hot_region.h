@@ -44,11 +44,16 @@ class HotRegion {
               ValueType* type = nullptr) const;
 
   bool CanBuffer(const Slice& value) const;
+  bool ShouldRoutePutToHotWal(const Slice& key, const Slice& value,
+                              uint64_t memtable_id);
+  bool ShouldRouteDeleteToHotWal(const Slice& key,
+                                 uint64_t memtable_id) const;
 
   PutResult TryPut(const Slice& key, const Slice& value,
                    SequenceNumber sequence, uint64_t memtable_id,
                    bool admit_new_key, uint64_t wal_number = 0,
-                   bool* found_in_region = nullptr);
+                   bool* found_in_region = nullptr,
+                   bool pre_admitted = false);
 
   PutResult TryDelete(const Slice& key, ValueType type,
                       SequenceNumber sequence, uint64_t memtable_id,
@@ -64,7 +69,7 @@ class HotRegion {
 
   bool Remove(const Slice& key, BufferedWrite* write);
   void RebindMemtable(uint64_t memtable_id, SequenceNumber sequence);
-  uint64_t OldestWalNumber() const;
+  uint64_t OldestHotWalNumber() const;
   std::vector<BufferedWrite> GetAll();
   void PrepareAllForMaterialization();
   std::vector<BufferedWrite> GetPendingEvictions(

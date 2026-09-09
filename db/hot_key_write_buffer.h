@@ -54,7 +54,7 @@ class HotKeyWriteBuffer {
     ValueType type = kTypeValue;
     SequenceNumber sequence = 0;
     uint64_t memtable_id = 0;
-    uint64_t wal_number = 0;
+    uint64_t hot_wal_number = 0;
     size_t charge = 0;
   };
 
@@ -76,6 +76,7 @@ class HotKeyWriteBuffer {
   bool Lookup(const Slice& key, SequenceNumber snapshot, uint64_t memtable_id,
               std::string* value, SequenceNumber* sequence,
               ValueType* type = nullptr) const;
+  bool Contains(const Slice& key, uint64_t memtable_id) const;
 
   bool CanBuffer(const Slice& value) const {
     return value.size() <= max_value_size_;
@@ -86,12 +87,12 @@ class HotKeyWriteBuffer {
 
   PutResult TryPut(const Slice& key, const Slice& value,
                    SequenceNumber sequence, uint64_t memtable_id,
-                   bool admit_new_key, uint64_t wal_number = 0,
+                   bool admit_new_key, uint64_t hot_wal_number = 0,
                    bool* found_in_buffer = nullptr);
 
   PutResult TryDelete(const Slice& key, ValueType type,
                       SequenceNumber sequence, uint64_t memtable_id,
-                      uint64_t wal_number = 0,
+                      uint64_t hot_wal_number = 0,
                       bool* found_in_buffer = nullptr);
 
   MaterializeResult MaterializeKey(const Slice& key,
@@ -105,7 +106,7 @@ class HotKeyWriteBuffer {
 
   void RebindMemtable(uint64_t memtable_id, SequenceNumber sequence);
 
-  uint64_t OldestWalNumber() const;
+  uint64_t OldestHotWalNumber() const;
 
   std::vector<BufferedWrite> GetAll();
 
@@ -150,8 +151,8 @@ class HotKeyWriteBuffer {
   static thread_local PendingReservationContext
       pending_reservation_context_;
 
-  struct WalReference {
-    explicit WalReference(uint64_t wal) : wal_number(wal) {}
+  struct HotWalReference {
+    explicit HotWalReference(uint64_t wal) : wal_number(wal) {}
 
     const uint64_t wal_number;
     std::atomic<size_t> entry_count{0};
@@ -184,7 +185,7 @@ class HotKeyWriteBuffer {
     ValueType type = kTypeValue;
     SequenceNumber sequence = 0;
     uint64_t memtable_id = 0;
-    WalReference* wal_reference = nullptr;
+    HotWalReference* hot_wal_reference = nullptr;
     size_t charge = 0;
     std::atomic<bool> materialize_on_delete{true};
     State state = State::kResident;
@@ -212,18 +213,18 @@ class HotKeyWriteBuffer {
   port::Mutex* KeyMutex(const Slice& key);
   bool RebindEntryIfNeeded(Entry* entry, uint64_t memtable_id);
   void RebindEntryToCurrentMemtable(Entry* entry);
-  WalReference* RegisterWalReference(uint64_t wal_number);
-  void UnregisterWalReference(WalReference* reference);
-  WalReference* UpdateWalReference(WalReference* old_reference,
-                                   uint64_t new_wal_number);
+  HotWalReference* RegisterHotWalReference(uint64_t wal_number);
+  void UnregisterHotWalReference(HotWalReference* reference);
+  HotWalReference* UpdateHotWalReference(HotWalReference* old_reference,
+                                         uint64_t new_wal_number);
   bool InsertEntry(std::unique_ptr<Entry> entry);
   PutResult TryMutation(const Slice& key, const Slice& value, ValueType type,
                         SequenceNumber sequence, uint64_t memtable_id,
-                        bool admit_new_key, uint64_t wal_number,
+                        bool admit_new_key, uint64_t hot_wal_number,
                         bool* found_in_buffer);
   PutResult TryUpdatePending(const Slice& key, const Slice& value,
                              ValueType type, SequenceNumber sequence,
-                             uint64_t memtable_id, uint64_t wal_number,
+                             uint64_t memtable_id, uint64_t hot_wal_number,
                              bool* found);
   std::shared_ptr<Entry> FindPending(const Slice& key) const;
   std::shared_ptr<Entry> FindPending(const Slice& key,
@@ -261,9 +262,9 @@ class HotKeyWriteBuffer {
   std::atomic<uint64_t> current_memtable_id_{0};
   std::atomic<SequenceNumber> current_memtable_sequence_{0};
 
-  mutable port::Mutex wal_mutex_;
-  std::map<uint64_t, std::unique_ptr<WalReference>> wal_references_;
-  std::atomic<WalReference*> current_wal_reference_{nullptr};
+  mutable port::Mutex hot_wal_mutex_;
+  std::map<uint64_t, std::unique_ptr<HotWalReference>> hot_wal_references_;
+  std::atomic<HotWalReference*> current_hot_wal_reference_{nullptr};
 
 };
 

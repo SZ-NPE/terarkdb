@@ -622,13 +622,6 @@ ColumnFamilyOptions ColumnFamilyData::GetLatestCFOptions() const {
 
 uint64_t ColumnFamilyData::OldestLogToKeep() {
   auto current_log = GetLogNumber();
-  if (hot_region_ != nullptr) {
-    const uint64_t hot_key_log = hot_region_->OldestWalNumber();
-    if (hot_key_log > 0 && hot_key_log < current_log) {
-      current_log = hot_key_log;
-    }
-  }
-
   if (allow_2pc_) {
     autovector<MemTable*> empty_list;
     auto imm_prep_log =
@@ -645,6 +638,21 @@ uint64_t ColumnFamilyData::OldestLogToKeep() {
   }
 
   return current_log;
+}
+
+uint64_t ColumnFamilyData::OldestHotWalToKeep() const {
+  uint64_t result = mem_->GetMinHotWalNumber();
+  const uint64_t immutable = imm_.GetMinHotWalNumber();
+  if (immutable > 0 && (result == 0 || immutable < result)) {
+    result = immutable;
+  }
+  if (hot_region_ != nullptr) {
+    const uint64_t resident = hot_region_->OldestHotWalNumber();
+    if (resident > 0 && (result == 0 || resident < result)) {
+      result = resident;
+    }
+  }
+  return result;
 }
 
 const double kIncSlowdownRatio = 0.8;

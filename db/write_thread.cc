@@ -457,6 +457,8 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
         // fail on delays.
         (w->disable_wal != leader->disable_wal) ||
         // Do not mix writes that are different request for WAL disabled.
+        (w->route_to_hot_region != leader->route_to_hot_region) ||
+        // HotRegion batches use a separate WAL stream.
         (w->batch == nullptr) ||
         // Do not include those writes with nullptr batch. Those are not writes
         // those are something else. They want to be alone
@@ -535,7 +537,8 @@ void WriteThread::EnterAsMemTableWriter(Writer* leader,
     while (w != newest_writer) {
       w = w->link_newer;
 
-      if (w->batch == nullptr) {
+      if (w->batch == nullptr ||
+          w->route_to_hot_region != leader->route_to_hot_region) {
         break;
       }
 

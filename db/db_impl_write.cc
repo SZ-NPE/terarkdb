@@ -53,12 +53,104 @@ bool MemtableHasNewerMutation(MemTable* mem,
          sequence >= write.sequence;
 }
 
+class HotWalRoutingHandler : public WriteBatch::Handler {
+ public:
+  explicit HotWalRoutingHandler(ColumnFamilySet* column_families)
+      : column_families_(column_families) {}
+
+  Status PutCF(uint32_t column_family_id, const Slice& key,
+               const Slice& value) override {
+    ColumnFamilyData* cfd = column_families_->GetColumnFamily(column_family_id);
+    saw_mutation_ = true;
+    if (cfd == nullptr || !cfd->IsHotKeyBufferEligible(key, value) ||
+        !cfd->hot_region()->ShouldRoutePutToHotWal(
+            key, value, cfd->mem()->GetID())) {
+      all_hot_ = false;
+    }
+    return Status::OK();
+  }
+
+  Status DeleteCF(uint32_t column_family_id, const Slice& key) override {
+    ColumnFamilyData* cfd = column_families_->GetColumnFamily(column_family_id);
+    saw_mutation_ = true;
+    if (cfd == nullptr || cfd->hot_region() == nullptr ||
+        !cfd->hot_region()->ShouldRouteDeleteToHotWal(
+            key, cfd->mem()->GetID())) {
+      all_hot_ = false;
+    }
+    return Status::OK();
+  }
+
+  Status SingleDeleteCF(uint32_t, const Slice&) override {
+    all_hot_ = false;
+    saw_mutation_ = true;
+    return Status::OK();
+  }
+
+  Status DeleteRangeCF(uint32_t, const Slice&, const Slice&) override {
+    all_hot_ = false;
+    saw_mutation_ = true;
+    return Status::OK();
+  }
+
+  Status MergeCF(uint32_t, const Slice&, const Slice&) override {
+    all_hot_ = false;
+    saw_mutation_ = true;
+    return Status::OK();
+  }
+
+  void LogData(const Slice&) override { all_hot_ = false; }
+
+  Status MarkBeginPrepare(bool) override {
+    all_hot_ = false;
+    return Status::OK();
+  }
+
+  Status MarkEndPrepare(const Slice&) override {
+    all_hot_ = false;
+    return Status::OK();
+  }
+
+  Status MarkCommit(const Slice&) override {
+    all_hot_ = false;
+    return Status::OK();
+  }
+
+  Status MarkRollback(const Slice&) override {
+    all_hot_ = false;
+    return Status::OK();
+  }
+
+  Status MarkNoop(bool) override {
+    all_hot_ = false;
+    return Status::OK();
+  }
+
+  bool ShouldRoute() const { return saw_mutation_ && all_hot_; }
+
+ private:
+  ColumnFamilySet* const column_families_;
+  bool saw_mutation_ = false;
+  bool all_hot_ = true;
+};
+
 }  // namespace
 
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
                    const Slice& key, const Slice& val) {
-  return DB::Put(o, column_family, key, val);
+  WriteBatch batch(key.size() + val.size() + 24);
+  Status status = batch.Put(column_family, key, val);
+  if (!status.ok()) {
+    return status;
+  }
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family)->cfd();
+  const bool route_to_hot_region =
+      cfd->IsHotKeyBufferEligible(key, val) &&
+      cfd->hot_region()->ShouldRoutePutToHotWal(key, val,
+                                                cfd->mem()->GetID());
+  return WriteImpl(o, &batch, nullptr, nullptr, 0, false, nullptr, 0,
+                   nullptr, route_to_hot_region);
 }
 
 Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
@@ -73,7 +165,18 @@ Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
 
 Status DBImpl::Delete(const WriteOptions& write_options,
                       ColumnFamilyHandle* column_family, const Slice& key) {
-  return DB::Delete(write_options, column_family, key);
+  WriteBatch batch;
+  Status status = batch.Delete(column_family, key);
+  if (!status.ok()) {
+    return status;
+  }
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family)->cfd();
+  const bool route_to_hot_region =
+      cfd->hot_region() != nullptr &&
+      cfd->hot_region()->ShouldRouteDeleteToHotWal(key,
+                                                   cfd->mem()->GetID());
+  return WriteImpl(write_options, &batch, nullptr, nullptr, 0, false, nullptr,
+                   0, nullptr, route_to_hot_region);
 }
 
 Status DBImpl::SingleDelete(const WriteOptions& write_options,
@@ -88,7 +191,19 @@ void DBImpl::SetRecoverableStatePreReleaseCallback(
 }
 
 Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
-  return WriteImpl(write_options, my_batch, nullptr, nullptr);
+  return WriteImpl(write_options, my_batch, nullptr, nullptr, 0, false, nullptr,
+                   0, nullptr, ShouldRouteToHotWal(my_batch));
+}
+
+bool DBImpl::ShouldRouteToHotWal(WriteBatch* batch) {
+  if (!has_hot_key_write_buffer_.load(std::memory_order_relaxed) ||
+      WriteBatchInternal::IsLatestPersistentState(batch)) {
+    return false;
+  }
+  InstrumentedMutexLock lock(&mutex_);
+  ReadLock publish_lock(&hot_key_publish_mutex_);
+  HotWalRoutingHandler handler(versions_->GetColumnFamilySet());
+  return batch->Iterate(&handler).ok() && handler.ShouldRoute();
 }
 
 Status DBImpl::MaterializeHotKey(ColumnFamilyData* cfd, const Slice& key) {
@@ -103,8 +218,12 @@ Status DBImpl::MaterializeHotKey(ColumnFamilyData* cfd, const Slice& key) {
         if (MemtableHasNewerMutation(cfd->mem(), mutation)) {
           return true;
         }
-        return cfd->mem()->AddMaterializedMutation(
+        const bool inserted = cfd->mem()->AddMaterializedMutation(
             mutation.sequence, mutation.type, mutation.key, mutation.value);
+        if (inserted) {
+          cfd->mem()->RetainHotWalNumber(mutation.hot_wal_number);
+        }
+        return inserted;
       },
       &write);
   if (result == HotRegion::MaterializeResult::kNotFound) {
@@ -112,9 +231,6 @@ Status DBImpl::MaterializeHotKey(ColumnFamilyData* cfd, const Slice& key) {
   }
   if (result == HotRegion::MaterializeResult::kRetry) {
     return Status::TryAgain("hot-key materialization key+seq exists");
-  }
-  if (write.wal_number > 0) {
-    cfd->RetainLogNumber(write.wal_number);
   }
   RecordTick(cfd->ioptions()->statistics,
              HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS);
@@ -145,10 +261,15 @@ Status DBImpl::MaterializeEvictedHotKeys(ColumnFamilyData* cfd,
           if (mutation.memtable_id != cfd->mem()->GetID()) {
             return false;
           }
-          return MemtableHasNewerMutation(cfd->mem(), mutation) ||
-                 cfd->mem()->AddMaterializedMutation(
-                     mutation.sequence, mutation.type, mutation.key,
-                     mutation.value);
+          if (MemtableHasNewerMutation(cfd->mem(), mutation)) {
+            return true;
+          }
+          const bool inserted = cfd->mem()->AddMaterializedMutation(
+              mutation.sequence, mutation.type, mutation.key, mutation.value);
+          if (inserted) {
+            cfd->mem()->RetainHotWalNumber(mutation.hot_wal_number);
+          }
+          return inserted;
         },
         &materialized);
     if (result == HotRegion::MaterializeResult::kNotFound) {
@@ -156,9 +277,6 @@ Status DBImpl::MaterializeEvictedHotKeys(ColumnFamilyData* cfd,
     }
     if (result == HotRegion::MaterializeResult::kRetry) {
       return Status::TryAgain("hot-key materialization key+seq exists");
-    }
-    if (materialized.wal_number > 0) {
-      cfd->RetainLogNumber(materialized.wal_number);
     }
     RecordTick(cfd->ioptions()->statistics,
                HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS);
@@ -200,18 +318,17 @@ Status DBImpl::MaterializeAllHotKeys(ColumnFamilyData* cfd) {
 
   auto writes = cfd->hot_region()->GetAll();
   for (const auto& write : writes) {
-    if (!MemtableHasNewerMutation(cfd->mem(), write) &&
-        !cfd->mem()->AddMaterializedMutation(
-            write.sequence, write.type, write.key, write.value)) {
-      return Status::TryAgain("hot-key materialization key+seq exists");
+    if (!MemtableHasNewerMutation(cfd->mem(), write)) {
+      if (!cfd->mem()->AddMaterializedMutation(
+              write.sequence, write.type, write.key, write.value)) {
+        return Status::TryAgain("hot-key materialization key+seq exists");
+      }
+      cfd->mem()->RetainHotWalNumber(write.hot_wal_number);
     }
     HotRegion::BufferedWrite removed;
     if (!cfd->hot_region()->Remove(write.key, &removed)) {
       return Status::Corruption(
           "hot-key materialization lost buffered value");
-    }
-    if (removed.wal_number > 0) {
-      cfd->RetainLogNumber(removed.wal_number);
     }
     RecordTick(cfd->ioptions()->statistics,
                HOT_KEY_WRITE_BUFFER_MATERIALIZED_KEYS);
@@ -249,7 +366,8 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                          uint64_t* log_used, uint64_t log_ref,
                          bool disable_memtable, uint64_t* seq_used,
                          size_t batch_cnt,
-                         PreReleaseCallback* pre_release_callback) {
+                         PreReleaseCallback* pre_release_callback,
+                         bool route_to_hot_region) {
   LatencyHistLoggedGuard guard(&write_latency_reporter_, 500000);
   write_qps_reporter_.AddCount(WriteBatchInternal::Count(my_batch));
   write_throughput_reporter_.AddCount(WriteBatchInternal::ByteSize(my_batch));
@@ -296,12 +414,14 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 
   if (immutable_db_options_.enable_pipelined_write) {
     return PipelinedWriteImpl(write_options, my_batch, callback, log_used,
-                              log_ref, disable_memtable, seq_used);
+                              log_ref, disable_memtable, seq_used,
+                              route_to_hot_region);
   }
 
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
-                        disable_memtable, batch_cnt, pre_release_callback);
+                        disable_memtable, batch_cnt, pre_release_callback,
+                        route_to_hot_region);
 
   if (!write_options.disableWAL) {
     RecordTick(stats_, WRITE_WITH_WAL);
@@ -328,6 +448,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     }
 
     if (write_thread_.CompleteParallelMemTableWriter(&w)) {
+      if (w.write_group->status.ok()) {
+        ReleaseHotWalReferences(*w.write_group);
+      }
       last_batch_group_memtable_size_.store(
           MemtableWriteGroupBytes(*w.write_group),
           std::memory_order_relaxed);
@@ -381,7 +504,10 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 
   mutex_.Lock();
 
-  bool need_log_sync = write_options.sync;
+  const bool write_hot_wal =
+      route_to_hot_region && !write_options.disableWAL;
+  bool need_log_sync = !write_hot_wal && write_options.sync;
+  const bool need_hot_wal_sync = write_hot_wal && write_options.sync;
   bool need_log_dir_sync = need_log_sync && !log_dir_synced_;
   if (!two_write_queues_ || !disable_memtable) {
     // With concurrent writes we do preprocess only in the write thread that
@@ -482,8 +608,12 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     if (!two_write_queues_) {
       if (status.ok() && !write_options.disableWAL) {
         PERF_TIMER_GUARD(write_wal_time);
-        status = WriteToWAL(write_group, log_writer, log_used, need_log_sync,
-                            need_log_dir_sync, last_sequence + 1);
+        status = write_hot_wal
+                     ? WriteToHotWal(write_group, log_used,
+                                     need_hot_wal_sync, last_sequence + 1)
+                     : WriteToWAL(write_group, log_writer, log_used,
+                                  need_log_sync, need_log_dir_sync,
+                                  last_sequence + 1);
       }
     } else {
       if (status.ok() && !write_options.disableWAL) {
@@ -557,7 +687,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     WriteStatusCheck(status);
   }
 
-  if (need_log_sync) {
+  if (need_log_sync && !write_hot_wal) {
     mutex_.Lock();
     MarkLogsSynced(logfile_number_, need_log_dir_sync, status);
     mutex_.Unlock();
@@ -579,6 +709,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     should_exit_batch_group = write_thread_.CompleteParallelMemTableWriter(&w);
   }
   if (should_exit_batch_group) {
+    if (w.status.ok()) {
+      ReleaseHotWalReferences(write_group);
+    }
     last_batch_group_memtable_size_.store(
         MemtableWriteGroupBytes(write_group), std::memory_order_relaxed);
     if (status.ok()) {
@@ -610,12 +743,13 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
                                   WriteBatch* my_batch, WriteCallback* callback,
                                   uint64_t* log_used, uint64_t log_ref,
-                                  bool disable_memtable, uint64_t* seq_used) {
+                                  bool disable_memtable, uint64_t* seq_used,
+                                  bool route_to_hot_region) {
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   StopWatch write_sw(env_, immutable_db_options_.statistics.get(), DB_WRITE);
   WriteContext write_context(immutable_db_options_.info_log.get());
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
-                        disable_memtable);
+                        disable_memtable, 0, nullptr, route_to_hot_region);
   write_thread_.JoinBatchGroup(&w);
   if (w.state == WriteThread::STATE_GROUP_LEADER) {
     WriteThread::WriteGroup wal_write_group;
@@ -623,7 +757,11 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       write_thread_.WaitForMemTableWriters();
     }
     mutex_.Lock();
-    bool need_log_sync = !write_options.disableWAL && write_options.sync;
+    const bool write_hot_wal =
+        route_to_hot_region && !write_options.disableWAL;
+    bool need_log_sync =
+        !write_hot_wal && !write_options.disableWAL && write_options.sync;
+    const bool need_hot_wal_sync = write_hot_wal && write_options.sync;
     bool need_log_dir_sync = need_log_sync && !log_dir_synced_;
     // PreprocessWrite does its own perf timing.
     PERF_TIMER_STOP(write_pre_and_post_process_time);
@@ -677,15 +815,19 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
                           wal_write_group.size - 1);
         RecordTick(stats_, WRITE_DONE_BY_OTHER, wal_write_group.size - 1);
       }
-      w.status = WriteToWAL(wal_write_group, log_writer, log_used,
-                            need_log_sync, need_log_dir_sync, current_sequence);
+      w.status = write_hot_wal
+                     ? WriteToHotWal(wal_write_group, log_used,
+                                     need_hot_wal_sync, current_sequence)
+                     : WriteToWAL(wal_write_group, log_writer, log_used,
+                                  need_log_sync, need_log_dir_sync,
+                                  current_sequence);
     }
 
     if (!w.CallbackFailed()) {
       WriteStatusCheck(w.status);
     }
 
-    if (need_log_sync) {
+    if (need_log_sync && !write_hot_wal) {
       mutex_.Lock();
       MarkLogsSynced(logfile_number_, need_log_dir_sync, w.status);
       mutex_.Unlock();
@@ -720,6 +862,9 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
           &flush_scheduler_, write_options.ignore_missing_column_families,
           0 /*log_number*/, this, false /*concurrent_memtable_writes*/,
           seq_per_batch_, batch_per_txn_);
+      if (memtable_write_group.status.ok()) {
+        ReleaseHotWalReferences(memtable_write_group);
+      }
       last_batch_group_memtable_size_.store(
           MemtableWriteGroupBytes(memtable_write_group),
           std::memory_order_relaxed);
@@ -737,6 +882,9 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
         write_options.ignore_missing_column_families, 0 /*log_number*/, this,
         true /*concurrent_memtable_writes*/);
     if (write_thread_.CompleteParallelMemTableWriter(&w)) {
+      if (w.write_group->status.ok()) {
+        ReleaseHotWalReferences(*w.write_group);
+      }
       last_batch_group_memtable_size_.store(
           MemtableWriteGroupBytes(*w.write_group),
           std::memory_order_relaxed);
@@ -1143,6 +1291,81 @@ Status DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
     RecordTick(stats_, WRITE_WITH_WAL, write_with_wal);
   }
   return status;
+}
+
+Status DBImpl::WriteToHotWal(
+    const WriteThread::WriteGroup& write_group, uint64_t* log_used,
+    bool need_log_sync, SequenceNumber sequence) {
+  assert(!write_group.leader->disable_wal);
+  assert(write_group.leader->route_to_hot_region);
+  if (hot_wal_ == nullptr) {
+    return Status::Corruption("Hot WAL is not initialized");
+  }
+
+  size_t write_with_wal = 0;
+  WriteBatch* to_be_cached_state = nullptr;
+  WriteBatch* merged_batch = MergeBatch(
+      write_group, &tmp_batch_, &write_with_wal, &to_be_cached_state);
+  assert(to_be_cached_state == nullptr);
+  WriteBatchInternal::SetSequence(merged_batch, sequence);
+
+  uint64_t segment_number = 0;
+  const uint64_t log_size = WriteBatchInternal::ByteSize(merged_batch);
+  Status status =
+      hot_wal_->Append(merged_batch, sequence, write_with_wal, need_log_sync,
+                       &segment_number);
+  if (status.ok()) {
+    SequenceNumber batch_sequence = sequence;
+    for (auto* writer : write_group) {
+      if (writer->CallbackFailed()) {
+        continue;
+      }
+      writer->log_used = segment_number;
+      WriteBatchInternal::SetSequence(writer->batch, batch_sequence);
+      batch_sequence += WriteBatchInternal::Count(writer->batch);
+    }
+    if (log_used != nullptr) {
+      *log_used = segment_number;
+    }
+  }
+
+  if (merged_batch == &tmp_batch_) {
+    tmp_batch_.Clear();
+  }
+  if (status.ok()) {
+    auto stats = default_cf_internal_stats_;
+    if (need_log_sync) {
+      stats->AddDBStats(InternalStats::WAL_FILE_SYNCED, 1);
+      RecordTick(stats_, WAL_FILE_SYNCED);
+    }
+    stats->AddDBStats(InternalStats::WAL_FILE_BYTES, log_size);
+    RecordTick(stats_, WAL_FILE_BYTES, log_size);
+    stats->AddDBStats(InternalStats::WRITE_WITH_WAL, write_with_wal);
+    RecordTick(stats_, WRITE_WITH_WAL, write_with_wal);
+  }
+  return status;
+}
+
+void DBImpl::ReleaseHotWalReferences(
+    const WriteThread::WriteGroup& write_group) {
+  if (hot_wal_ == nullptr) {
+    return;
+  }
+  for (auto* writer : write_group) {
+    if (writer->route_to_hot_region && !writer->disable_wal &&
+        !writer->CallbackFailed() && writer->log_used != 0) {
+      hot_wal_->Release(writer->log_used);
+    }
+  }
+  if (hot_wal_->TakePurgeRequest()) {
+    InstrumentedMutexLock lock(&mutex_);
+    Status status = PurgeObsoleteHotWal();
+    if (!status.ok()) {
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "Failed to purge obsolete Hot WAL segments: %s",
+                     status.ToString().c_str());
+    }
+  }
 }
 
 Status DBImpl::ConcurrentWriteToWAL(const WriteThread::WriteGroup& write_group,
@@ -1663,8 +1886,7 @@ Status DBImpl::NewLogWriter(std::unique_ptr<log::Writer>* new_log,
         immutable_db_options_.listeners));
     new_log->reset(new log::Writer(
         std::move(file_writer), new_log_number,
-        immutable_db_options_.recycle_log_file_num > 0, manual_wal_flush_,
-        has_hot_key_write_buffer_.load(std::memory_order_relaxed)));
+        immutable_db_options_.recycle_log_file_num > 0, manual_wal_flush_));
   }
   return s;
 }

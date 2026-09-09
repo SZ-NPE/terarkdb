@@ -214,14 +214,7 @@ class ColumnFamilyData {
   uint64_t GetLogNumber() const {
     return log_number_.load(std::memory_order_relaxed);
   }
-  void RetainLogNumber(uint64_t log_number) {
-    uint64_t current = GetLogNumber();
-    while (log_number < current &&
-           !log_number_.compare_exchange_weak(
-               current, log_number, std::memory_order_relaxed,
-               std::memory_order_relaxed)) {
-    }
-  }
+  uint64_t OldestHotWalToKeep() const;
 
   void SetFlushReason(FlushReason flush_reason) {
     flush_reason_ = flush_reason;

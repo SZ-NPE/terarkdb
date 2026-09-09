@@ -11,9 +11,6 @@
 #include <stdint.h>
 
 #include <memory>
-#include <string>
-#include <unordered_map>
-#include <vector>
 
 #include "db/log_format.h"
 #include "rocksdb/slice.h"
@@ -78,8 +75,7 @@ class Writer {
   // "*dest" must remain live while this Writer is in use.
   explicit Writer(std::unique_ptr<WritableFileWriter>&& dest,
                   uint64_t log_number, bool recycle_log_files,
-                  bool manual_flush = false,
-                  bool deduplicate_record_blocks = false);
+                  bool manual_flush = false);
   ~Writer();
 
   Status AddRecord(const Slice& slice);
@@ -114,11 +110,6 @@ class Writer {
   // If true, it does not flush after each write. Instead it relies on the upper
   // layer to manually does the flush by calling ::WriteBuffer()
   bool manual_flush_;
-  bool deduplicate_record_blocks_;
-  std::vector<std::string> deduplicated_values_;
-  std::unordered_map<uint64_t, std::vector<uint32_t>> deduplication_index_;
-
-  Slice EncodeRecord(const Slice& record, std::string* encoded);
 
   // No copying allowed
   Writer(const Writer&);

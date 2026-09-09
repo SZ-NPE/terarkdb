@@ -119,6 +119,7 @@ class WriteThread {
     bool no_slowdown;
     bool disable_wal;
     bool disable_memtable;
+    bool route_to_hot_region;
     size_t memtable_write_bytes;
     size_t batch_cnt;  // if non-zero, number of sub-batches in the write batch
     PreReleaseCallback* pre_release_callback;
@@ -143,6 +144,7 @@ class WriteThread {
           no_slowdown(false),
           disable_wal(false),
           disable_memtable(false),
+          route_to_hot_region(false),
           memtable_write_bytes(0),
           batch_cnt(0),
           pre_release_callback(nullptr),
@@ -159,12 +161,14 @@ class WriteThread {
     Writer(const WriteOptions& write_options, WriteBatch* _batch,
            WriteCallback* _callback, uint64_t _log_ref, bool _disable_memtable,
            size_t _batch_cnt = 0,
-           PreReleaseCallback* _pre_release_callback = nullptr)
+           PreReleaseCallback* _pre_release_callback = nullptr,
+           bool _route_to_hot_region = false)
         : batch(_batch),
           sync(write_options.sync),
           no_slowdown(write_options.no_slowdown),
           disable_wal(write_options.disableWAL),
           disable_memtable(_disable_memtable),
+          route_to_hot_region(_route_to_hot_region),
           memtable_write_bytes(0),
           batch_cnt(_batch_cnt),
           pre_release_callback(_pre_release_callback),

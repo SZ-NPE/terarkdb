@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "db/dbformat.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/write_batch_internal.h"
@@ -47,6 +48,27 @@ static std::string NumberString(int n) {
 static std::string RandomSkewedString(int i, Random* rnd) {
   return BigString(NumberString(i), rnd->Skewed(17));
 }
+
+class MemorySource : public SequentialFile {
+ public:
+  explicit MemorySource(Slice* contents) : contents_(contents) {}
+
+  Status Read(size_t size, Slice* result, char* scratch) override {
+    const size_t bytes = std::min(size, contents_->size());
+    std::memcpy(scratch, contents_->data(), bytes);
+    *result = Slice(scratch, bytes);
+    contents_->remove_prefix(bytes);
+    return Status::OK();
+  }
+
+  Status Skip(uint64_t bytes) override {
+    contents_->remove_prefix(std::min<size_t>(bytes, contents_->size()));
+    return Status::OK();
+  }
+
+ private:
+  Slice* contents_;
+};
 
 class LogTest : public ::testing::TestWithParam<int> {
  private:
@@ -647,33 +669,11 @@ TEST_P(LogTest, Recycle) {
 
 INSTANTIATE_TEST_CASE_P(bool, LogTest, ::testing::Values(0, 2));
 
-TEST(DeduplicatedLogTest, RoundTripsRepeatedBlocks) {
-  class MemorySource : public SequentialFile {
-   public:
-    explicit MemorySource(Slice* contents) : contents_(contents) {}
-
-    Status Read(size_t size, Slice* result, char* scratch) override {
-      const size_t bytes = std::min(size, contents_->size());
-      std::memcpy(scratch, contents_->data(), bytes);
-      *result = Slice(scratch, bytes);
-      contents_->remove_prefix(bytes);
-      return Status::OK();
-    }
-
-    Status Skip(uint64_t bytes) override {
-      contents_->remove_prefix(
-          std::min<size_t>(bytes, contents_->size()));
-      return Status::OK();
-    }
-
-   private:
-    Slice* contents_;
-  };
-
+TEST(LogWriterTest, WritesRepeatedValuesVerbatim) {
   Slice contents;
   std::unique_ptr<WritableFileWriter> destination(
       test::GetWritableFileWriter(new test::StringSink(&contents), ""));
-  Writer writer(std::move(destination), 123, false, false, true);
+  Writer writer(std::move(destination), 123, false);
   const std::string value(128U << 10, 'x');
   WriteBatch first;
   WriteBatch second;
@@ -682,7 +682,43 @@ TEST(DeduplicatedLogTest, RoundTripsRepeatedBlocks) {
   ASSERT_OK(writer.AddRecord(WriteBatchInternal::Contents(&first)));
   ASSERT_OK(writer.AddRecord(WriteBatchInternal::Contents(&second)));
   ASSERT_OK(writer.WriteBuffer());
-  ASSERT_LT(contents.size(), value.size() + value.size() / 4);
+  ASSERT_GT(contents.size(), value.size() * 2);
+}
+
+TEST(LegacyDeduplicatedLogTest, DecodesRepeatedBlocks) {
+  constexpr char kMagic[] = "HKDED01";
+  const std::string value(128U << 10, 'x');
+  WriteBatch first;
+  WriteBatch second;
+  ASSERT_OK(first.Put("first", value));
+  ASSERT_OK(second.Put("second", value));
+
+  auto encode = [&](const WriteBatch& batch, const Slice& key,
+                    bool write_literal) {
+    const Slice original = WriteBatchInternal::Contents(&batch);
+    std::string encoded(kMagic, sizeof(kMagic) - 1);
+    PutFixed32(&encoded, static_cast<uint32_t>(original.size()));
+    encoded.append(original.data(), WriteBatchInternal::kHeader);
+    encoded.push_back(static_cast<char>(kTypeValue));
+    PutLengthPrefixedSlice(&encoded, key);
+    encoded.push_back(write_literal ? 0 : 1);
+    if (write_literal) {
+      PutLengthPrefixedSlice(&encoded, value);
+    } else {
+      PutVarint32(&encoded, 0);
+    }
+    return encoded;
+  };
+
+  const std::string encoded_first = encode(first, "first", true);
+  const std::string encoded_second = encode(second, "second", false);
+  Slice contents;
+  std::unique_ptr<WritableFileWriter> destination(
+      test::GetWritableFileWriter(new test::StringSink(&contents), ""));
+  Writer writer(std::move(destination), 123, false);
+  ASSERT_OK(writer.AddRecord(encoded_first));
+  ASSERT_OK(writer.AddRecord(encoded_second));
+  ASSERT_OK(writer.WriteBuffer());
 
   class Reporter : public Reader::Reporter {
    public:

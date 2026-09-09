@@ -524,6 +524,18 @@ Status DBImpl::Recover(
         }
       }
     }
+    if (s.ok()) {
+      s = OpenHotWal(!read_only);
+    }
+    if (s.ok() && hot_wal_ != nullptr &&
+        error_if_log_file_exist && hot_wal_->segment_count() != 0) {
+      s = Status::Corruption(
+          "The db was opened in readonly mode with error_if_log_file_exist "
+          "flag but a Hot WAL file already exists");
+    }
+    if (s.ok() && hot_wal_ != nullptr) {
+      s = RecoverHotWalFiles(&next_sequence, read_only);
+    }
   }
 
   if (read_only) {
@@ -641,6 +653,138 @@ Status DBImpl::InitPersistStatsColumnFamily() {
     mutex_.Lock();
   }
   return s;
+}
+
+Status DBImpl::OpenHotWal(bool writable) {
+  mutex_.AssertHeld();
+  bool hot_region_enabled = false;
+  for (auto* cfd : *versions_->GetColumnFamilySet()) {
+    if (cfd->IsHotKeyWriteBufferEnabled()) {
+      hot_region_enabled = true;
+      has_hot_key_write_buffer_.store(true, std::memory_order_relaxed);
+    }
+  }
+
+  const std::string directory =
+      HotWalDirectory(immutable_db_options_.wal_dir);
+  Status exists = env_->FileExists(directory);
+  if (!hot_region_enabled && exists.IsNotFound()) {
+    return Status::OK();
+  }
+  if (!exists.ok() && !exists.IsNotFound()) {
+    return exists;
+  }
+
+  EnvOptions hot_wal_env_options = env_->OptimizeForLogWrite(
+      env_options_,
+      BuildDBOptions(immutable_db_options_, mutable_db_options_));
+  hot_wal_.reset(new HotWal(
+      env_, hot_wal_env_options, directory, GetMaxWalSize(),
+      immutable_db_options_.manual_wal_flush,
+      immutable_db_options_.use_fsync));
+  return hot_wal_->Open(writable);
+}
+
+Status DBImpl::RecoverHotWalFiles(SequenceNumber* next_sequence,
+                                  bool read_only) {
+  mutex_.AssertHeld();
+  assert(hot_wal_ != nullptr);
+
+  std::vector<HotWal::RecoveredRecord> records;
+  Status status =
+      hot_wal_->ReadAll(&records, immutable_db_options_.wal_recovery_mode,
+                        immutable_db_options_.paranoid_checks);
+  if (!status.ok() || records.empty()) {
+    return status;
+  }
+
+  std::unordered_map<int, VersionEdit> version_edits;
+  for (auto* cfd : *versions_->GetColumnFamilySet()) {
+    VersionEdit edit;
+    edit.SetColumnFamily(cfd->GetID());
+    version_edits.emplace(cfd->GetID(), std::move(edit));
+  }
+
+  const int job_id = next_job_id_.fetch_add(1);
+  bool flushed = false;
+  for (const auto& record : records) {
+    WriteBatch batch(record.contents);
+    SequenceNumber record_next_sequence = kMaxSequenceNumber;
+    bool has_valid_writes = false;
+    status = WriteBatchInternal::InsertInto(
+        &batch, column_family_memtables_.get(), &flush_scheduler_, true,
+        0 /* recovery_log_number */, this,
+        false /* concurrent_memtable_writes */, &record_next_sequence,
+        &has_valid_writes, seq_per_batch_, batch_per_txn_,
+        false /* route_to_hot_region */, true /* bypass_hot_region */,
+        record.segment_number);
+    MaybeIgnoreError(&status);
+    if (!status.ok()) {
+      break;
+    }
+    if (*next_sequence == kMaxSequenceNumber ||
+        record_next_sequence > *next_sequence) {
+      *next_sequence = record_next_sequence;
+    }
+
+    if (has_valid_writes && !read_only) {
+      ColumnFamilyData* cfd;
+      while ((cfd = flush_scheduler_.TakeNextColumnFamily()) != nullptr) {
+        cfd->Unref();
+        auto edit = version_edits.find(cfd->GetID());
+        assert(edit != version_edits.end());
+        status = WriteLevel0TableForRecovery(
+            job_id, cfd, cfd->mem(), &edit->second);
+        if (!status.ok()) {
+          return status;
+        }
+        flushed = true;
+        cfd->CreateNewMemtable(*cfd->GetLatestMutableCFOptions(),
+                               false /* needs_dup_key_check */,
+                               *next_sequence);
+      }
+    }
+  }
+  flush_scheduler_.Clear();
+  if (!status.ok()) {
+    return status;
+  }
+
+  if (!read_only) {
+    for (auto* cfd : *versions_->GetColumnFamilySet()) {
+      auto edit = version_edits.find(cfd->GetID());
+      assert(edit != version_edits.end());
+      if (cfd->mem()->GetFirstSequenceNumber() != 0 &&
+          (flushed || !immutable_db_options_.avoid_flush_during_recovery)) {
+        status = WriteLevel0TableForRecovery(
+            job_id, cfd, cfd->mem(), &edit->second);
+        if (!status.ok()) {
+          return status;
+        }
+        cfd->CreateNewMemtable(*cfd->GetLatestMutableCFOptions(),
+                               false /* needs_dup_key_check */,
+                               *next_sequence);
+      }
+      if (edit->second.NumEntries() != 0) {
+        edit->second.set_open_db(true);
+        status = versions_->LogAndApply(
+            cfd, *cfd->GetLatestMutableCFOptions(), &edit->second, &mutex_);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    }
+  }
+
+  if (*next_sequence != kMaxSequenceNumber) {
+    const SequenceNumber last_sequence = *next_sequence - 1;
+    if (versions_->LastSequence() <= last_sequence) {
+      versions_->SetLastAllocatedSequence(last_sequence);
+      versions_->SetLastPublishedSequence(last_sequence);
+      versions_->SetLastSequence(last_sequence);
+    }
+  }
+  return Status::OK();
 }
 
 // REQUIRES: log_numbers are sorted in ascending order
@@ -1399,12 +1543,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                                    nullptr /* stats */, listeners));
         impl->logs_.emplace_back(
             new_log_number,
-            new log::Writer(
-                std::move(file_writer), new_log_number,
-                impl->immutable_db_options_.recycle_log_file_num > 0,
-                impl->immutable_db_options_.manual_wal_flush,
-                impl->has_hot_key_write_buffer_.load(
-                    std::memory_order_relaxed)));
+            new log::Writer(std::move(file_writer), new_log_number,
+                            impl->immutable_db_options_.recycle_log_file_num > 0,
+                            impl->immutable_db_options_.manual_wal_flush));
       }
 
       autovector<const ColumnFamilyOptions*> cf_options_list;

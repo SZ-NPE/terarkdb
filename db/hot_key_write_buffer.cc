@@ -39,11 +39,11 @@ HotKeyWriteBuffer::Entry::Entry(HotKeyWriteBuffer* entry_owner,
       memtable_id(entry_memtable_id) {
   UpdateMutation(entry_value, entry_type);
   charge = CalculateCharge();
-  wal_reference = owner->RegisterWalReference(entry_wal_number);
+  hot_wal_reference = owner->RegisterHotWalReference(entry_wal_number);
 }
 
 HotKeyWriteBuffer::Entry::~Entry() {
-  owner->UnregisterWalReference(wal_reference);
+  owner->UnregisterHotWalReference(hot_wal_reference);
 }
 
 void HotKeyWriteBuffer::Entry::CopyTo(BufferedWrite* write) {
@@ -59,8 +59,8 @@ void HotKeyWriteBuffer::Entry::CopyToUnlocked(BufferedWrite* write) {
   write->type = type;
   write->sequence = sequence;
   write->memtable_id = memtable_id;
-  write->wal_number =
-      wal_reference == nullptr ? 0 : wal_reference->wal_number;
+  write->hot_wal_number =
+      hot_wal_reference == nullptr ? 0 : hot_wal_reference->wal_number;
   write->charge = charge;
 }
 
@@ -188,26 +188,32 @@ bool HotKeyWriteBuffer::Lookup(const Slice& key, SequenceNumber snapshot,
   return true;
 }
 
+bool HotKeyWriteBuffer::Contains(const Slice& key,
+                                 uint64_t memtable_id) const {
+  return Lookup(key, kMaxSequenceNumber, memtable_id, nullptr, nullptr,
+                nullptr);
+}
+
 HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryPut(
     const Slice& key, const Slice& value, SequenceNumber sequence,
-    uint64_t memtable_id, bool admit_new_key, uint64_t wal_number,
+    uint64_t memtable_id, bool admit_new_key, uint64_t hot_wal_number,
     bool* found_in_buffer) {
   return TryMutation(key, value, kTypeValue, sequence, memtable_id,
-                     admit_new_key, wal_number, found_in_buffer);
+                     admit_new_key, hot_wal_number, found_in_buffer);
 }
 
 HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryDelete(
     const Slice& key, ValueType type, SequenceNumber sequence,
-    uint64_t memtable_id, uint64_t wal_number, bool* found_in_buffer) {
+    uint64_t memtable_id, uint64_t hot_wal_number, bool* found_in_buffer) {
   assert(type == kTypeDeletion);
   return TryMutation(key, Slice(), type, sequence, memtable_id,
-                     false, wal_number, found_in_buffer);
+                     false, hot_wal_number, found_in_buffer);
 }
 
 HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
     const Slice& key, const Slice& value, ValueType type,
     SequenceNumber sequence, uint64_t memtable_id, bool admit_new_key,
-    uint64_t wal_number, bool* found_in_buffer) {
+    uint64_t hot_wal_number, bool* found_in_buffer) {
   if (type == kTypeValue && value.size() > max_value_size_) {
     return PutResult::kBypass;
   }
@@ -229,6 +235,7 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
           if (!allow_replacement) {
             *requires_key_lock = true;
           } else {
+            resident->retired = true;
             resident->materialize_on_delete.store(
                 false, std::memory_order_release);
             if (resident->pending_memory_reserved) {
@@ -243,8 +250,8 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
         } else {
           resident->UpdateMutation(value, type);
           resident->sequence = sequence;
-          resident->wal_reference =
-              UpdateWalReference(resident->wal_reference, wal_number);
+          resident->hot_wal_reference = UpdateHotWalReference(
+              resident->hot_wal_reference, hot_wal_number);
           result = PutResult::kUpdatedInPlace;
         }
       }
@@ -253,9 +260,13 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
     if (replace_entry) {
       std::unique_ptr<Entry> replacement(
           new Entry(this, key, value, type, sequence, memtable_id,
-                    wal_number));
-      result = InsertEntry(std::move(replacement)) ? PutResult::kReplaced
-                                                    : PutResult::kBypass;
+                    hot_wal_number));
+      if (InsertEntry(std::move(replacement))) {
+        result = PutResult::kReplaced;
+      } else {
+        cache_->Erase(key);
+        result = PutResult::kBypass;
+      }
     }
     return result;
   };
@@ -276,7 +287,7 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
 
   bool found_pending = false;
   PutResult pending_result =
-      TryUpdatePending(key, value, type, sequence, memtable_id, wal_number,
+      TryUpdatePending(key, value, type, sequence, memtable_id, hot_wal_number,
                        &found_pending);
   if (found_pending) {
     if (found_in_buffer != nullptr) {
@@ -297,7 +308,7 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
     return result;
   }
   pending_result =
-      TryUpdatePending(key, value, type, sequence, memtable_id, wal_number,
+      TryUpdatePending(key, value, type, sequence, memtable_id, hot_wal_number,
                        &found_pending);
   if (found_pending) {
     if (found_in_buffer != nullptr) {
@@ -309,7 +320,8 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryMutation(
     return PutResult::kBypass;
   }
   std::unique_ptr<Entry> entry(
-      new Entry(this, key, value, type, sequence, memtable_id, wal_number));
+      new Entry(this, key, value, type, sequence, memtable_id,
+                hot_wal_number));
   return InsertEntry(std::move(entry)) ? PutResult::kInserted
                                        : PutResult::kBypass;
 }
@@ -499,9 +511,9 @@ void HotKeyWriteBuffer::RebindMemtable(uint64_t memtable_id,
   current_memtable_id_.store(memtable_id, std::memory_order_release);
 }
 
-uint64_t HotKeyWriteBuffer::OldestWalNumber() const {
-  MutexLock lock(&wal_mutex_);
-  for (const auto& reference : wal_references_) {
+uint64_t HotKeyWriteBuffer::OldestHotWalNumber() const {
+  MutexLock lock(&hot_wal_mutex_);
+  for (const auto& reference : hot_wal_references_) {
     if (reference.second->entry_count.load(std::memory_order_relaxed) != 0) {
       return reference.first;
     }
@@ -751,29 +763,30 @@ void HotKeyWriteBuffer::RebindEntryToCurrentMemtable(Entry* entry) {
       entry, current_memtable_id_.load(std::memory_order_acquire));
 }
 
-HotKeyWriteBuffer::WalReference* HotKeyWriteBuffer::RegisterWalReference(
-    uint64_t wal_number) {
+HotKeyWriteBuffer::HotWalReference*
+HotKeyWriteBuffer::RegisterHotWalReference(uint64_t wal_number) {
   if (wal_number == 0) {
     return nullptr;
   }
-  WalReference* reference =
-      current_wal_reference_.load(std::memory_order_acquire);
+  HotWalReference* reference =
+      current_hot_wal_reference_.load(std::memory_order_acquire);
   if (reference != nullptr && reference->wal_number == wal_number) {
     reference->entry_count.fetch_add(1, std::memory_order_relaxed);
     return reference;
   }
-  MutexLock lock(&wal_mutex_);
-  auto& slot = wal_references_[wal_number];
+  MutexLock lock(&hot_wal_mutex_);
+  auto& slot = hot_wal_references_[wal_number];
   if (slot == nullptr) {
-    slot.reset(new WalReference(wal_number));
+    slot.reset(new HotWalReference(wal_number));
   }
   reference = slot.get();
-  current_wal_reference_.store(reference, std::memory_order_release);
+  current_hot_wal_reference_.store(reference, std::memory_order_release);
   reference->entry_count.fetch_add(1, std::memory_order_relaxed);
   return reference;
 }
 
-void HotKeyWriteBuffer::UnregisterWalReference(WalReference* reference) {
+void HotKeyWriteBuffer::UnregisterHotWalReference(
+    HotWalReference* reference) {
   if (reference == nullptr) {
     return;
   }
@@ -782,15 +795,16 @@ void HotKeyWriteBuffer::UnregisterWalReference(WalReference* reference) {
   assert(previous > 0);
 }
 
-HotKeyWriteBuffer::WalReference* HotKeyWriteBuffer::UpdateWalReference(
-    WalReference* old_reference, uint64_t new_wal_number) {
+HotKeyWriteBuffer::HotWalReference*
+HotKeyWriteBuffer::UpdateHotWalReference(
+    HotWalReference* old_reference, uint64_t new_wal_number) {
   if ((old_reference == nullptr && new_wal_number == 0) ||
       (old_reference != nullptr &&
        old_reference->wal_number == new_wal_number)) {
     return old_reference;
   }
-  WalReference* new_reference = RegisterWalReference(new_wal_number);
-  UnregisterWalReference(old_reference);
+  HotWalReference* new_reference = RegisterHotWalReference(new_wal_number);
+  UnregisterHotWalReference(old_reference);
   return new_reference;
 }
 
@@ -832,7 +846,7 @@ bool HotKeyWriteBuffer::InsertEntry(std::unique_ptr<Entry> entry) {
 
 HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryUpdatePending(
     const Slice& key, const Slice& value, ValueType type,
-    SequenceNumber sequence, uint64_t memtable_id, uint64_t wal_number,
+    SequenceNumber sequence, uint64_t memtable_id, uint64_t hot_wal_number,
     bool* found) {
   std::shared_ptr<Entry> entry = FindPending(key);
   if (entry == nullptr) {
@@ -856,8 +870,8 @@ HotKeyWriteBuffer::PutResult HotKeyWriteBuffer::TryUpdatePending(
   }
   entry->UpdateMutation(value, type);
   entry->sequence = sequence;
-  entry->wal_reference =
-      UpdateWalReference(entry->wal_reference, wal_number);
+  entry->hot_wal_reference =
+      UpdateHotWalReference(entry->hot_wal_reference, hot_wal_number);
   entry->charge = entry->CalculateCharge();
   assert(entry->charge <= previous_charge);
   if (entry->charge < previous_charge) {

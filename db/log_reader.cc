@@ -27,6 +27,7 @@ namespace log {
 
 namespace {
 
+// Legacy HeatKV WAL encoding. New writers always emit regular records.
 constexpr char kDeduplicatedRecordMagic[] = "HKDED01";
 constexpr size_t kMaxDeduplicatedValues = 4096;
 

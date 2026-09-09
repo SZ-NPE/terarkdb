@@ -13,10 +13,12 @@
 #include <mutex>
 #include <thread>
 
+#include "db/hot_wal.h"
 #include "port/stack_trace.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/terark_namespace.h"
 #include "util/fault_injection_test_env.h"
+#include "util/filename.h"
 #include "utilities/merge_operators.h"
 #if !defined(ROCKSDB_LITE)
 #include "util/sync_point.h"
@@ -629,6 +631,110 @@ TEST_F(DBBasicTest, HotKeyWriteBufferRecoversWalWithoutShutdownFlush) {
 
   Reopen(options);
   ASSERT_EQ(value, Get("hot-key"));
+}
+
+TEST_F(DBBasicTest, HotKeyWriteBufferUsesIndependentWal) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  const std::string normal_wal =
+      LogFileName(dbname_, dbfull()->TEST_LogfileNumber());
+  uint64_t normal_size_before = 0;
+  ASSERT_OK(env_->GetFileSize(normal_wal, &normal_size_before));
+
+  const std::string value(4096, 'a');
+  ASSERT_OK(Put("hot-key", value));
+  ASSERT_OK(db_->FlushWAL(false));
+
+  uint64_t normal_size_after_hot = 0;
+  ASSERT_OK(env_->GetFileSize(normal_wal, &normal_size_after_hot));
+  ASSERT_EQ(normal_size_before, normal_size_after_hot);
+
+  std::vector<std::string> hot_wal_files;
+  ASSERT_OK(env_->GetChildren(HotWalDirectory(dbname_), &hot_wal_files));
+  uint64_t hot_wal_bytes = 0;
+  for (const auto& file : hot_wal_files) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(file, &number, &type) && type == kLogFile) {
+      uint64_t size = 0;
+      ASSERT_OK(env_->GetFileSize(
+          LogFileName(HotWalDirectory(dbname_), number), &size));
+      hot_wal_bytes += size;
+    }
+  }
+  ASSERT_GT(hot_wal_bytes, value.size());
+
+  ASSERT_OK(Put("cold-key", "small"));
+  ASSERT_OK(db_->FlushWAL(false));
+  uint64_t normal_size_after_cold = 0;
+  ASSERT_OK(env_->GetFileSize(normal_wal, &normal_size_after_cold));
+  ASSERT_GT(normal_size_after_cold, normal_size_after_hot);
+}
+
+TEST_F(DBBasicTest, RecoversHotWalWhenBufferingIsDisabled) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  options.avoid_flush_during_shutdown = true;
+  Reopen(options);
+
+  const std::string value(4096, 'a');
+  ASSERT_OK(Put("hot-key", value));
+
+  options.enable_hot_key_write_buffer = false;
+  Reopen(options);
+  ASSERT_EQ(value, Get("hot-key"));
+  auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
+                  db_->DefaultColumnFamily())
+                  ->cfd();
+  ASSERT_EQ(nullptr, cfd->hot_region());
+}
+
+TEST_F(DBBasicTest, HotWalSegmentsArePurgedAfterFlush) {
+  Options options = CurrentOptions();
+  options.enable_hot_key_write_buffer = true;
+  options.hot_key_admission_threshold = 1;
+  options.hot_key_write_buffer_size = 2U << 20;
+  options.hot_key_max_buffered_value_size = 64U << 10;
+  options.max_wal_size = 1U << 20;
+  options.blob_size = 512;
+  options.blob_large_key_ratio = 1.0;
+  Reopen(options);
+
+  const std::string value(4096, 'a');
+  for (int update = 0; update < 300; ++update) {
+    ASSERT_OK(Put("hot-key", value));
+  }
+
+  std::vector<std::string> files;
+  ASSERT_OK(env_->GetChildren(HotWalDirectory(dbname_), &files));
+  size_t segments = 0;
+  for (const auto& file : files) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(file, &number, &type) && type == kLogFile) {
+      ++segments;
+    }
+  }
+  ASSERT_EQ(1U, segments);
+
+  ASSERT_OK(Flush());
+  files.clear();
+  ASSERT_OK(env_->GetChildren(HotWalDirectory(dbname_), &files));
+  for (const auto& file : files) {
+    uint64_t number = 0;
+    FileType type;
+    ASSERT_FALSE(ParseFileName(file, &number, &type) && type == kLogFile);
+  }
 }
 
 TEST_F(DBBasicTest, HotKeyWriteBufferMaterializesBeforeMerge) {
