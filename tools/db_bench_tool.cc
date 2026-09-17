@@ -78,6 +78,7 @@
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
 #include "utilities/trace/bytedance_metrics_reporter.h"
+#ifdef WITH_YCSBCORE
 #include "ycsbcore/client.h"
 #include "ycsbcore/core_workload.h"
 #include "ycsbcore/countdown_latch.h"
@@ -85,6 +86,7 @@
 #include "ycsbcore/measurements.h"
 #include "ycsbcore/timer.h"
 #include "ycsbcore/utils.h"
+#endif  // WITH_YCSBCORE
 
 #ifdef OS_WIN
 #include <io.h>  // open/close
@@ -2758,6 +2760,7 @@ class Benchmark {
         num_ /= 1000;
         value_size_ = 100 * 1000;
         method = &Benchmark::WriteRandom;
+#ifdef WITH_YCSBCORE
       } else if (name == "ycsb") {
         fresh_db = true;
         method = &Benchmark::YCSBIntegrate;
@@ -2771,6 +2774,7 @@ class Benchmark {
         num_threads++;
         fresh_db = true;
         method = &Benchmark::BGYCSBRun;
+#endif  // WITH_YCSBCORE
       } else if (name == "readseq") {
         method = &Benchmark::ReadSequential;
       } else if (name == "readtocache") {
@@ -3936,6 +3940,7 @@ class Benchmark {
   void MultiWriteUniqueRandom(ThreadState* thread) {
     DoWrite(thread, MULTI_UNIQUE_RANDOM);
   }
+#ifdef WITH_YCSBCORE
   void YCSBWorking(ThreadState* thread, ycsbc::CoreWorkload* workload, int load,
                    int run) {
     int remain_loading = FLAGS_load_num;
@@ -4546,6 +4551,8 @@ class Benchmark {
       BurstWritten(thread, kWrite);
     }
   }
+
+#endif  // WITH_YCSBCORE
 
   class KeyGenerator {
    public:

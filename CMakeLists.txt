@@ -41,6 +41,7 @@ include(CMakeDependentOption)
 # Tests are excluded from Release builds
 CMAKE_DEPENDENT_OPTION(WITH_TESTS "build with tests" ON "CMAKE_BUILD_TYPE STREQUAL Debug" OFF)
 option(WITH_TOOLS "build with tools" ON)
+option(WITH_YCSBCORE "build db_bench with ycsb" OFF)
 option(WITH_TERARK_ZIP "build with TerarkZipTable support" ON)
 option(WITH_ZENFS "build with experimental zenfs" OFF)
 option(WITH_DIAGNOSE_CACHE "build with diagnosable cache support" OFF)
@@ -652,12 +653,6 @@ set(SOURCES
         monitoring/thread_status_updater.cc
         monitoring/thread_status_util.cc
         monitoring/thread_status_util_debug.cc
-        ycsbcore/acknowledged_counter_generator.cc                   
-        ycsbcore/basic_db.cc                                         
-        ycsbcore/core_workload.cc                                    
-        ycsbcore/db_factory.cc                                       
-        ycsbcore/measurements.cc                                     
-        ycsbcore/ycsbc.cc  
         options/cf_options.cc
         options/db_options.cc
         options/options.cc
@@ -1231,6 +1226,17 @@ if(WITH_TOOLS)
   add_executable(db_bench${ARTIFACT_SUFFIX} tools/db_bench.cc
       tools/db_bench_tool.cc
       $<TARGET_OBJECTS:testharness>)
+  if(WITH_YCSBCORE)
+    target_sources(db_bench${ARTIFACT_SUFFIX} PRIVATE
+      ycsbcore/acknowledged_counter_generator.cc
+      ycsbcore/basic_db.cc
+      ycsbcore/core_workload.cc
+      ycsbcore/db_factory.cc
+      ycsbcore/measurements.cc
+      ycsbcore/ycsbc.cc
+    )
+    target_compile_definitions(db_bench${ARTIFACT_SUFFIX} PRIVATE WITH_YCSBCORE)
+  endif()
   target_link_libraries(db_bench${ARTIFACT_SUFFIX} gtest ${ROCKSDB_STATIC_LIB})
 
                       
