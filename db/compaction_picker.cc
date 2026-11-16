@@ -75,10 +75,23 @@ struct GarbageFileInfo {
   FileMetaData* f;
   double score;
   uint64_t estimate_size;
-  GarbageFileInfo(FileMetaData* _f) : f(_f), score(0.0), estimate_size(0) {
+
+  // precise_gc: compute per-file garbage score.
+  //   precise==true  -> byte-based: antiquation_bytes / file_size
+  //   precise==false -> entry-based: num_antiquation / num_entries
+  static double ComputeScore(const FileMetaData* f, bool precise) {
+    if (f == nullptr) return 0.0;
+    if (precise) {
+      return std::min(1.0, f->num_antiquation_bytes /
+                               std::max<double>(1, f->fd.file_size));
+    }
+    return std::min(1.0, f->num_antiquation /
+                             std::max<double>(1, f->prop.num_entries));
+  }
+
+  GarbageFileInfo(FileMetaData* _f, bool precise_gc = false)
+      : f(_f), score(ComputeScore(_f, precise_gc)), estimate_size(0) {
     if (f == nullptr) return;
-    score = std::min(
-        1.0, f->num_antiquation / std::max<double>(1, f->prop.num_entries));
     estimate_size = static_cast<uint64_t>(f->fd.file_size * (1 - score));
   }
 };
@@ -844,7 +857,7 @@ void CompactionPicker::GetGrandparents(
 // 2. fragment should be take away by the way
 // 3. it marked for compaction
 Compaction* CompactionPicker::PickGarbageCollection(
-    const std::string& /*cf_name*/, const MutableCFOptions& mutable_cf_options,
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
     VersionStorageInfo* vstorage, LogBuffer* /*log_buffer*/) {
   // Setting fragment_size as one eighth target_blob_file_size prevents
   // selecting massive files to single compaction which would pin down the
@@ -868,15 +881,25 @@ Compaction* CompactionPicker::PickGarbageCollection(
 
   auto& hidden_files = vstorage->LevelFiles(-1);
   uint64_t idx = 0;
+  uint64_t scanned_blobs = 0;
+  uint64_t permitted_blobs = 0;
+  uint64_t garbage_ratio_buckets[6] = {0, 0, 0, 0, 0, 0};
+  auto bucket_idx = [](double score) {
+    return score < 0.1 ? 0 : score < 0.3 ? 1 : score < 0.5 ? 2
+         : score < 0.7 ? 3 : score < 0.9 ? 4 : 5;
+  };
   // Find largest score blob
-  GarbageFileInfo dirtiest_blob{nullptr};
+  GarbageFileInfo dirtiest_blob{nullptr, mutable_cf_options.precise_gc};
   for (; idx < hidden_files.size() && !hidden_files[idx]->is_gc_forbidden();
        ++idx) {
+    ++scanned_blobs;
     FileMetaData* f = hidden_files[idx];
     if (!f->is_gc_permitted() || f->being_compacted) {
       continue;
     }
-    GarbageFileInfo info{f};
+    ++permitted_blobs;
+    GarbageFileInfo info{f, mutable_cf_options.precise_gc};
+    ++garbage_ratio_buckets[bucket_idx(info.score)];
     // candidate_cmp is less comparator
     if (dirtiest_blob.f == nullptr || candidate_cmp(dirtiest_blob, info)) {
       dirtiest_blob = info;
@@ -939,7 +962,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
   }
   auto push_candidate = [&](FileMetaData* f) {
     if (f->is_gc_permitted() && !f->being_compacted) {
-      GarbageFileInfo gc_blob(f);
+      GarbageFileInfo gc_blob(f, mutable_cf_options.precise_gc);
       if (gc_blob.estimate_size <= fragment_size ||
           gc_blob.score >= mutable_cf_options.blob_gc_ratio ||
           gc_blob.f->marked_for_compaction) {
@@ -989,6 +1012,20 @@ Compaction* CompactionPicker::PickGarbageCollection(
       params.inputs, CompactionReason::kGarbageCollection);
 
   Compaction* c = RegisterCompaction(new Compaction(std::move(params)));
+  ROCKS_LOG_INFO(
+      ioptions_.info_log,
+      "[%s] GC_PICK scanned=%" PRIu64 " permitted=%" PRIu64
+      " selected=%zu target_blob=%" PRIu64
+      " selected_garbage=%" PRIu64 "/%" PRIu64 " ratio=%.4f"
+      " buckets=[<10%%=%" PRIu64 " <30%%=%" PRIu64
+      " <50%%=%" PRIu64 " <70%%=%" PRIu64
+      " <90%%=%" PRIu64 " >=90%%=%" PRIu64 "]",
+      cf_name.c_str(), scanned_blobs, permitted_blobs, input.files.size(),
+      total_estimate_size, num_antiquation,
+      std::max<uint64_t>(1, total_estimate_size), dirtiest_blob.score,
+      garbage_ratio_buckets[0], garbage_ratio_buckets[1],
+      garbage_ratio_buckets[2], garbage_ratio_buckets[3],
+      garbage_ratio_buckets[4], garbage_ratio_buckets[5]);
   vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options);
 
   return c;

@@ -135,7 +135,8 @@ struct FileMetaData {
   uint64_t compensated_file_size;
   // These values can mutate, but they can only be read or written from
   // single-threaded LogAndApply thread
-  uint64_t num_antiquation;  // the number of out-dated entries.
+  uint64_t num_antiquation;        // the number of out-dated entries.
+  uint64_t num_antiquation_bytes;  // the size of out-dated blob bytes.
 
   int refs;  // Reference count
 
@@ -154,6 +155,7 @@ struct FileMetaData {
       : table_reader_handle(nullptr),
         compensated_file_size(0),
         num_antiquation(0),
+        num_antiquation_bytes(0),
         refs(0),
         being_compacted(false),
         need_upgrade(false),

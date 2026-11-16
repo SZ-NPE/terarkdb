@@ -227,6 +227,8 @@ const std::string TablePropertiesNames::kReadAmp = "rocksdb.sst.read-amp";
 const std::string TablePropertiesNames::kDependence = "rocksdb.sst.dependence";
 const std::string TablePropertiesNames::kDependenceEntryCount =
     "rocksdb.sst.dependence.entry-count";
+const std::string TablePropertiesNames::kDependenceByteCount =
+    "rocksdb.sst.dependence.byte-count";
 const std::string TablePropertiesNames::kInheritanceChain =
     "rocksdb.sst.inheritance-chain";
 const std::string TablePropertiesNames::kInheritanceTree =

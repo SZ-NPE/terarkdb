@@ -622,6 +622,7 @@ class VersionStorageInfo {
   uint64_t blob_num_entries_;
   uint64_t blob_num_deletions_;
   uint64_t blob_num_antiquation_;
+  uint64_t blob_num_antiquation_bytes_;
   uint64_t lsm_file_size_;
   uint64_t lsm_num_entries_;
   uint64_t lsm_num_deletions_;

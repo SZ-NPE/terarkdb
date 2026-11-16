@@ -101,6 +101,13 @@ class CompactionJob {
 
   SeparationType separation_type() const;
 
+  // Blob GC time breakdown setters (nanoseconds)
+  void SetGcTriggerSelectTime(uint64_t trigger_nanos,
+                               uint64_t select_nanos);
+  void AddGcMetaTime(uint64_t meta_nanos);
+  void DumpGcBreakdown() const;
+  void DumpGcBlockDist() const;
+
   struct ProcessArg {
     CompactionJob* job;
     int task_id;
@@ -130,6 +137,7 @@ class CompactionJob {
       CompactionRangeDelAggregator* range_del_agg,
       CompactionIterationStats* range_del_out_stats,
       const std::unordered_map<uint64_t, uint64_t>& dependence,
+      const std::unordered_map<uint64_t, uint64_t>& new_blob_bytes_per_fn,
       const Slice* next_table_min_key = nullptr);
   Status FinishCompactionOutputBlob(
       const Status& input_status, SubcompactionState* sub_compact,
@@ -200,6 +208,33 @@ class CompactionJob {
   // Stores the approx size of keys covered in the range of each subcompaction
   std::vector<uint64_t> sizes_;
   Env::WriteLifeTimeHint write_hint_;
+
+  // Blob GC time breakdown accumulators (nanoseconds)
+  uint64_t gc_t_trigger_;
+  uint64_t gc_t_select_;
+  uint64_t gc_t_scan_;
+  uint64_t gc_t_lookup_;
+  uint64_t gc_t_write_;
+  uint64_t gc_t_meta_;
+
+  // Snapshot data for DumpGcBreakdown, cached before compact_ is freed
+  bool is_gc_job_;
+  std::string gc_cf_name_;
+  std::string gc_blob_files_;
+
+  // Blob GC bandwidth breakdown (bytes)
+  uint64_t gc_vsst_read_bytes_;
+  uint64_t gc_ksst_read_bytes_;
+  uint64_t gc_invalid_read_bytes_;
+  uint64_t gc_relocation_write_bytes_;
+
+  // Blob GC block-level invalidity distribution
+  uint64_t gc_block_total_;
+  uint64_t gc_block_invalid_0_25_;
+  uint64_t gc_block_invalid_25_50_;
+  uint64_t gc_block_invalid_50_75_;
+  uint64_t gc_block_invalid_75_100_;
+  uint64_t gc_block_invalid_100_;
 };
 
 }  // namespace TERARKDB_NAMESPACE

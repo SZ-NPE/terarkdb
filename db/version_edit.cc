@@ -224,6 +224,9 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
       for (auto& dependence : f.prop.dependence) {
         PutVarint64(&encode_property_cache, dependence.entry_count);
       }
+      for (auto& dependence : f.prop.dependence) {
+        PutVarint64(&encode_property_cache, dependence.byte_count);
+      }
       PutVarint64(&encode_property_cache, f.prop.num_deletions);
       encode_property_cache.push_back(char(f.prop.flags));
       PutVarint64Varint64(&encode_property_cache, f.prop.raw_key_size,
@@ -355,7 +358,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
               if (!GetVarint64(&field, &file_number)) {
                 return error_msg;
               }
-              f.prop.dependence.emplace_back(Dependence{file_number, 0});
+              f.prop.dependence.emplace_back(Dependence{file_number, 0, 0});
             }
             if (!field.empty()) {
               if (!GetVarint64(&field, &f.prop.num_entries)) {
@@ -384,6 +387,17 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
             if (!field.empty()) {
               for (auto& dependence : f.prop.dependence) {
                 if (!GetVarint64(&field, &dependence.entry_count)) {
+                  return error_msg;
+                }
+              }
+            }
+            if (!field.empty()) {
+              // precise_gc: byte_count is an append-only field introduced
+              // after entry_count. Older manifests won't have it, in which
+              // case `field` is already consumed and we leave byte_count as 0
+              // (VersionBuilder will fall back to an averaged estimate).
+              for (auto& dependence : f.prop.dependence) {
+                if (!GetVarint64(&field, &dependence.byte_count)) {
                   return error_msg;
                 }
               }

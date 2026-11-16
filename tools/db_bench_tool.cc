@@ -385,6 +385,11 @@ DEFINE_int32(max_background_flushes,
              "The maximum number of concurrent background flushes"
              " that can occur in parallel.");
 
+DEFINE_int32(max_background_garbage_collections,
+             TERARKDB_NAMESPACE::Options().max_background_garbage_collections,
+             "The maximum number of concurrent background garbage collections"
+             " that can occur in parallel.");
+
 static TERARKDB_NAMESPACE::CompactionStyle FLAGS_compaction_style_e;
 DEFINE_int32(compaction_style,
              (int32_t)TERARKDB_NAMESPACE::Options().compaction_style,
@@ -747,6 +752,9 @@ DEFINE_bool(report_bg_io_stats, false,
 DEFINE_bool(use_stderr_info_logger, false,
             "Write info logs to stderr instead of to LOG file. ");
 
+DEFINE_string(db_log_dir, "",
+              "Directory to store info log files. If empty, uses the db_path.");
+
 DEFINE_string(trace_file, "", "Trace workload to a file. ");
 
 static enum TERARKDB_NAMESPACE::CompressionType StringToCompressionType(
@@ -982,6 +990,9 @@ DEFINE_uint64(hotness_hot_capacity, 1000000,
 DEFINE_double(blob_large_key_ratio, 1, "Key Value Separate large key ratio");
 
 DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
+
+DEFINE_bool(precise_gc, false,
+            "Enable byte-precise garbage ratio calculation for blob GC");
 
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
@@ -3268,6 +3279,8 @@ class Benchmark {
     options.max_background_compactions = FLAGS_max_background_compactions;
     options.max_subcompactions = static_cast<uint32_t>(FLAGS_subcompactions);
     options.max_background_flushes = FLAGS_max_background_flushes;
+    options.max_background_garbage_collections =
+        FLAGS_max_background_garbage_collections;
     options.compaction_style = FLAGS_compaction_style_e;
     options.compaction_pri = FLAGS_compaction_pri_e;
     options.allow_mmap_reads = FLAGS_mmap_read;
@@ -3292,6 +3305,9 @@ class Benchmark {
     }
     if (FLAGS_use_stderr_info_logger) {
       options.info_log.reset(new StderrLogger());
+    }
+    if (!FLAGS_db_log_dir.empty()) {
+      options.db_log_dir = FLAGS_db_log_dir;
     }
     options.memtable_huge_page_size = FLAGS_memtable_use_huge_page ? 2048 : 0;
     options.memtable_prefix_bloom_size_ratio = FLAGS_memtable_bloom_size_ratio;
@@ -3580,6 +3596,7 @@ class Benchmark {
     options.hotness_hot_capacity = FLAGS_hotness_hot_capacity;
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
+    options.precise_gc = FLAGS_precise_gc;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;

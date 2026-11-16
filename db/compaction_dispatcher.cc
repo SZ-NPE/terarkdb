@@ -935,7 +935,12 @@ std::string RemoteCompactionDispatcher::Worker::DoCompaction(Slice data) {
           builder->NeedCompact() ? FileMetaData::kMarkedFromTableBuilder : 0;
       meta.prop.num_entries = builder->NumEntries();
       for (auto& pair : dependence) {
-        meta.prop.dependence.emplace_back(Dependence{pair.first, pair.second});
+        // precise_gc: remote workers never create new blob files, so all
+        // referenced blobs are carried over from existing SSTs. Leave
+        // byte_count as 0 and let VersionBuilder fall back to an averaged
+        // estimate from the source blob's file size.
+        meta.prop.dependence.emplace_back(
+            Dependence{pair.first, pair.second, 0});
       }
       terark::sort_a(meta.prop.dependence, TERARK_CMP(file_number, <));
       auto shrinked_snapshots = meta.ShrinkSnapshot(context.existing_snapshots);

@@ -118,11 +118,28 @@ TablePropertyCache GetPropCache(
     uint8_t purpose, std::initializer_list<uint64_t> dependence = {},
     std::initializer_list<uint64_t> inheritance = {}) {
   std::vector<Dependence> dep;
-  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1});
+  for (auto& d : dependence) dep.emplace_back(Dependence{d, 1, 0});
   TablePropertyCache ret;
   ret.purpose = purpose;
   ret.dependence = dep;
   ret.inheritance = inheritance;
+  return ret;
+}
+
+// precise_gc: build a TablePropertyCache with explicit per-dependence
+// (file_number, entry_count, byte_count) tuples so tests can drive the new
+// byte-based path through VersionBuilder.
+TablePropertyCache GetPropCacheWithBytes(
+    uint8_t purpose,
+    std::initializer_list<std::tuple<uint64_t, uint64_t, uint64_t>> dep_list) {
+  std::vector<Dependence> dep;
+  for (auto& t : dep_list) {
+    dep.emplace_back(
+        Dependence{std::get<0>(t), std::get<1>(t), std::get<2>(t)});
+  }
+  TablePropertyCache ret;
+  ret.purpose = purpose;
+  ret.dependence = dep;
   return ret;
 }
 
@@ -490,6 +507,81 @@ TEST_F(VersionBuilderTest, HugeLSM) {
   version_builder.Apply(&version_edit);
 
   version_builder.SaveTo(&new_vstorage, 0);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+// precise_gc: when a referencing SST carries an explicit per-dependence
+// byte_count, VersionBuilder should propagate it to the blob file's
+// num_antiquation_bytes field instead of falling back to the averaged
+// estimate. This test also verifies that the entry-based
+// num_antiquation still works in parallel with the byte-based accounting.
+TEST_F(VersionBuilderTest, PreciseGcByteCountFromDependence) {
+  // Blob B (file_number=100) at level -1:
+  //   num_entries=100, file_size=10000.
+  // Referencing SST S (file_number=200) at level 2 declares that it points
+  // at 70 entries / 6000 bytes from B.
+  // Expected after SaveTo:
+  //   B.num_antiquation       = 100 - 70   = 30
+  //   B.num_antiquation_bytes = 10000 - 6000 = 4000
+  Add(-1, 100U, "100", "199", 10000U /*file_size*/, 0 /*path_id*/,
+      100 /*smallest_seq*/, 100 /*largest_seq*/, 100 /*num_entries*/,
+      0 /*num_deletions*/, 100 /*smallest_seqno*/, 100 /*largest_seqno*/);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  version_edit.AddFile(
+      2 /*level*/, 200U /*file_number*/, 0 /*path_id*/, 500U /*file_size*/,
+      GetInternalKey("100"), GetInternalKey("199"), 200, 200, false,
+      GetPropCacheWithBytes(0, {std::make_tuple(100U, 70U, 6000U)}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto& dep_map = new_vstorage.dependence_map();
+  auto it = dep_map.find(100U);
+  ASSERT_TRUE(it != dep_map.end());
+  FileMetaData* b = it->second;
+  ASSERT_EQ(30U, b->num_antiquation);
+  ASSERT_EQ(4000U, b->num_antiquation_bytes);
+
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+// precise_gc: when byte_count is 0 in every referencing Dependence (legacy
+// manifests / MapSst / remote-compaction paths), VersionBuilder must fall
+// back to the averaged estimate (entry_count * file_size / num_entries)
+// so that num_antiquation_bytes is still a meaningful approximation.
+TEST_F(VersionBuilderTest, PreciseGcByteCountFallbackWhenZero) {
+  // Blob B: 100 entries, 10000 bytes. Average entry size = 100 bytes.
+  // S references 70 entries with byte_count=0 -> fallback estimate:
+  //   bytes_depended ~= 70 * 10000 / 100 = 7000
+  //   num_antiquation_bytes ~= 10000 - 7000 = 3000
+  Add(-1, 101U, "100", "199", 10000U, 0, 100, 100, 100, 0, 100, 100);
+  UpdateVersionStorageInfo();
+
+  VersionEdit version_edit;
+  version_edit.AddFile(
+      2, 201U, 0, 500U, GetInternalKey("100"), GetInternalKey("199"), 200, 200,
+      false, GetPropCacheWithBytes(0, {std::make_tuple(101U, 70U, 0U)}));
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, nullptr, &vstorage_);
+  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                  kCompactionStyleLevel, false);
+  version_builder.Apply(&version_edit);
+  version_builder.SaveTo(&new_vstorage, 0);
+
+  auto& dep_map = new_vstorage.dependence_map();
+  auto it = dep_map.find(101U);
+  ASSERT_TRUE(it != dep_map.end());
+  FileMetaData* b = it->second;
+  ASSERT_EQ(30U, b->num_antiquation);
+  ASSERT_EQ(3000U, b->num_antiquation_bytes);
 
   UnrefFilesInVersion(&new_vstorage);
 }
