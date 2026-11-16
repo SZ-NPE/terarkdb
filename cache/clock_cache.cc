@@ -253,7 +253,7 @@ class ClockCacheShard : public CacheShard {
                         void (*deleter)(const Slice& key, void* value),
                         Cache::Handle** handle,
                         Cache::Priority priority) override;
-  virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) override;
+  virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true) override;
   // If the entry in in cache, increase reference count and return true.
   // Return false otherwise.
   //
@@ -611,7 +611,8 @@ Status ClockCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
   return s;
 }
 
-Cache::Handle* ClockCacheShard::Lookup(const Slice& key, uint32_t hash) {
+Cache::Handle* ClockCacheShard::Lookup(const Slice& key, uint32_t hash, bool record_hit) {
+  (void)record_hit; // Clock cache currently doesn't use hit record for promotion
   HashTable::const_accessor accessor;
   if (!table_.find(accessor, CacheKey(key, hash))) {
     return nullptr;

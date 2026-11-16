@@ -782,9 +782,11 @@ void CompactionIterator::PrepareOutput() {
     assert(value_.size() < (1ull << 49));
     assert(blob_large_key_ratio_lsh16_ < (1ull << 17));
     // (key.size << 16) > value.size * large_key_ratio_lsh16
-    if (value_.size() < blob_config_.blob_size ||
+    const bool key_too_large =
+        blob_config_.blob_size != 0 && blob_large_key_ratio_lsh16_ > 0 &&
         (current_user_key_.size() << 16) >
-            value_.size() * blob_large_key_ratio_lsh16_) {
+            value_.size() * blob_large_key_ratio_lsh16_;
+    if (value_.size() < blob_config_.blob_size || key_too_large) {
       // Keep value combined. value too small or key too large
       zero_sequence();
     } else if (do_rebuild_blob || value_.file_number() == uint64_t(-1)) {

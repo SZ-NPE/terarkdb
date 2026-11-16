@@ -103,6 +103,26 @@ struct LIRSCacheOptions {
         memory_allocator(std::move(_memory_allocator)) {}
 };
 
+struct FIFOCacheOptions {
+  size_t capacity = 0;
+  int num_shard_bits = -1;
+  bool strict_capacity_limit = false;
+  double high_pri_pool_ratio = 0.0;
+  bool is_diagnose = false;
+  size_t topk = 10;
+  std::shared_ptr<MemoryAllocator> memory_allocator;
+
+  FIFOCacheOptions() {}
+  FIFOCacheOptions(size_t _capacity, int _num_shard_bits,
+                  bool _strict_capacity_limit, double _high_pri_pool_ratio,
+                  std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr)
+      : capacity(_capacity),
+        num_shard_bits(_num_shard_bits),
+        strict_capacity_limit(_strict_capacity_limit),
+        high_pri_pool_ratio(_high_pri_pool_ratio),
+        memory_allocator(std::move(_memory_allocator)) {}
+};
+
 // Create a new cache with a fixed size capacity. The cache is sharded
 // to 2^num_shard_bits shards, by hash of the key. The total capacity
 // is divided and evenly assigned to each shard. If strict_capacity_limit
@@ -122,6 +142,21 @@ std::shared_ptr<Cache> NewDiagnosableLRUCache(
     const LRUCacheOptions& cache_opts);
 
 std::shared_ptr<Cache> NewDiagnosableLRUCache(
+    size_t capacity, int num_shard_bits, bool strict_capacity_limit,
+    double high_pri_pool_ratio,
+    std::shared_ptr<MemoryAllocator> memory_allocator, size_t topk);
+
+extern std::shared_ptr<Cache> NewFIFOCache(
+    size_t capacity, int num_shard_bits = -1,
+    bool strict_capacity_limit = false, double high_pri_pool_ratio = 0.0,
+    std::shared_ptr<MemoryAllocator> memory_allocator = nullptr);
+
+extern std::shared_ptr<Cache> NewFIFOCache(const FIFOCacheOptions& cache_opts);
+
+std::shared_ptr<Cache> NewDiagnosableFIFOCache(
+    const FIFOCacheOptions& cache_opts);
+
+std::shared_ptr<Cache> NewDiagnosableFIFOCache(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
     std::shared_ptr<MemoryAllocator> memory_allocator, size_t topk);
@@ -183,6 +218,14 @@ class Cache {
                         Handle** handle = nullptr,
                         Priority priority = Priority::LOW) = 0;
 
+  virtual Status Insert(const Slice& key, uint32_t hash, void* value, size_t charge,
+                        void (*deleter)(const Slice& key, void* value),
+                        Handle** handle = nullptr,
+                        Priority priority = Priority::LOW) {
+    (void)hash;
+    return Insert(key, value, charge, deleter, handle, priority);
+  }
+
   // If the cache has no mapping for "key", returns nullptr.
   //
   // Else return a handle that corresponds to the mapping.  The caller
@@ -190,7 +233,14 @@ class Cache {
   // longer needed.
   // If stats is not nullptr, relative tickers could be used inside the
   // function.
+  // If record_hit is false, it won't be promoted to the head of the LRU.
   virtual Handle* Lookup(const Slice& key, Statistics* stats = nullptr) = 0;
+
+  virtual Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true, Statistics* stats = nullptr) {
+    (void)hash;
+    (void)record_hit;
+    return Lookup(key, stats);
+  }
 
   // Increments the reference count for the handle if it refers to an entry in
   // the cache. Returns true if refcount was incremented; otherwise, returns
@@ -222,6 +272,10 @@ class Cache {
   // underlying entry will be kept around until all existing handles
   // to it have been released.
   virtual void Erase(const Slice& key) = 0;
+  virtual void Erase(const Slice& key, uint32_t hash) {
+    (void)hash;
+    Erase(key);
+  }
   // Return a new numeric id.  May be used by multiple clients who are
   // sharding the same cache to partition the key space.  Typically the
   // client will allocate a new id at startup and prepend the id to

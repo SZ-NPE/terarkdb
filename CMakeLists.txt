@@ -448,14 +448,14 @@ if(MSVC)
   else()
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /${RUNTIME_LIBRARY}")
   endif()
-  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Oxt /Zp8 /Gm- /Gy /${RUNTIME_LIBRARY}")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Od /Zp8 /Gm- /Gy /${RUNTIME_LIBRARY}")
 
   set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEBUG")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DEBUG")
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-memcmp")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-memcmp -O0 -g")
 endif()
 
 option(ROCKSDB_LITE "Build RocksDBLite version" OFF)
@@ -563,6 +563,7 @@ endif()
 # Main library source code
 set(SOURCES
         cache/clock_cache.cc
+        cache/fifo_cache.cc
         cache/lirs_cache.cc
         cache/lru_cache.cc
         cache/sharded_cache.cc
@@ -716,6 +717,7 @@ set(SOURCES
         util/filename.cc
         util/filter_policy.cc
         util/hash.cc
+        util/hotness_tracker.cc
         util/iterator_cache.cc
         util/jemalloc_nodump_allocator.cc
         util/lazy_buffer.cc
@@ -988,6 +990,7 @@ if(WITH_TESTS)
         db/compaction_iterator_test.cc
         db/compaction_job_stats_test.cc
         db/compaction_job_test.cc
+        db/hotness_routing_test.cc
         db/compaction_picker_test.cc
         db/comparator_db_test.cc
         db/corruption_test.cc

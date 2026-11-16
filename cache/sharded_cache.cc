@@ -56,9 +56,20 @@ Status ShardedCache::Insert(const Slice& key, void* value, size_t charge,
       ->Insert(key, hash, value, charge, deleter, handle, priority);
 }
 
+Status ShardedCache::Insert(const Slice& key, uint32_t hash, void* value, size_t charge,
+                            void (*deleter)(const Slice& key, void* value),
+                            Handle** handle, Priority priority) {
+  return GetShard(Shard(hash))
+      ->Insert(key, hash, value, charge, deleter, handle, priority);
+}
+
 Cache::Handle* ShardedCache::Lookup(const Slice& key, Statistics* /*stats*/) {
   uint32_t hash = HashSlice(key);
-  return GetShard(Shard(hash))->Lookup(key, hash);
+  return GetShard(Shard(hash))->Lookup(key, hash, true);
+}
+
+Cache::Handle* ShardedCache::Lookup(const Slice& key, uint32_t hash, bool record_hit, Statistics* /*stats*/) {
+  return GetShard(Shard(hash))->Lookup(key, hash, record_hit);
 }
 
 bool ShardedCache::Ref(Handle* handle) {

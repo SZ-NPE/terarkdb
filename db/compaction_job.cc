@@ -776,6 +776,9 @@ int CompactionJob::Prepare(int sub_compaction_slots) {
              compact_->compaction->level()) > 0);
   write_hint_ =
       c->column_family_data()->CalculateSSTWriteHint(c->output_level());
+  if (c->mutable_cf_options()->get_blob_config().blob_size != size_t(-1)) {
+    write_hint_ = Env::WLTH_EXTREME;
+  }
   // Is this compaction producing files at the bottommost level?
   bottommost_level_ = c->bottommost_level();
 
@@ -3030,7 +3033,7 @@ Status CompactionJob::OpenCompactionOutputBlob(
 
   sub_compact->blob_outputs.push_back(out);
   writable_file->SetIOPriority(Env::IO_LOW);
-  writable_file->SetWriteLifeTimeHint(write_hint_);
+  writable_file->SetWriteLifeTimeHint(Env::WLTH_EXTREME);
   writable_file->SetPreallocationBlockSize(static_cast<size_t>(
       sub_compact->compaction->OutputFilePreallocationSize()));
   const auto& listeners =

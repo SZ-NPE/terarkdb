@@ -205,7 +205,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShardTemplate : public CacheMonitor,
                         void (*deleter)(const Slice& key, void* value),
                         Cache::Handle** handle,
                         Cache::Priority priority) override;
-  virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) override;
+  virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash, bool record_hit = true) override;
   virtual bool Ref(Cache::Handle* handle) override;
   virtual bool Release(Cache::Handle* handle,
                        bool force_erase = false) override;

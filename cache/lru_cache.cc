@@ -284,16 +284,19 @@ void LRUCacheShardTemplate<CacheMonitor>::SetStrictCapacityLimit(
 
 template <class CacheMonitor>
 Cache::Handle* LRUCacheShardTemplate<CacheMonitor>::Lookup(const Slice& key,
-                                                           uint32_t hash) {
+                                                           uint32_t hash,
+                                                           bool record_hit) {
   MutexLock l(&mutex_);
   LRUHandle* e = table_.Lookup(key, hash);
   if (e != nullptr) {
     assert(e->InCache());
-    if (e->refs == 1) {
+    if (e->refs == 1 && record_hit) {
       LRU_Remove(e);
     }
     e->refs++;
-    e->SetHit();
+    if (record_hit) {
+      e->SetHit();
+    }
   }
   return reinterpret_cast<Cache::Handle*>(e);
 }
@@ -344,8 +347,9 @@ bool LRUCacheShardTemplate<CacheMonitor>::Release(Cache::Handle* handle,
         Unref(e);
         UsageSub(e);
         last_reference = true;
-      } else {
-        // put the item on the list to be potentially freed
+      } else if (e->next == nullptr && e->prev == nullptr) {
+        // Entries returned by Lookup(record_hit = false) stay on the LRU list.
+        // Only reinsert entries that were detached earlier.
         LRU_Insert(e);
       }
     }
