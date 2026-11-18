@@ -2484,6 +2484,40 @@ TEST_P(ColumnFamilyTest, CreateAndDropRace) {
 }
 #endif  // !ROCKSDB_LITE
 
+TEST(ColumnFamilyWriteStallTest, BlobGarbageRatioThreshold) {
+  MutableCFOptions options(Options{}, Env::Default());
+  options.garbage_ratio_stop_writes_trigger = 0.75;
+
+  const auto below_limit = ColumnFamilyData::GetWriteStallConditionAndCause(
+      0, 0, 0, 0, 0, 0.74, 5, options);
+  EXPECT_EQ(WriteStallCondition::kNormal, below_limit.first);
+
+  const auto at_limit = ColumnFamilyData::GetWriteStallConditionAndCause(
+      0, 0, 0, 0, 0, 0.75, 5, options);
+  EXPECT_EQ(WriteStallCondition::kStopped, at_limit.first);
+  EXPECT_EQ(ColumnFamilyData::WriteStallCause::kGarbageRatioLimit,
+            at_limit.second);
+}
+
+#ifndef ROCKSDB_LITE
+TEST_P(ColumnFamilyTest, BlobFileBytesLimitStopsWrites) {
+  column_family_options_.blob_size = 512;
+  column_family_options_.blob_file_bytes_limit = 1;
+  Open({"default"});
+
+  WriteOptions write_options;
+  write_options.no_slowdown = true;
+  const std::string value(1024, 'v');
+  ASSERT_OK(db_->Put(write_options, handles_[0], "before-flush", value));
+  ASSERT_OK(Flush(0));
+  ASSERT_TRUE(
+      db_->Put(write_options, handles_[0], "at-limit", value).IsIncomplete());
+
+  ASSERT_OK(db_->SetOptions(handles_[0], {{"blob_file_bytes_limit", "0"}}));
+  ASSERT_OK(db_->Put(write_options, handles_[0], "after-limit-raised", value));
+}
+#endif  // !ROCKSDB_LITE
+
 TEST_P(ColumnFamilyTest, WriteStallSingleColumnFamily) {
   const uint64_t kBaseRate = 800000u;
   db_options_.delayed_write_rate = kBaseRate;

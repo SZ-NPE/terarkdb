@@ -994,6 +994,16 @@ DEFINE_double(blob_gc_ratio, 0.2, "Blob SST gc ratio");
 DEFINE_bool(precise_gc, false,
             "Enable byte-precise garbage ratio calculation for blob GC");
 
+DEFINE_double(garbage_ratio_stop_writes_trigger,
+              TERARKDB_NAMESPACE::ColumnFamilyOptions()
+                  .garbage_ratio_stop_writes_trigger,
+              "Stop writes at this blob garbage ratio");
+
+DEFINE_uint64(blob_file_bytes_limit,
+              TERARKDB_NAMESPACE::ColumnFamilyOptions().blob_file_bytes_limit,
+              "Stop writes at this combined LSM and blob SST size in bytes "
+              "(0 disables the limit)");
+
 DEFINE_uint64(target_blob_file_size, 0, "Blob file size");
 
 DEFINE_uint64(blob_file_defragment_size, 0, "Blob file defragment threshold");
@@ -3597,6 +3607,9 @@ class Benchmark {
     options.blob_large_key_ratio = FLAGS_blob_large_key_ratio;
     options.blob_gc_ratio = FLAGS_blob_gc_ratio;
     options.precise_gc = FLAGS_precise_gc;
+    options.garbage_ratio_stop_writes_trigger =
+        FLAGS_garbage_ratio_stop_writes_trigger;
+    options.blob_file_bytes_limit = FLAGS_blob_file_bytes_limit;
     options.target_blob_file_size = FLAGS_target_blob_file_size;
     options.blob_file_defragment_size = FLAGS_blob_file_defragment_size;
     options.max_dependence_blob_overlap = FLAGS_max_dependence_blob_overlap;

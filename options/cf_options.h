@@ -162,6 +162,8 @@ struct MutableCFOptions {
         blob_large_key_ratio(0),
         blob_gc_ratio(0),
         precise_gc(false),
+        garbage_ratio_stop_writes_trigger(1.0),
+        blob_file_bytes_limit(0),
         target_blob_file_size(0),
         blob_file_defragment_size(0),
         max_dependence_blob_overlap(0),
@@ -189,6 +191,14 @@ struct MutableCFOptions {
 
   BlobConfig get_blob_config() const {
     return BlobConfig{blob_size, blob_large_key_ratio};
+  }
+
+  bool IsBlobFileBytesLimitReached(uint64_t total_sst_bytes) const {
+    return blob_file_bytes_limit > 0 && total_sst_bytes >= blob_file_bytes_limit;
+  }
+
+  double GetEffectiveBlobGCRatio(uint64_t total_sst_bytes) const {
+    return IsBlobFileBytesLimitReached(total_sst_bytes) ? 1e-15 : blob_gc_ratio;
   }
 
   // Must be called after any change to MutableCFOptions
@@ -226,6 +236,8 @@ struct MutableCFOptions {
   double blob_large_key_ratio;
   double blob_gc_ratio;
   bool precise_gc;
+  double garbage_ratio_stop_writes_trigger;
+  uint64_t blob_file_bytes_limit;
   uint64_t target_blob_file_size;
   uint64_t blob_file_defragment_size;
   size_t max_dependence_blob_overlap;

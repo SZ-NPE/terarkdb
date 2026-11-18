@@ -174,6 +174,9 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   cf_opts.blob_large_key_ratio = mutable_cf_options.blob_large_key_ratio;
   cf_opts.blob_gc_ratio = mutable_cf_options.blob_gc_ratio;
   cf_opts.precise_gc = mutable_cf_options.precise_gc;
+  cf_opts.garbage_ratio_stop_writes_trigger =
+      mutable_cf_options.garbage_ratio_stop_writes_trigger;
+  cf_opts.blob_file_bytes_limit = mutable_cf_options.blob_file_bytes_limit;
   cf_opts.target_blob_file_size = mutable_cf_options.target_blob_file_size;
   cf_opts.blob_file_defragment_size =
       mutable_cf_options.blob_file_defragment_size;
@@ -1953,6 +1956,14 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::precise_gc), OptionType::kBoolean,
           OptionVerificationType::kNormal, true,
           offsetof(struct MutableCFOptions, precise_gc)}},
+        {"garbage_ratio_stop_writes_trigger",
+         {offset_of(&ColumnFamilyOptions::garbage_ratio_stop_writes_trigger),
+          OptionType::kDouble, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, garbage_ratio_stop_writes_trigger)}},
+        {"blob_file_bytes_limit",
+         {offset_of(&ColumnFamilyOptions::blob_file_bytes_limit),
+          OptionType::kUInt64T, OptionVerificationType::kNormal, true,
+          offsetof(struct MutableCFOptions, blob_file_bytes_limit)}},
         {"target_blob_file_size",
          {offset_of(&ColumnFamilyOptions::target_blob_file_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal, true,

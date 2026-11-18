@@ -328,6 +328,15 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Use byte-precise garbage ratio when metadata is available.
   bool precise_gc = false;
 
+  // Stop writes when the blob garbage ratio reaches this threshold.
+  // Dynamically changeable through SetOptions().
+  double garbage_ratio_stop_writes_trigger = 1.0;
+
+  // Stop writes when the combined size of live LSM and blob SSTs reaches
+  // this limit. Zero disables this limit. Dynamically changeable through
+  // SetOptions().
+  uint64_t blob_file_bytes_limit = 0;
+
   // Blob file size
   // Default : same as bottommost level sst file size
   uint64_t target_blob_file_size = 0;

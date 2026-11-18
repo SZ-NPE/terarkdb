@@ -269,6 +269,10 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    blob_large_key_ratio);
   ROCKS_LOG_HEADER(log, "                          Options.blob_gc_ratio: %f",
                    blob_gc_ratio);
+  ROCKS_LOG_HEADER(log, "      Options.garbage_ratio_stop_writes_trigger: %f",
+                   garbage_ratio_stop_writes_trigger);
+  ROCKS_LOG_HEADER(log, "                  Options.blob_file_bytes_limit: %" PRIu64,
+                   blob_file_bytes_limit);
   ROCKS_LOG_HEADER(log,
                    "                  Options.target_blob_file_size: %" PRIu64,
                    target_blob_file_size);

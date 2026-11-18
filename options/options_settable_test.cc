@@ -479,6 +479,8 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "hotness_hot_capacity=654321;"
       "blob_gc_ratio=0.05;"
       "precise_gc=false;"
+      "garbage_ratio_stop_writes_trigger=0.75;"
+      "blob_file_bytes_limit=268435456;"
       "target_blob_file_size=0;"
       "blob_file_defragment_size=0;"
       "max_dependence_blob_overlap=1024;"

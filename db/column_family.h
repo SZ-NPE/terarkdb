@@ -390,11 +390,15 @@ class ColumnFamilyData {
     kL0FileCountLimit,
     kPendingCompactionBytes,
     kReadAmpLimit,
+    kGarbageRatioLimit,
+    kBlobFileBytesLimit,
   };
   static std::pair<WriteStallCondition, WriteStallCause>
   GetWriteStallConditionAndCause(int num_unflushed_memtables, int num_l0_files,
                                  int read_amp,
                                  uint64_t num_compaction_needed_bytes,
+                                 uint64_t total_sst_bytes,
+                                 double total_garbage_ratio,
                                  int num_levels,
                                  const MutableCFOptions& mutable_cf_options);
 

@@ -1178,10 +1178,16 @@ void InternalStats::DumpCFMapStatsIOStalls(
       std::to_string(cf_stats_count_[MEMTABLE_LIMIT_STOPS]);
   (*cf_stats)["io_stalls.memtable_slowdown"] =
       std::to_string(cf_stats_count_[MEMTABLE_LIMIT_SLOWDOWNS]);
+  (*cf_stats)["io_stalls.stop_for_garbage_ratio"] =
+      std::to_string(cf_stats_count_[GARBAGE_RATIO_LIMIT_STOPS]);
+  (*cf_stats)["io_stalls.stop_for_blob_file_bytes"] =
+      std::to_string(cf_stats_count_[BLOB_FILE_BYTES_LIMIT_STOPS]);
 
   uint64_t total_stop = cf_stats_count_[L0_FILE_COUNT_LIMIT_STOPS] +
                         cf_stats_count_[PENDING_COMPACTION_BYTES_LIMIT_STOPS] +
-                        cf_stats_count_[MEMTABLE_LIMIT_STOPS];
+                        cf_stats_count_[MEMTABLE_LIMIT_STOPS] +
+                        cf_stats_count_[GARBAGE_RATIO_LIMIT_STOPS] +
+                        cf_stats_count_[BLOB_FILE_BYTES_LIMIT_STOPS];
 
   uint64_t total_slowdown =
       cf_stats_count_[L0_FILE_COUNT_LIMIT_SLOWDOWNS] +
@@ -1231,7 +1237,9 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
       cf_stats_count_[PENDING_COMPACTION_BYTES_LIMIT_SLOWDOWNS] +
       cf_stats_count_[PENDING_COMPACTION_BYTES_LIMIT_STOPS] +
       cf_stats_count_[MEMTABLE_LIMIT_STOPS] +
-      cf_stats_count_[MEMTABLE_LIMIT_SLOWDOWNS];
+      cf_stats_count_[MEMTABLE_LIMIT_SLOWDOWNS] +
+      cf_stats_count_[GARBAGE_RATIO_LIMIT_STOPS] +
+      cf_stats_count_[BLOB_FILE_BYTES_LIMIT_STOPS];
   // Interval summary
   uint64_t interval_flush_ingest =
       flush_ingest - cf_stats_snapshot_.ingest_bytes_flush;
@@ -1355,6 +1363,10 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
            " memtable_compaction, "
            "%" PRIu64
            " memtable_slowdown, "
+           "%" PRIu64
+           " stop for garbage_ratio, "
+           "%" PRIu64
+           " stop for blob_file_bytes, "
            "interval %" PRIu64 " total count\n",
            cf_stats_count_[L0_FILE_COUNT_LIMIT_SLOWDOWNS],
            cf_stats_count_[LOCKED_L0_FILE_COUNT_LIMIT_SLOWDOWNS],
@@ -1364,6 +1376,8 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
            cf_stats_count_[PENDING_COMPACTION_BYTES_LIMIT_SLOWDOWNS],
            cf_stats_count_[MEMTABLE_LIMIT_STOPS],
            cf_stats_count_[MEMTABLE_LIMIT_SLOWDOWNS],
+           cf_stats_count_[GARBAGE_RATIO_LIMIT_STOPS],
+           cf_stats_count_[BLOB_FILE_BYTES_LIMIT_STOPS],
            total_stall_count - cf_stats_snapshot_.stall_count);
   value->append(buf);
 
